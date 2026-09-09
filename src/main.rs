@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use slack_light::doctor;
-use slk_api::{Credentials, MockBackend, SessionBackend, SlackBackend};
+use slk_api::{Credentials, MockBackend, SlackBackend, WebBackend};
 use slk_auth as auth;
 use slk_config::Config;
 use slk_store::Store;
@@ -138,6 +138,15 @@ enum AuthCmd {
         /// Paste the token and cookie yourself instead.
         #[arg(long)]
         paste: bool,
+        /// Install a Slack app of your own instead of reading a browser
+        /// session. Documented, defensible, and less capable — see
+        /// `docs/SLACK-ACCESS-STRATEGY.md`.
+        #[arg(long, conflicts_with = "paste")]
+        oauth: bool,
+        /// An `xapp-…` app-level token, which is the only realtime an
+        /// installed app has. Without one the client polls.
+        #[arg(long, value_name = "TOKEN", requires = "oauth")]
+        app_token: Option<String>,
         /// A specific browser binary to drive.
         #[arg(long, value_name = "PATH")]
         browser: Option<std::path::PathBuf>,
@@ -152,6 +161,68 @@ enum AuthCmd {
         /// The workspace subdomain. Omit to forget every one.
         team: Option<String>,
     },
+}
+
+/// Swap an expired OAuth access token for a fresh one, and write it back.
+///
+/// Only when the workspace's app has token rotation turned on: without it
+/// Slack sends no refresh token and the access token does not expire, so
+/// there is nothing to do. Sixty seconds of slack on the deadline, because a
+/// token that expires while the request is in flight fails in the least
+/// helpful way there is.
+/// `slack-light auth add --oauth`: install the app, keep the token.
+fn oauth_sign_in(
+    browser: Option<std::path::PathBuf>,
+    timeout: u64,
+    app_token: Option<String>,
+) -> Result<()> {
+    let got = auth::oauth::install(browser, std::time::Duration::from_secs(timeout))?;
+    let mut all = auth::load_all().unwrap_or_default();
+    all.retain(|a| a.team != got.team);
+    all.push(auth::Account {
+        team: got.team.clone(),
+        token: got.token,
+        // Empty, and that is the signal: no cookie means the OAuth route.
+        cookie: String::new(),
+        refresh: got.refresh,
+        expires_at: got.expires_at,
+        app_token: app_token.unwrap_or_default(),
+    });
+    let p = auth::save_all(&all)?;
+    println!("stored {} in {} (0600)", got.team, p.display());
+    println!(
+        "\nThis route cannot read the unread counts in one call, has no typing\n\
+         indicators and no drafts, and its realtime needs an app-level token.\n\
+         The client disables what it cannot do rather than failing at it."
+    );
+    Ok(())
+}
+
+fn refresh_if_stale(a: &mut auth::Account) -> Result<()> {
+    if a.refresh.is_empty() || a.expires_at == 0 {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    if a.expires_at > now + 60 {
+        return Ok(());
+    }
+    let fresh = auth::oauth::refresh(&a.refresh)?;
+    a.token = fresh.token;
+    if !fresh.refresh.is_empty() {
+        a.refresh = fresh.refresh;
+    }
+    a.expires_at = fresh.expires_at;
+
+    // Written back one account at a time rather than all at once: a rewrite
+    // of the whole file here would drop any workspace that failed to load.
+    let mut all = auth::load_all().unwrap_or_default();
+    if let Some(slot) = all.iter_mut().find(|x| x.team == a.team) {
+        *slot = a.clone();
+        auth::save_all(&all)?;
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -191,10 +262,14 @@ fn main() -> Result<()> {
             return match what {
                 AuthCmd::Add {
                     paste,
+                    oauth,
+                    app_token,
                     browser,
                     timeout,
                 } => {
-                    if *paste {
+                    if *oauth {
+                        oauth_sign_in(browser.clone(), *timeout, app_token.clone())
+                    } else if *paste {
                         auth::add()
                     } else {
                         browser_sign_in(browser.clone(), *timeout)
@@ -273,12 +348,19 @@ fn main() -> Result<()> {
         }
     } else {
         let accounts = auth::load_all()?;
-        for a in accounts {
+        for mut a in accounts {
             let team = a.team.clone();
-            let r = runtime.block_on(SessionBackend::connect(Credentials {
+            // An expired OAuth token is refreshed before anything is asked of
+            // it. Doing it here, once, beats discovering it on the first
+            // request and having to unwind a half-built client.
+            if let Err(e) = refresh_if_stale(&mut a) {
+                eprintln!("{team}: could not refresh the token — {e}");
+            }
+            let r = runtime.block_on(WebBackend::connect(Credentials {
                 domain: a.team,
                 token: a.token,
                 cookie: a.cookie,
+                app_token: a.app_token,
             }));
             match r {
                 Ok(b) => backends.push((team, Arc::new(b))),
@@ -464,6 +546,7 @@ fn browser_sign_in(browser: Option<std::path::PathBuf>, timeout: u64) -> Result<
             team: t.domain.clone(),
             token: t.token.clone(),
             cookie: out.cookie.clone(),
+            ..Default::default()
         });
         println!("  stored {}", t.domain);
     }

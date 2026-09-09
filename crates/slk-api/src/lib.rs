@@ -9,10 +9,10 @@ pub mod backend;
 pub mod error;
 pub mod events;
 pub mod mock;
-pub mod session;
+pub mod web;
 
 pub use backend::{Boot, Capabilities, CountEntry, Counts, HistoryQuery, Page, SlackBackend};
 pub use error::{ErrorKind, Result, SlackError};
 pub use events::{EventStream, RtEvent};
 pub use mock::MockBackend;
-pub use session::{Credentials, SessionBackend};
+pub use web::{Credentials, Route, WebBackend};

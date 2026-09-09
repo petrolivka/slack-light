@@ -16,7 +16,9 @@ async fn wait_for<T>(
     rx: &mut tokio::sync::mpsc::Receiver<Event>,
     mut want: impl FnMut(&Event) -> Option<T>,
 ) -> Option<T> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Longer than the engine's outbox heartbeat, so a test that is waiting
+    // for a retry is waiting for the retry rather than racing it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {

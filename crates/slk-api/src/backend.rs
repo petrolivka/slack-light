@@ -26,6 +26,28 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// What an installed app can do.
+    ///
+    /// Measured against the documented API rather than guessed: `client.counts`
+    /// and `drafts.*` are not public methods at all, `chat.command` is not
+    /// either, and typing is a frame on a websocket this route does not have.
+    /// Realtime depends on an app-level token the person has to paste, so the
+    /// caller passes what it found rather than this deciding.
+    pub fn oauth(realtime: bool) -> Self {
+        Capabilities {
+            counts: false,
+            realtime,
+            typing: false,
+            // `users.getPresence` exists but there is no subscription, so it
+            // would have to be polled — FR-P2 grades that S for this route.
+            presence: false,
+            drafts: false,
+            // `stars.*` still answers for a user token; `saved.*` does not.
+            saved: true,
+            search: true,
+        }
+    }
+
     /// Everything the browser session route provides.
     pub fn session() -> Self {
         Capabilities {

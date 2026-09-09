@@ -68,6 +68,25 @@ would rather paste the token and cookie yourself, that still works.
 **Credentials never leave your machine**, are never logged, and are stored
 in the OS keyring when one exists, otherwise in a file only you can read.
 
+### Or install an app instead
+
+If reading a session out of a browser is not something you want to do — or
+not something your employer would want you to do — there is a documented
+route: create a Slack app of your own from
+[`contrib/slack-app-manifest.yml`](contrib/slack-app-manifest.yml), put its
+two ids in `~/.config/slack-light/oauth.toml`, and run
+`slack-light auth add --oauth`.
+
+It is less capable, and the client says so rather than failing at it: no
+unread counts in a single call, no typing indicators, no drafts, no muting,
+no workspace slash commands, and realtime only if you also paste an
+app-level token (`--app-token xapp-…`). `slack-light --doctor` names which
+route each workspace is on.
+
+There is no shipped client secret. One in an open-source binary is not a
+secret, and an app registered by this project would put everybody's access
+under a single installation somebody else can revoke.
+
 ## Where your data lives
 
 | Path | What |

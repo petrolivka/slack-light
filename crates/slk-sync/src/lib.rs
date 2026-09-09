@@ -412,7 +412,11 @@ impl Engine {
         // reconnects, so nothing ever retries, and a message waits for ever
         // in a client that looks perfectly connected. Found by a test that
         // made sends fail without dropping the socket.
-        let mut retry_queued = tokio::time::interval(Duration::from_secs(20));
+        //
+        // Five seconds: on an empty outbox it is one indexed SELECT that
+        // returns nothing, and a message that waits half a minute after the
+        // network came back is a message the person has already re-typed.
+        let mut retry_queued = tokio::time::interval(Duration::from_secs(5));
         retry_queued.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {

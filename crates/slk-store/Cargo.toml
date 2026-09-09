@@ -14,3 +14,12 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = []
+# FR-K5: encrypt the message cache at rest. Not the default, and deliberately
+# not: SQLCipher needs the system library, the key has to come from somewhere
+# (the keyring, or a prompt), and a cache that cannot be opened after a
+# keyring reset is worse than one that could have been read by somebody with
+# your disk. `--no-cache` is the answer for most people who ask for this.
+sqlcipher = ["rusqlite/sqlcipher"]

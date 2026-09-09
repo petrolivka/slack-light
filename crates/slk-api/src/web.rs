@@ -1,13 +1,22 @@
-//! The browser-session backend: an `xoxc` token and the `d` cookie.
+//! Slack's web API, over either of the two ways in.
 //!
-//! This is the route the client is built on, because it is the only one that
-//! reaches the endpoints the product's parity depends on — `client.counts` for
-//! every unread badge in a single call, `drafts.*`, `saved.list`, and a
-//! websocket that carries typing and presence. M0 measured all of it working.
+//! **Session** is an `xoxc` token and the `d` cookie read out of a browser.
+//! It is the route the client is built on, because it is the only one that
+//! reaches the endpoints parity depends on — `client.counts` for every unread
+//! badge in a single call, `drafts.*`, `saved.list`, and a websocket that
+//! carries typing and presence. M0 measured all of it working. It is also
+//! undocumented, so everything here assumes Slack will change it: defensive
+//! parsing, shapes pinned by fixtures rather than trusted.
 //!
-//! It is also undocumented, so everything here is written on the assumption
-//! that Slack will change it: one module, defensive parsing, and shapes pinned
-//! by fixtures rather than trusted.
+//! **OAuth** is an `xoxp` user token from an app the person installed
+//! themselves (FR-A5). Same host, same methods, same parsing — the difference
+//! is the header, a handful of endpoints that are not public, and Socket Mode
+//! instead of the client websocket. One module rather than two, because two
+//! implementations of `conversations.history` is how one of them stops
+//! matching the fixtures.
+//!
+//! What OAuth cannot do it says in `capabilities()`, so the interface
+//! disables the action rather than offering something that will fail.
 
 use crate::backend::*;
 use crate::error::{ErrorKind, Result, SlackError};
@@ -29,16 +38,42 @@ const USER_AGENT: &str = concat!(
     " (+https://github.com/petrolivka/slack-light)"
 );
 
+/// Which of the two ways in this is. See the module comment, and
+/// `docs/SLACK-ACCESS-STRATEGY.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// A browser session: `xoxc` plus the `d` cookie.
+    Session,
+    /// An app the user installed: `xoxp`, and only the documented methods.
+    OAuth,
+}
+
 #[derive(Clone)]
 pub struct Credentials {
     /// The `<team>.slack.com` subdomain.
     pub domain: String,
     pub token: String,
-    /// The value of the `d` cookie, without the `d=`.
+    /// The value of the `d` cookie, without the `d=`. Empty for OAuth, which
+    /// is what `Route::of` reads.
     pub cookie: String,
+    /// `xapp-…`, for Socket Mode. Only OAuth has one, and only if the person
+    /// pasted it: OAuth does not hand app-level tokens out.
+    pub app_token: String,
 }
 
-pub struct SessionBackend {
+impl Credentials {
+    pub fn route(&self) -> Route {
+        // A session token without its cookie is useless, so there is no
+        // ambiguous case to get wrong.
+        if self.cookie.is_empty() {
+            Route::OAuth
+        } else {
+            Route::Session
+        }
+    }
+}
+
+pub struct WebBackend {
     http: reqwest::Client,
     creds: Credentials,
     base: String,
@@ -62,9 +97,12 @@ pub struct SessionBackend {
     outbound: Arc<Mutex<Option<mpsc::Sender<String>>>>,
     /// Slack's frames are numbered per connection; so are ours.
     frame_id: Arc<std::sync::atomic::AtomicI64>,
+    /// Whether this is an Enterprise Grid org session, in which case every
+    /// call carries `team_id` — see `whoami`.
+    grid: Arc<Mutex<bool>>,
 }
 
-impl SessionBackend {
+impl WebBackend {
     /// Connect and identify. Fails with `ErrorKind::Auth` when the credentials
     /// are stale, which is the case the UI must handle without losing state.
     pub async fn connect(creds: Credentials) -> Result<Self> {
@@ -76,7 +114,7 @@ impl SessionBackend {
             .map_err(|e| SlackError::new("client", ErrorKind::Transport, e.to_string()))?;
 
         let base = format!("https://{}.slack.com/api", creds.domain);
-        let mut me = SessionBackend {
+        let mut me = WebBackend {
             http,
             creds,
             base,
@@ -87,11 +125,106 @@ impl SessionBackend {
             paused_until: Arc::new(Mutex::new(None)),
             outbound: Arc::new(Mutex::new(None)),
             frame_id: Arc::new(std::sync::atomic::AtomicI64::new(1000)),
+            grid: Arc::new(Mutex::new(false)),
         };
         let ws = me.whoami().await?;
         me.team = ws.id.clone();
         me.self_id = ws.self_id.clone();
         Ok(me)
+    }
+
+    /// The OAuth route's boot: what an installed app is actually allowed.
+    ///
+    /// `client.userBoot` gives the session route conversations, users, prefs
+    /// and the muted list in one call. There is no public equivalent, so this
+    /// is `users.conversations` and nothing else — no muted list (that is a
+    /// pref, and prefs are not readable), no notification settings, no users
+    /// (the engine resolves names one at a time as it needs them, which it
+    /// already does for the session route's unknown ids).
+    ///
+    /// The result is a client that boots a little emptier and fills in as it
+    /// goes, rather than one that pretends to know things it cannot ask.
+    async fn boot_oauth(&self) -> Result<Boot> {
+        let mut conversations = Vec::new();
+        let mut cursor = String::new();
+        // Paged, because a person in three hundred channels is not unusual and
+        // Slack's default page is a hundred.
+        for _ in 0..10 {
+            let mut form: Vec<(&str, &str)> = vec![
+                ("types", "public_channel,private_channel,im,mpim"),
+                ("exclude_archived", "true"),
+                ("limit", "200"),
+            ];
+            if !cursor.is_empty() {
+                form.push(("cursor", &cursor));
+            }
+            let v = self.call("users.conversations", &form).await?;
+            if let Some(a) = v.get("channels").and_then(Value::as_array) {
+                conversations.extend(a.iter().filter_map(|c| Conversation::parse(&self.team, c)));
+            }
+            cursor = v
+                .get("response_metadata")
+                .and_then(|m| m.get("next_cursor"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if cursor.is_empty() {
+                break;
+            }
+        }
+        Ok(Boot {
+            conversations,
+            users: Vec::new(),
+            muted: Vec::new(),
+            notify: Vec::new(),
+        })
+    }
+
+    /// A call authenticated with the *app-level* token rather than the user's.
+    ///
+    /// Exactly one method needs this — `apps.connections.open` — and it
+    /// refuses a user token, so it cannot go through `call`.
+    async fn app_call(&self, method: &str) -> Result<Value> {
+        let res = self
+            .http
+            .post(format!("{}/{method}", self.base))
+            .bearer_auth(&self.creds.app_token)
+            .send()
+            .await
+            .map_err(|e| SlackError::new(method, ErrorKind::Transport, e.to_string()))?;
+        let v: Value = res
+            .json()
+            .await
+            .map_err(|e| SlackError::new(method, ErrorKind::Shape, e.to_string()))?;
+        if v.get("ok").and_then(Value::as_bool) != Some(true) {
+            let detail = v
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason given");
+            return Err(SlackError::new(
+                method,
+                if detail.contains("auth") {
+                    ErrorKind::Auth
+                } else {
+                    ErrorKind::Other
+                },
+                detail,
+            ));
+        }
+        Ok(v)
+    }
+
+    /// "An installed app cannot do this", in the words a person can act on.
+    ///
+    /// Not `NotFound`, which reads as "that message is gone", and not a
+    /// silent success, which is worse than either: the interface shows this
+    /// text, and it has to name the route rather than the endpoint.
+    fn unsupported(what: &'static str) -> SlackError {
+        SlackError::new(
+            what,
+            ErrorKind::Permission,
+            "not available to an installed app — this needs the browser sign-in",
+        )
     }
 
     async fn call(&self, method: &str, form: &[(&str, &str)]) -> Result<Value> {
@@ -101,13 +234,29 @@ impl SessionBackend {
             tokio::time::sleep(left).await;
         }
         let _permit = self.gate.acquire().await.ok();
-        let res = self
+        // On Grid, `team_id` disambiguates which workspace in the org the
+        // call is about. Appended rather than merged into the caller's form,
+        // so a method that already sets its own wins.
+        let team = self.team.as_str().to_string();
+        let mut form = form.to_vec();
+        if *self.grid.lock().await && !form.iter().any(|(k, _)| *k == "team_id") {
+            form.push(("team_id", &team));
+        }
+        let form = &form[..];
+        let mut req = self
             .http
             .post(format!("{}/{method}", self.base))
-            .header("Cookie", format!("d={}", self.creds.cookie))
             // M0 measured that Bearer is accepted, which keeps the token out of
             // the request body and out of anything that logs bodies.
-            .bearer_auth(&self.creds.token)
+            .bearer_auth(&self.creds.token);
+        // Only the session route carries the cookie. Sending an empty `d=` on
+        // an OAuth request is not harmless: Slack has answered `invalid_auth`
+        // to it, which reads as a revoked token and sends the user to sign in
+        // again for no reason.
+        if self.creds.route() == Route::Session {
+            req = req.header("Cookie", format!("d={}", self.creds.cookie));
+        }
+        let res = req
             .form(form)
             .send()
             .await
@@ -176,7 +325,7 @@ impl SessionBackend {
 }
 
 #[async_trait]
-impl SlackBackend for SessionBackend {
+impl SlackBackend for WebBackend {
     fn team(&self) -> &TeamId {
         &self.team
     }
@@ -184,7 +333,10 @@ impl SlackBackend for SessionBackend {
         &self.self_id
     }
     fn capabilities(&self) -> Capabilities {
-        Capabilities::session()
+        match self.creds.route() {
+            Route::Session => Capabilities::session(),
+            Route::OAuth => Capabilities::oauth(!self.creds.app_token.is_empty()),
+        }
     }
 
     /// How much longer every request is holding off, if it is.
@@ -195,6 +347,16 @@ impl SlackBackend for SessionBackend {
 
     async fn whoami(&self) -> Result<Workspace> {
         let v = self.call("auth.test", &[]).await?;
+        // FR-A6. On Enterprise Grid the session is the *org's*, and several
+        // endpoints then answer for the wrong workspace unless `team_id`
+        // says which one. `auth.test` reports `enterprise_id` when that is
+        // the case; it is remembered here and sent from then on. Verified
+        // against the shape Slack documents, **not** against a Grid org —
+        // there is no Grid workspace to test with, and that is written down
+        // in M3-STATUS rather than implied by a green suite.
+        if v.get("enterprise_id").and_then(Value::as_str).is_some() {
+            *self.grid.lock().await = true;
+        }
         Ok(Workspace {
             id: TeamId::new(v["team_id"].as_str().unwrap_or_default()),
             name: v["team"].as_str().unwrap_or_default().to_string(),
@@ -204,6 +366,9 @@ impl SlackBackend for SessionBackend {
     }
 
     async fn boot(&self) -> Result<Boot> {
+        if self.creds.route() == Route::OAuth {
+            return self.boot_oauth().await;
+        }
         let v = self
             .call("client.userBoot", &[("_x_reason", "initial-data")])
             .await?;
@@ -268,6 +433,16 @@ impl SlackBackend for SessionBackend {
     }
 
     async fn counts(&self) -> Result<Counts> {
+        // `client.counts` is not a public method. The engine already asks
+        // `capabilities().counts` first, so this only ever runs if something
+        // stopped asking — and then it should say why rather than 404.
+        if self.creds.route() == Route::OAuth {
+            return Err(SlackError::new(
+                "client.counts",
+                ErrorKind::Permission,
+                "an installed app cannot read the unread counts in one call",
+            ));
+        }
         let v = self
             .call(
                 "client.counts",
@@ -558,6 +733,9 @@ impl SlackBackend for SessionBackend {
     /// route has no equivalent, which is why the capability is declared rather
     /// than assumed.
     async fn follow_thread(&self, ch: &ChannelId, thread: &Ts, on: bool) -> Result<()> {
+        if self.creds.route() == Route::OAuth {
+            return Err(Self::unsupported("subscriptions.thread"));
+        }
         let method = if on {
             "subscriptions.thread.add"
         } else {
@@ -726,6 +904,12 @@ impl SlackBackend for SessionBackend {
                 }
             }
             ChannelOp::SetMuted(all) => {
+                // Muting is a user preference, and `users.prefs.set` is not a
+                // public method. The interface shows the refusal rather than
+                // leaving a mute that looks applied until the next boot.
+                if self.creds.route() == Route::OAuth {
+                    return Err(Self::unsupported("users.prefs.set"));
+                }
                 let value = all.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(",");
                 self.call(
                     "users.prefs.set",
@@ -738,6 +922,9 @@ impl SlackBackend for SessionBackend {
     }
 
     async fn slash(&self, ch: &ChannelId, command: &str, text: &str) -> Result<()> {
+        if self.creds.route() == Route::OAuth {
+            return Err(Self::unsupported("chat.command"));
+        }
         // `chat.command` is the web client's own path, and the only one that
         // reaches an app's slash command as the user.
         self.call(
@@ -762,6 +949,22 @@ impl SlackBackend for SessionBackend {
         // The fallback fires on the two answers that mean "this endpoint is
         // not what you think it is", and on nothing else: a genuine auth
         // failure has to surface rather than be retried against another method.
+        // An installed app has `stars:write` and no `saved.*` at all, so it
+        // goes straight to the endpoint the fallback would have reached.
+        if self.creds.route() == Route::OAuth {
+            let legacy = if on { "stars.add" } else { "stars.remove" };
+            return match self
+                .call(
+                    legacy,
+                    &[("channel", ch.as_str()), ("timestamp", ts.as_str())],
+                )
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(e) if e.detail == "already_starred" || e.detail == "not_starred" => Ok(()),
+                Err(e) => Err(e),
+            };
+        }
         let method = if on { "saved.add" } else { "saved.remove" };
         let form = [("channel", ch.as_str()), ("ts", ts.as_str())];
         match self.call(method, &form).await {
@@ -918,6 +1121,12 @@ impl SlackBackend for SessionBackend {
     }
 
     async fn typing(&self, ch: &ChannelId) -> Result<()> {
+        // Socket Mode is inbound only; there is no frame to send. Silently,
+        // because `capabilities().typing` already said so and an indicator
+        // must never be the reason anything fails.
+        if self.creds.route() == Route::OAuth {
+            return Ok(());
+        }
         // Down the socket the client already has. Dropped silently when there
         // is no socket, and never retried: by the time a retry landed the
         // person has either sent the message or stopped typing.
@@ -937,15 +1146,37 @@ impl SlackBackend for SessionBackend {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-        // Prefer the URL Slack pushed. M0 measured that an old handshake URL
-        // also still works, but this is the path Slack intends.
-        let url = match self.reconnect_url.lock().await.clone() {
-            Some(u) => u,
-            None => format!(
-                "wss://wss-primary.slack.com/?token={}&gateway_server={}-1&slack_client=desktop&batch_presence_aware=1",
-                self.creds.token,
-                self.team.as_str()
-            ),
+        let url = if self.creds.route() == Route::OAuth {
+            // Socket Mode, the only realtime an installed app has. It needs an
+            // app-level token, which OAuth does not hand out — the person
+            // pastes it. Without one there is no stream, and `capabilities()`
+            // already said so, so the engine polls rather than waiting for
+            // events that will never come.
+            if self.creds.app_token.is_empty() {
+                return Ok(None);
+            }
+            let v = self.app_call("apps.connections.open").await?;
+            match v.get("url").and_then(Value::as_str) {
+                Some(u) => u.to_string(),
+                None => {
+                    return Err(SlackError::new(
+                        "apps.connections.open",
+                        ErrorKind::Shape,
+                        "no url",
+                    ))
+                }
+            }
+        } else {
+            // Prefer the URL Slack pushed. M0 measured that an old handshake
+            // URL also still works, but this is the path Slack intends.
+            match self.reconnect_url.lock().await.clone() {
+                Some(u) => u,
+                None => format!(
+                    "wss://wss-primary.slack.com/?token={}&gateway_server={}-1&slack_client=desktop&batch_presence_aware=1",
+                    self.creds.token,
+                    self.team.as_str()
+                ),
+            }
         };
 
         let mut req = url
@@ -967,6 +1198,7 @@ impl SlackBackend for SessionBackend {
             .await
             .map_err(|e| SlackError::new("ws", ErrorKind::Transport, e.to_string()))?;
 
+        let socket_mode = self.creds.route() == Route::OAuth;
         let (tx, rx) = mpsc::channel(256);
         // Frames this client wants to send: typing, and nothing else so far.
         // Bounded and `try_send`-only, so a stalled socket drops indicators
@@ -1016,13 +1248,35 @@ impl SlackBackend for SessionBackend {
                         match frame {
                             Ok(WsMessage::Text(t)) => {
                                 let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
+                                // Socket Mode wraps every event in an
+                                // envelope and expects it acknowledged; an
+                                // unacknowledged envelope is redelivered
+                                // three times and then the connection is
+                                // dropped, which reads as a flaky network.
+                                let v = if socket_mode {
+                                    if let Some(id) = v.get("envelope_id").and_then(Value::as_str) {
+                                        let ack = format!(r#"{{"envelope_id":"{id}"}}"#);
+                                        let _ = sink.send(WsMessage::Text(ack.into())).await;
+                                    }
+                                    match v.get("payload").and_then(|p| p.get("event")) {
+                                        Some(e) => e.clone(),
+                                        // `hello`, `disconnect` and the
+                                        // acknowledgements of our own acks
+                                        // carry no event.
+                                        None => v.clone(),
+                                    }
+                                } else {
+                                    v
+                                };
                                 let Some(ev) = events::parse(&v) else { continue };
                                 match &ev {
-                                    RtEvent::Hello if !subscribed => {
+                                    // Presence is one of the two features the
+                                    // session route exists for, and Slack
+                                    // reports none until asked. Socket Mode
+                                    // has no such subscription — it is an
+                                    // events stream, not a client socket.
+                                    RtEvent::Hello if !subscribed && !socket_mode => {
                                         subscribed = true;
-                                        // Presence is one of the two features
-                                        // this route exists for, and Slack
-                                        // reports none until asked.
                                         let ids = watch
                                             .iter()
                                             .map(|i| format!("\"{i}\""))

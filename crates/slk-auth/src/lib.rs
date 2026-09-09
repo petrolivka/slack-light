@@ -10,17 +10,46 @@
 //! same user can read out of `/proc`, or a command line, which is in `ps`.
 
 pub mod browser;
+pub mod oauth;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Account {
     /// The `<team>.slack.com` subdomain.
     pub team: String,
     pub token: String,
+    /// The `d` cookie for a browser session. Empty for an OAuth install,
+    /// which is how the two are told apart — a session token without its
+    /// cookie is useless, so there is no ambiguous case.
+    #[serde(default)]
     pub cookie: String,
+    /// Set when the workspace's app has token rotation turned on. Empty
+    /// otherwise, and Slack then never expires the token.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub refresh: String,
+    /// Unix time the access token stops working, or zero for never.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub expires_at: i64,
+    /// `xapp-…`. Socket Mode is the only realtime the official route has, and
+    /// it needs an app-level token that OAuth does not hand out — the person
+    /// copies it from the app's own settings page. Without one the backend
+    /// says `realtime: false` rather than pretending.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_token: String,
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
+}
+
+impl Account {
+    /// Which of the two routes this account is. See `SLACK-ACCESS-STRATEGY`.
+    pub fn is_oauth(&self) -> bool {
+        self.cookie.is_empty()
+    }
 }
 
 pub fn path() -> PathBuf {
@@ -189,6 +218,7 @@ Open the workspace in your browser, then open developer tools on that tab.
         team,
         token,
         cookie: cookie.trim_start_matches("d=").to_string(),
+        ..Default::default()
     };
     let p = add_account(account)?;
     let n = load_all().map(|a| a.len()).unwrap_or(1);

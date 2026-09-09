@@ -87,6 +87,18 @@ pub fn report(anonymous: bool) -> Result<()> {
     );
 
     println!("\nsign-in");
+    let app = slk_auth::oauth::app_path();
+    println!(
+        "  official app    {}",
+        if app.is_file() {
+            match slk_auth::oauth::load_app() {
+                Ok(_) => format!("registered — {}", app.display()),
+                Err(_) => format!("{} is there but unreadable", app.display()),
+            }
+        } else {
+            "none — `auth add --oauth` explains how to create one".into()
+        }
+    );
     match slk_auth::browser::find_browser(None) {
         Ok(p) => println!("  browser         {}", p.display()),
         Err(_) => println!("  browser         none found (chromium, google-chrome, brave) — `auth add --paste` still works"),
@@ -112,7 +124,19 @@ pub fn report(anonymous: bool) -> Result<()> {
             Ok(all) => {
                 println!("  credentials     {} (0600)", slk_auth::path().display());
                 for a in all {
-                    println!("  workspace       {}", a.team);
+                    // Which route, and therefore which features. Somebody
+                    // wondering why there are no typing indicators should be
+                    // able to find the answer here rather than in the source.
+                    let route = if a.is_oauth() {
+                        if a.app_token.is_empty() {
+                            "app (no realtime: no app-level token)"
+                        } else {
+                            "app (Socket Mode)"
+                        }
+                    } else {
+                        "browser session"
+                    };
+                    println!("  workspace       {} — {route}", a.team);
                 }
             }
             Err(_) => println!("  none stored. Run `slack-light auth add`."),

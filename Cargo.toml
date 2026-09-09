@@ -29,7 +29,7 @@ unicode-width = "0.2"
 unicode-segmentation = "1"
 emojis = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "multipart", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "multipart", "stream", "blocking"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -57,6 +57,9 @@ pkg-fmt = "tgz"
 [features]
 default = []
 dev-tools = []
+# FR-K5. Passed through to the store; see its Cargo.toml for why it is not
+# the default.
+sqlcipher = ["slk-store/sqlcipher"]
 
 [lib]
 name = "slack_light"

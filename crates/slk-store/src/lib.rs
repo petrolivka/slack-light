@@ -24,6 +24,26 @@ pub struct Store {
 impl Store {
     /// Open or create the store. `None` is an in-memory database, which is what
     /// `--no-cache` and every test use.
+    /// The key for an encrypted store, from the environment.
+    ///
+    /// Only compiled with `--features sqlcipher`, and deliberately not
+    /// prompted for: a client that asks for a passphrase at start-up is one
+    /// people run with the passphrase in their shell history. `SLACK_LIGHT_KEY`
+    /// is meant to come from a keyring helper in the launcher.
+    #[cfg(feature = "sqlcipher")]
+    fn apply_key(db: &Connection) -> Result<()> {
+        let key = std::env::var("SLACK_LIGHT_KEY")
+            .context("built with sqlcipher but SLACK_LIGHT_KEY is not set")?;
+        // `PRAGMA key` takes the passphrase as a string literal, so a quote in
+        // it has to be doubled or the pragma is malformed rather than wrong.
+        db.pragma_update(None, "key", key.replace('\'', "''"))?;
+        // Proves the key before anything else runs: without this a wrong key
+        // fails on the first query, which is a stack away from the cause.
+        db.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .context("the cache will not open — wrong SLACK_LIGHT_KEY?")?;
+        Ok(())
+    }
+
     pub fn open(path: Option<&Path>) -> Result<Self> {
         let db = match path {
             Some(p) => {
@@ -42,6 +62,10 @@ impl Store {
             }
             None => Connection::open_in_memory()?,
         };
+        // Before anything else touches the database: with SQLCipher, an
+        // un-keyed connection cannot even read the schema version.
+        #[cfg(feature = "sqlcipher")]
+        Self::apply_key(&db)?;
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
 
         let version: i64 = db

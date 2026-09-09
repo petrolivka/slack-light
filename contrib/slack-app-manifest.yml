@@ -1,0 +1,82 @@
+# The app slack-light asks you to create, if you would rather not read a
+# session out of your browser.
+#
+# Create it at https://api.slack.com/apps?new_app=1 → "From a manifest",
+# paste this, then put the app's Client ID and Client Secret into
+# ~/.config/slack-light/oauth.toml:
+#
+#     client_id = "…"
+#     client_secret = "…"
+#
+# Then: slack-light auth add --oauth
+#
+# There is no shipped client secret. One in an open-source binary is not a
+# secret, and an app registered by this project would put every user's access
+# under one installation somebody else can revoke.
+#
+# Every scope here is one the client uses; the list is checked against
+# slk_auth::oauth::SCOPES. If you do not want a feature, remove its scope —
+# the client disables what it cannot do rather than failing at it.
+#
+# What this route cannot do, whatever you grant: read every unread badge in
+# one call (client.counts is not public), send or receive typing indicators,
+# sync drafts, mute a conversation (users.prefs.set is not public), or run a
+# workspace slash command as you (chat.command is not public). Realtime needs
+# the app-level token from Basic Information → App-Level Tokens, with
+# connections:write, passed as `--app-token xapp-…`.
+
+display_information:
+  name: slack-light
+  description: A native, lightweight Slack client for Linux desktops
+  background_color: "#1a1d21"
+
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: false
+
+oauth_config:
+  redirect_urls:
+    - http://127.0.0.1:41751/callback
+  scopes:
+    user:
+      - channels:history
+      - channels:read
+      - channels:write
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - mpim:history
+      - mpim:read
+      - chat:write
+      - reactions:read
+      - reactions:write
+      - search:read
+      - users:read
+      - users.profile:write
+      - files:read
+      - files:write
+      - pins:read
+      - pins:write
+      - stars:read
+      - stars:write
+      - dnd:write
+      - emoji:read
+
+settings:
+  # Off unless you pass --app-token. Socket Mode is the only realtime an
+  # installed app has, and it needs an app-level token OAuth does not issue.
+  socket_mode_enabled: true
+  event_subscriptions:
+    user_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+      - reaction_added
+      - reaction_removed
+  org_deploy_enabled: false
+  # Token rotation is optional. With it on, access tokens expire in twelve
+  # hours and slack-light refreshes them before each start.
+  token_rotation_enabled: false
