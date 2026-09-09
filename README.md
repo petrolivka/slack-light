@@ -30,7 +30,7 @@ Built for Wayland, verified on Hyprland, themed by
 > the keyboard and asserted through the accessibility tree — and then
 > built. See [ADR-001](docs/ADR-001-native-gui.md)
 > for why, [the findings](docs/M0-GUI-FINDINGS.md) for the spike numbers,
-> and [M2-STATUS.md](docs/M2-STATUS.md) for what works today and what does
+> and [M3-STATUS.md](docs/M3-STATUS.md) for what works today and what does
 > not — including one measurement that had to be taken back.
 
 ---
@@ -146,7 +146,7 @@ Needs GTK 4.14+ development files (`gtk4` on Arch). No libadwaita.
 | [docs/SLACK-ACCESS-STRATEGY.md](docs/SLACK-ACCESS-STRATEGY.md) | Session token vs official app: coverage, stability, rate limits, risk |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crates, data model, storage, sync engine, the GTK runtime, theming, config |
 | [docs/M0-GUI-SPIKE-PLAN.md](docs/M0-GUI-SPIKE-PLAN.md) | What the GTK client must prove before anything else is built |
-| [docs/M0-GUI-FINDINGS.md](docs/M0-GUI-FINDINGS.md) · [docs/M1-STATUS.md](docs/M1-STATUS.md) · [docs/M2-STATUS.md](docs/M2-STATUS.md) | What the GTK spikes measured; what the skeleton delivered; where parity stands |
+| [docs/M0-GUI-FINDINGS.md](docs/M0-GUI-FINDINGS.md) · [docs/M1-STATUS.md](docs/M1-STATUS.md) · [docs/M2-STATUS.md](docs/M2-STATUS.md) · [docs/M3-STATUS.md](docs/M3-STATUS.md) | What the GTK spikes measured; what the skeleton delivered; where parity stands; what polish added, and what it decided against |
 | [docs/M0-SPIKE-PLAN.md](docs/M0-SPIKE-PLAN.md) · [docs/M0-FINDINGS.md](docs/M0-FINDINGS.md) | The original spike: what was proved about Slack's API, measured against a live workspace |
 
 ## Licence
