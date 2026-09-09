@@ -96,6 +96,114 @@ impl MockBackend {
         self
     }
 
+    /// Fill `#engineering` with `n` more messages cycling through every
+    /// construct the renderer has to draw — bold, code, links, mentions,
+    /// emoji, quotes, lists, code blocks, long prose, and every fiftieth one a
+    /// Block Kit payload. For the interface to be measured against a
+    /// conversation the size of a real one, not the size of a demo.
+    ///
+    /// They are dated before the seed, one second apart, so the demo's own
+    /// story still ends the conversation.
+    pub fn with_synthetic(self, n: usize) -> Self {
+        let team = self.team.clone();
+        let eng = ChannelId::new(format!("C0ENG{}", &team.as_str()[1..2]));
+        let users = ["U0ALICE", "U0BOB", "U0CAROL", "U0SELF"];
+        let corpus: [&str; 12] = [
+            "plain sentence number {i}, nothing special about it",
+            "*bold* and _italic_ and ~struck~ and `code` in one line ({i})",
+            "see <https://example.com/issues/{i}|issue {i}> and <https://example.com/raw>",
+            "cc <@U0ALICE> and <#C0ENG0|engineering> and <!here> ({i})",
+            "shipped :rocket: :tada: :white_check_mark: ({i})",
+            "> a quoted line ({i})\n> that continues\nand a reply after it",
+            "• first item ({i})\n• second item\n• third item",
+            "1. one ({i})\n2. two\n3. three",
+            "```\nfn main() {{\n    println!(\"{i}\");\n}}\n```",
+            "a longer message so that wrapping has something to do: the deploy of build {i} \
+             went through staging, then canary, then the two regional clusters, and every \
+             dashboard stayed green the whole way, which is the first time this quarter",
+            "日本語のテキスト と emoji 👨‍👩‍👧‍👦 と ligatures ({i})",
+            "&lt;not a tag&gt; &amp; escaped ({i})",
+        ];
+        let base: i64 = 1_725_600_000;
+        let mut msgs = Vec::with_capacity(n);
+        for i in 0..n {
+            let ts = format!("{}.{:06}", base + i as i64, 100);
+            let user = users[i % users.len()];
+            let mut v = if i % 50 == 49 {
+                json!({
+                    "type": "message", "user": "U0BOB", "ts": ts,
+                    "text": format!("Deploy summary #{i}"),
+                    "blocks": [
+                        {"type": "header", "text": {"type": "plain_text", "text": format!("Deploy #{i} finished")}},
+                        {"type": "section",
+                         "text": {"type": "mrkdwn", "text": "*Status:* green :white_check_mark:\nAll clusters healthy."},
+                         "fields": [
+                            {"type": "mrkdwn", "text": "*Duration*\n3m 12s"},
+                            {"type": "mrkdwn", "text": "*Commit*\n`a1b2c3d`"},
+                            {"type": "mrkdwn", "text": "*Clusters*\neu-1, eu-2, us-1"},
+                            {"type": "mrkdwn", "text": "*Errors*\n0"}
+                         ],
+                         "accessory": {"type": "button", "text": {"type": "plain_text", "text": "Dashboard"},
+                                       "url": "https://example.com/dash"}},
+                        {"type": "context", "elements": [{"type": "mrkdwn", "text": "triggered by <@U0ALICE> · main"}]},
+                        {"type": "divider"},
+                        {"type": "actions", "elements": [
+                            {"type": "button", "text": {"type": "plain_text", "text": "Open build"}, "url": format!("https://example.com/build/{i}"), "style": "primary"},
+                            {"type": "button", "text": {"type": "plain_text", "text": "Rollback"}, "style": "danger"}
+                        ]}
+                    ]
+                })
+            } else {
+                let text = corpus[i % corpus.len()].replace("{i}", &i.to_string());
+                json!({"type": "message", "user": user, "ts": ts, "text": text})
+            };
+            if i % 7 == 6 {
+                v["reactions"] = json!([{"name": "+1", "count": 2, "users": ["U0ALICE", "U0BOB"]}]);
+            }
+            if let Some(m) = Message::parse(&team, &eng, &self.self_id, &v) {
+                msgs.push(m);
+            }
+        }
+        {
+            let mut all = self.messages.lock().unwrap();
+            let entry = all.entry(eng.as_str().to_string()).or_default();
+            msgs.append(entry);
+            *entry = msgs;
+        }
+        self
+    }
+
+    /// Post `path` as a picture into `#engineering`, so the demo has an
+    /// image to draw. Goes through the same `upload` the client uses, which
+    /// is what makes the download side real.
+    pub fn with_image(self, path: &std::path::Path) -> Self {
+        let team = self.team.clone();
+        let eng = ChannelId::new(format!("C0ENG{}", &team.as_str()[1..2]));
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "picture.png".into());
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let url = format!("mock://{name}");
+        self.uploaded
+            .lock()
+            .unwrap()
+            .insert(url.clone(), path.to_path_buf());
+        let v = json!({
+            "type": "message", "subtype": "file_share", "user": "U0ALICE",
+            "ts": "1725701800.000100", "text": "screenshot from the canary",
+            "files": [{"id": "F0SPIKE", "name": name, "size": size, "mimetype": "image/png",
+                       "url_private": url, "original_w": 320, "original_h": 200}],
+        });
+        if let Some(m) = Message::parse(&team, &eng, &self.self_id, &v) {
+            let mut all = self.messages.lock().unwrap();
+            let entry = all.entry(eng.as_str().to_string()).or_default();
+            entry.push(m);
+            entry.sort_by(|a, b| a.ts.cmp(&b.ts));
+        }
+        self
+    }
+
     fn seed(&mut self) {
         let t = &self.team;
         let team_id = t.as_str().to_string();
