@@ -86,7 +86,11 @@ const DEFAULTS: &[(Action, &str)] = &[
     (Action::CopyLink, "<Control>l"),
     (Action::Star, "<Control><Alt>s"),
     (Action::Mute, "<Control><Alt>m"),
-    (Action::Pinned, "<Control>p"),
+    // Not <Control><Alt>p, which reads better and is already this table's
+    // default for the palette. Two entries wanting one chord is a latent
+    // collision that only shows up under a preset that leaves the other one
+    // unbound, and the test below refuses it.
+    (Action::Pinned, "<Control><Alt>i"),
     // Topic, purpose, invite and leave are deliberately keyless: they are
     // rare, they are not reversible by pressing the same key again, and a
     // mis-typed chord that leaves a channel is not a mistake anyone forgives.
@@ -165,4 +169,29 @@ pub fn install(app: &gtk::Application, preset: &str, sender: relm4::Sender<Msg>)
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULTS;
+    use std::collections::HashMap;
+
+    /// No two defaults may ask for the same chord.
+    ///
+    /// The first-claimant rule makes a collision survivable rather than
+    /// silent, but which of the two wins then depends on the preset: under
+    /// one keymap the pinned list has a key and under another it does not,
+    /// and nothing says why. Within this table it is simply a mistake.
+    #[test]
+    fn no_two_defaults_want_the_same_chord() {
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        for (action, accel) in DEFAULTS {
+            if let Some(other) = seen.insert(accel, action.name()) {
+                panic!(
+                    "{accel} is the default for both {other} and {}",
+                    action.name()
+                );
+            }
+        }
+    }
 }

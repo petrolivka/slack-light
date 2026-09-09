@@ -5,6 +5,10 @@
 #
 #   tests/a11y/e2e.sh [path-to-slack-light] [screenshot-dir]
 #
+# It needs the desktop to itself. Keystrokes go to the compositor, not to a
+# window, so whatever holds the keyboard receives them; the run aborts rather
+# than typing anywhere else.
+#
 # Input goes in through wtype (the Wayland virtual-keyboard protocol);
 # focus is put on the window through Hyprland's dispatcher; the assertions
 # read the AT-SPI tree with tree.py. Nothing here touches a real account:
@@ -17,7 +21,37 @@ CLASS=dev.olivka.slack_light
 pass=0; fail=0
 check() { if [ "$2" = 1 ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1   ${3:-}"; fail=$((fail+1)); fi; }
 tree() { python3 "$HERE/tree.py" "$@" 2>/dev/null; }
-focus() { hyprctl dispatch "hl.dsp.focus({ window = \"class:$CLASS\" })" >/dev/null 2>&1; sleep 0.3; }
+# Measured on Hyprland 0.56.2: `hl.dsp.focus({ window = "class:..." })`
+# answers `ok` — it does find the window, an unmatched selector answers
+# `window not found` instead — and does not move the keyboard when another
+# window is holding it. There is no dispatcher that takes focus by force.
+# So this is a request, not a guarantee, and `w` below checks the result.
+focus() { hyprctl dispatch "hl.dsp.focus({ window = \"class:$CLASS\" })" >/dev/null 2>&1; sleep 0.4; }
+
+# Nothing is typed until the window under test is the one that will receive
+# it. `wtype` talks to the compositor, not to a window: whatever has the
+# keyboard gets the keystrokes. On this machine that could be the developer's
+# real Slack, which is the accident CONTRIBUTING rule 1 is about, and it is
+# also why a run with focus quietly elsewhere reports thirty failures that
+# say nothing about the client. So: check, try once to take focus back, and
+# if that fails abort the run rather than type into somebody's #general.
+w() {
+  local c
+  c=$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // ""')
+  if [ "$c" != "$CLASS" ]; then
+    focus
+    c=$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // ""')
+  fi
+  if [ "$c" != "$CLASS" ]; then
+    echo
+    echo "  ABORTED: the keyboard belongs to '${c:-nothing}', not to $CLASS."
+    echo "  Nothing was typed. This suite drives the real keyboard; it needs"
+    echo "  the desktop to itself. Close what took focus and run it again."
+    pkill -x slack-light 2>/dev/null
+    exit 2
+  fi
+  wtype "$@"
+}
 shot() { local g; g=$(hyprctl clients -j | jq -r ".[] | select(.class==\"$CLASS\") | \"\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])\"" | head -1); [ -n "$g" ] && grim -g "$g" "$1"; }
 
 # A stray window from an earlier run confuses tree.py, which reads the first
@@ -34,57 +68,57 @@ check "the window is on the a11y bus with its rows" "$( [ "$(echo "$t" | grep -c
 check "the composer is a text field in the tree" "$( echo "$t" | grep -qE '^ *(text|entry)' && echo 1 || echo 0 )"
 
 # E1: ctrl-k, type, Enter → the conversation opens.
-wtype -M ctrl k -m ctrl; sleep 0.4
-wtype "des"; sleep 0.3
-wtype -k Return; sleep 1.2
+w -M ctrl k -m ctrl; sleep 0.4
+w "des"; sleep 0.3
+w -k Return; sleep 1.2
 check "ctrl-k, 'des', Enter opens #design" "$( tree | grep -q "label '# design'" && echo 1 || echo 0 )" "$(tree | grep "label '#" | head -2 | tr '\n' ' ')"
 
 # E2: after the jump, focus is back on the composer: typing lands there.
-wtype "keyboard test"; sleep 0.2; wtype -k Return; sleep 2.5
+w "keyboard test"; sleep 0.2; w -k Return; sleep 2.5
 check "typing after the jump goes to the composer and sends" "$( tree | grep -q "keyboard test" && echo 1 || echo 0 )"
 check "the send was confirmed by the engine" "$( grep -q send_confirmed_ms "$LOG" && echo 1 || echo 0 )"
 
 # Completion. The popup offers, Enter takes, and the rest is unit-tested:
 # a resolved mention renders as the name it started as, so the tree cannot
 # tell `<@U0ALICE>` from `@alice` — slk-core's tests do that.
-wtype "hi @al"; sleep 1.0
+w "hi @al"; sleep 1.0
 check "typing @ offers the people" "$( tree | grep -q "label '@alice'" && echo 1 || echo 0 )"
-wtype -k Return; sleep 0.4
-wtype ":roc"; sleep 1.0
+w -k Return; sleep 0.4
+w ":roc"; sleep 1.0
 check "typing a shortcode offers emoji, best first" "$( tree | grep -A1 "list item" | grep -q ':rocket:' && echo 1 || echo 0 )" "$(tree | grep -oE "':[a-z]+:'" | head -2 | tr '\n' ' ')"
-wtype -k Escape; sleep 0.3
+w -k Escape; sleep 0.3
 check "escape closes the completions and leaves the draft" "$( tree | grep -q ':rocket:' && echo 0 || echo 1 )"
 
 # A draft survives a look at another conversation. Losing one is the thing
 # people never forgive a chat client for.
-wtype -M alt -k Up -m alt; sleep 1.2
-wtype -M alt -k Down -m alt; sleep 1.2
-wtype -k Return; sleep 2.0
+w -M alt -k Up -m alt; sleep 1.2
+w -M alt -k Down -m alt; sleep 1.2
+w -k Return; sleep 2.0
 check "a draft survives leaving the conversation" "$( tree | grep -q 'hi @alice :roc' && echo 1 || echo 0 )" "$(tree | grep -oE "'hi @alice[^']*'" | head -1)"
 
 # E1: alt-Up moves to the previous conversation without the mouse.
-wtype -M alt -k Up -m alt; sleep 1.2
+w -M alt -k Up -m alt; sleep 1.2
 check "alt-Up moves to the previous conversation" "$( tree | grep -q "label '🔒 leads'" && echo 1 || echo 0 )" "$(tree | grep -E "label '(#|🔒)" | head -2 | tr '\n' ' ')"
 
 # Escape from anywhere returns to the composer; ctrl-u clears it.
-wtype "abc"; sleep 0.2; wtype -M ctrl u -m ctrl; sleep 0.3; wtype -k Escape; sleep 0.3
-wtype "after escape"; sleep 0.2; wtype -k Return; sleep 1.2
+w "abc"; sleep 0.2; w -M ctrl u -m ctrl; sleep 0.3; w -k Escape; sleep 0.3
+w "after escape"; sleep 0.2; w -k Return; sleep 1.2
 check "escape and ctrl-u leave a usable, empty composer" "$( tree | grep -q "after escape" && echo 1 || echo 0 )"
 
 # The message cursor, and a reaction on the message it lands on. alt-k
 # selects; alt-1 is the first quick reaction, which is :+1:.
-wtype -M alt k -m alt; sleep 0.4
+w -M alt k -m alt; sleep 0.4
 check "alt-k puts a cursor on a message" "$( tree --states | grep -q 'list item .*\[selected\]' && echo 1 || echo 0 )" "$(tree --states | grep -c selected) selected nodes"
 before=$(tree | grep -c '👍' || true)
-wtype -M alt 1 -m alt; sleep 1.0
+w -M alt 1 -m alt; sleep 1.0
 after=$(tree | grep -c '👍' || true)
 check "alt-1 adds a reaction chip to it" "$( [ "$after" -gt "$before" ] && echo 1 || echo 0 )" "before=$before after=$after"
 
 # The thread pane: alt-t opens it on the message under the cursor, alt-w
 # closes it. Both go through the same code the row's ↳ link does.
-wtype -M alt t -m alt; sleep 1.5
+w -M alt t -m alt; sleep 1.5
 check "alt-t opens the thread pane" "$( tree | grep -q "label 'Thread" && echo 1 || echo 0 )"
-wtype -M alt w -m alt; sleep 0.6
+w -M alt w -m alt; sleep 0.6
 check "alt-w closes it again" "$( tree | grep -q "label 'Thread" && echo 0 || echo 1 )"
 
 # Save then pin, back to back, on a message of our own. Two defects in one
@@ -92,71 +126,100 @@ check "alt-w closes it again" "$( tree | grep -q "label 'Thread" && echo 0 || ec
 # replacement used to be grouped against the end of the list, which for the
 # newest message is itself), and the second action only finds a message if
 # the cursor survived the first one's echo.
-wtype "mine to keep"; sleep 0.3; wtype -k Return; sleep 2.0
-wtype -M alt g -m alt; sleep 0.4
-wtype -M alt s -m alt; sleep 1.2
+w "mine to keep"; sleep 0.3; w -k Return; sleep 2.0
+w -M alt g -m alt; sleep 0.4
+w -M alt s -m alt; sleep 1.2
 saved=$( tree | grep -c 'saved for later' )
-wtype -M alt p -m alt; sleep 1.2
+w -M alt p -m alt; sleep 1.2
 marks=$(tree | grep -oE "'📌[^']*'" | tr '\n' ' ')
 check "save reports back" "$( [ "$saved" -gt 0 ] && echo 1 || echo 0 )"
 check "pin finds the same message, and the row shows both marks" "$( echo "$marks" | grep -q 'pinned · 🔖 saved' && echo 1 || echo 0 )" "marks=[$marks]"
 
 # Editing one's own message, and the refusal on somebody else's.
-wtype -M alt e -m alt; sleep 0.5
+w -M alt e -m alt; sleep 0.5
 check "alt-e says what enter will do now" "$( tree | grep -q 'editing — enter saves' && echo 1 || echo 0 )"
-wtype " (fixed)"; sleep 0.2; wtype -k Return; sleep 2.0
+w " (fixed)"; sleep 0.2; w -k Return; sleep 2.0
 check "the edit lands, marked as one" "$( tree | grep -q 'mine to keep (fixed)' && echo 1 || echo 0 )"
 # #engineering is the one conversation the mock seeds with other people's
 # messages and this run never types into, so its oldest message is somebody
 # else's for certain — #general and #design start empty.
-wtype -M ctrl k -m ctrl; sleep 0.4; wtype "engi"; sleep 0.3; wtype -k Return; sleep 2.5
-wtype -M alt -k Home -m alt; sleep 1.0; wtype -M alt e -m alt; sleep 0.6
+w -M ctrl k -m ctrl; sleep 0.4; w "engi"; sleep 0.3; w -k Return; sleep 2.5
+w -M alt -k Home -m alt; sleep 1.0; w -M alt e -m alt; sleep 0.6
 check "editing somebody else's message is refused in words" "$( tree | grep -q 'only edit your own' && echo 1 || echo 0 )" "status=$(tree | grep -oE "label '[^']*'" | tail -2 | head -1)"
 
 # A slash command the workspace does not know must not eat what was typed.
-wtype "/nonsense here"; sleep 0.3; wtype -k Return; sleep 2.0
+w "/nonsense here"; sleep 0.3; w -k Return; sleep 2.0
 check "an unknown slash command says so" "$( tree | grep -q 'not a command this workspace knows' && echo 1 || echo 0 )"
 check "and the text comes back to the composer" "$( grep -q '^slash_returned=/nonsense here$' "$LOG" && echo 1 || echo 0 )" "$(grep '^slash_returned=' "$LOG" | head -1)"
-wtype -M ctrl u -m ctrl; sleep 0.3
+w -M ctrl u -m ctrl; sleep 0.3
 
 # The image viewer, from the keyboard so the suite can see it. The demo's
 # second-newest message in #engineering is the screenshot.
-wtype -M alt g -m alt; sleep 0.5; wtype -M alt k -m alt; sleep 0.5
-wtype -M alt v -m alt; sleep 1.2
+w -M alt g -m alt; sleep 0.5; w -M alt k -m alt; sleep 0.5
+w -M alt v -m alt; sleep 1.2
 check "alt-v opens the image at its own size" "$( tree | grep -q "window 'Image'" && echo 1 || echo 0 )" "$(tree | grep -oE "window '[^']*'" | tr '\n' ' ')"
-wtype -k Escape; sleep 0.5
+w -k Escape; sleep 0.5
 check "escape closes it" "$( tree | grep -q "window 'Image'" && echo 0 || echo 1 )"
 
 # The side pane's lists. One pane shows a thread, a search, a member list
 # or a profile, and each answers with the same five row shapes.
-wtype -M ctrl t -m ctrl; sleep 1.5
+w -M ctrl t -m ctrl; sleep 1.5
 check "ctrl-t lists the threads with replies" "$( tree | grep -q '2 replies' && echo 1 || echo 0 )"
-wtype -M alt m -m alt; sleep 1.5
+w -M alt m -m alt; sleep 1.5
 check "alt-m lists who is in the conversation" "$( tree | grep -q "label 'alice'" && echo 1 || echo 0 )"
-wtype -M alt c -m alt; sleep 1.5
+w -M alt c -m alt; sleep 1.5
 check "alt-c offers the channels one could join" "$( tree | grep -q '#random' && echo 1 || echo 0 )"
+
+# Managing the conversation: star, mute, and the pinned list. The star and
+# the mute are toggles read back out of the header, which is the only place
+# either one is visible for a conversation that is already open.
+w -k Escape; sleep 0.4
+star_before=$(tree | grep -c "label '★" || true)
+w -M ctrl -M alt s -m alt -m ctrl; sleep 1.5
+star_after=$(tree | grep -c "label '★" || true)
+check "ctrl-alt-s stars the conversation, and the header says so" "$( [ "$star_after" != "$star_before" ] && echo 1 || echo 0 )" "before=$star_before after=$star_after"
+w -M ctrl -M alt m -m alt -m ctrl; sleep 1.5
+check "ctrl-alt-m mutes it, and that shows too" "$( tree | grep -q '🔕' && echo 1 || echo 0 )" "$(tree | grep -oE "label '[^']*(★|🔕)[^']*'" | head -1)"
+w -M ctrl -M alt m -m alt -m ctrl; sleep 1.5
+check "and unmuting takes the mark away again" "$( tree | grep -q '🔕' && echo 0 || echo 1 )"
+
+w -M ctrl -M alt i -m alt -m ctrl; sleep 1.5
+check "ctrl-alt-i lists what is pinned here" "$( tree | grep -q 'retry limit' && echo 1 || echo 0 )" "$(tree | grep -oE "label 'Pinned'" | head -1)"
+w -k Escape; sleep 0.5
+
+# The composer as the prompt for the commands that need a word. `/topic`
+# through the palette prefills it; typing the rest sends it through the same
+# handler the action uses.
+w "/topic on-call rotation"; sleep 0.3; w -k Return; sleep 2.0
+check "/topic sets the topic and the header shows it" "$( tree | grep -q 'on-call rotation' && echo 1 || echo 0 )" "$(tree | grep -oE "label '[0-9]+ members[^']*'" | head -1)"
+
+# A slash command the interface owns rather than the workspace: nothing is
+# sent, a box opens.
+w "/upload"; sleep 0.3; w -k Return; sleep 1.5
+check "/upload opens the file chooser rather than posting" "$( tree | grep -qiE "window '[^']*(file|open)" && echo 1 || echo 0 )" "$(tree | grep -oE "window '[^']*'" | tr '\n' ' ')"
+w -k Escape; sleep 0.8
 
 # Search: the query goes in the pane, so the results stay readable next to
 # the conversation they came from.
-wtype -M alt -k slash -m alt; sleep 1.0
-wtype "deploy"; sleep 0.4; wtype -k Return; sleep 2.0
+w -M alt -k slash -m alt; sleep 1.0
+w "deploy"; sleep 0.4; w -k Return; sleep 2.0
 check "alt-/ searches and counts what it found" "$( tree | grep -qE "label '[0-9]+ results? for" && echo 1 || echo 0 )" "$(tree | grep -oE "label '[0-9]+ results?[^']*'" | head -1)"
 check "each hit says which conversation it is in" "$( tree | grep -q '#engineering' && echo 1 || echo 0 )"
 
 # A profile, from the message under the cursor.
-wtype -k Escape; sleep 0.4
-wtype -M alt k -m alt; sleep 0.4; wtype -M alt i -m alt; sleep 1.5
+w -k Escape; sleep 0.4
+w -M alt k -m alt; sleep 0.4; w -M alt i -m alt; sleep 1.5
 check "alt-i shows who wrote it" "$( tree | grep -qE "label '(time zone|presence)'" && echo 1 || echo 0 )"
-wtype -k Escape; sleep 0.5
+w -k Escape; sleep 0.5
 check "escape closes the pane" "$( tree | grep -q "label 'presence'" && echo 0 || echo 1 )"
 
 # F1 is the shortcuts window, generated from the live keymap: an action with
 # no key has to say so rather than be missing.
-wtype -k F1; sleep 0.8
+w -k F1; sleep 0.8
 t=$(tree)
 check "F1 opens the shortcuts window" "$( echo "$t" | grep -q "Keyboard shortcuts" && echo 1 || echo 0 )"
 check "it is generated from the keymap, not written by hand" "$( echo "$t" | grep -q "label '<Control>k'" && echo 1 || echo 0 )"
-wtype -k Escape; sleep 0.4
+w -k Escape; sleep 0.4
 
 shot "$OUT/e2e_keys.png" && echo "  shot $OUT/e2e_keys.png"
 
@@ -173,7 +236,7 @@ focus
 check "a long conversation opens on its newest message" "$( tree | grep -q 'Deploy of v2.4 finished' && echo 1 || echo 0 )" "$(tree | grep -oE "'plain sentence number [0-9]+" | head -1)"
 check "and only a page of it is loaded" "$( [ "$(grep -c '^rows=50$' "$LOG2")" -ge 1 ] && echo 1 || echo 0 )" "$(grep '^rows=' "$LOG2" | head -1)"
 
-for _ in 1 2 3 4; do wtype -M alt -k Home -m alt; sleep 1.8; done
+for _ in 1 2 3 4; do w -M alt -k Home -m alt; sleep 1.8; done
 check "scrollback walks back to the start of the conversation" "$( tree | grep -q 'the beginning of the conversation' && echo 1 || echo 0 )"
 check "and it got there a page at a time" "$( [ "$(grep -c '^scrollback_asked=' "$LOG2")" -ge 3 ] && echo 1 || echo 0 )" "$(grep -c '^scrollback_asked=' "$LOG2") pages"
 check "the oldest message is now on screen" "$( tree | grep -q 'plain sentence number 0,' && echo 1 || echo 0 )"
@@ -194,7 +257,7 @@ quiet=$(grep -c '^notified=' "$LOG3" || true)
 check "no notification while looking straight at the conversation" "$( [ "$quiet" = 0 ] && echo 1 || echo 0 )" "$quiet raised"
 # Now look somewhere else. The demo's third line mentions the signed-in
 # user, which is what the engine thinks is worth interrupting for.
-wtype -M ctrl k -m ctrl; sleep 0.5; wtype "des"; sleep 0.3; wtype -k Return; sleep 9
+w -M ctrl k -m ctrl; sleep 0.5; w "des"; sleep 0.3; w -k Return; sleep 9
 check "a mention elsewhere is raised" "$( [ "$(grep -c '^notified=' "$LOG3")" -ge 1 ] && echo 1 || echo 0 )" "$(grep '^notified=' "$LOG3" | head -1)"
 check "and it says who and where" "$( grep -q '^notified=.*mentioned you in #' "$LOG3" && echo 1 || echo 0 )"
 
@@ -223,8 +286,13 @@ rm -rf "$CFG"
 # so none may be installed — and every action must have a key or say why not.
 dead=$(grep '^binding=' "$LOG" | grep -cE '=<[^>]*Shift>[A-Za-z]( |$)' || true)
 check "no binding is shift plus a letter" "$( [ "$dead" = 0 ] && echo 1 || echo 0 )" "$dead such bindings"
-unbound=$(grep '^binding=' "$LOG" | grep -c 'no free key' || true)
-check "every action but the two GTK owns has a key" "$( [ "$unbound" -le 2 ] && echo 1 || echo 0 )" "$unbound unbound"
+# Two are GTK's own (pane focus cycling), four are keyless on purpose:
+# topic, purpose, invite and leave are rare, irreversible by the same key,
+# and reached by name from the palette. Anything else without a key is an
+# action nobody can run.
+unbound=$(grep '^binding=' "$LOG" | grep 'no free key' \
+          | grep -cvE '^binding=(focus_next|focus_prev|set_topic|set_purpose|invite|leave_channel)=' || true)
+check "every action without a key is one that was meant to have none" "$( [ "$unbound" = 0 ] && echo 1 || echo 0 )" "$unbound unexpected: $(grep '^binding=' "$LOG" | grep 'no free key' | grep -vE '^binding=(focus_next|focus_prev|set_topic|set_purpose|invite|leave_channel)=' | tr '\n' ' ')"
 
 echo "--- bindings installed ---"; grep '^binding=' "$LOG" | sed 's/^binding=/  /'
 echo; echo "$pass passed, $fail failed"
