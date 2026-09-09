@@ -250,6 +250,9 @@ pub struct Ui {
     /// can follow, and what a braille display can hold.
     pub linear: bool,
     pub mouse: bool,
+    /// `auto` follows the desktop's high-contrast setting through the
+    /// portal; `on` and `off` insist. FR-I9.
+    pub high_contrast: String,
 }
 impl Default for Ui {
     fn default() -> Self {
@@ -259,6 +262,7 @@ impl Default for Ui {
             reduced_motion: false,
             linear: false,
             mouse: true,
+            high_contrast: "auto".into(),
         }
     }
 }

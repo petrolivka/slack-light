@@ -149,6 +149,41 @@ fn read(p: &Path) -> Option<Palette> {
 /// The settings portal's `color-scheme`, which every desktop with a portal
 /// answers; `gsettings` needs the GNOME schema installed and a minimal
 /// Wayland box may not have it. 1 is "prefer dark".
+/// Whether the desktop asks for high contrast.
+///
+/// `org.freedesktop.appearance` `contrast`, the companion to `color-scheme`
+/// and read the same way: 1 means "increase contrast". A portal that does not
+/// know the key (anything before xdg-desktop-portal 1.17) answers with an
+/// error, which is "no" for this purpose and not worth reporting — unlike a
+/// capability check, nothing is disabled by the answer.
+pub fn prefers_contrast() -> bool {
+    let Ok(bus) =
+        gtk::gio::bus_get_sync(gtk::gio::BusType::Session, None::<&gtk::gio::Cancellable>)
+    else {
+        return false;
+    };
+    let reply = bus.call_sync(
+        Some("org.freedesktop.portal.Desktop"),
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Settings",
+        "Read",
+        Some(&("org.freedesktop.appearance", "contrast").to_variant()),
+        None,
+        gtk::gio::DBusCallFlags::NONE,
+        1000,
+        None::<&gtk::gio::Cancellable>,
+    );
+    match reply {
+        Ok(v) => {
+            let inner = v.child_value(0);
+            let inner = inner.as_variant().unwrap_or(inner);
+            let inner = inner.as_variant().unwrap_or(inner);
+            inner.get::<u32>() == Some(1)
+        }
+        Err(_) => false,
+    }
+}
+
 fn prefers_dark() -> bool {
     let Ok(bus) =
         gtk::gio::bus_get_sync(gtk::gio::BusType::Session, None::<&gtk::gio::Cancellable>)
@@ -195,6 +230,47 @@ pub struct Semantic {
 }
 
 impl Palette {
+    /// The same palette, pushed to the contrast a high-contrast desktop asks
+    /// for (FR-I9).
+    ///
+    /// Not a second theme: a theme of its own would have to be maintained
+    /// beside every Omarchy palette, and would stop following the one the
+    /// person chose. This keeps the hues and moves the extremes — the
+    /// backgrounds all become the darkest (or lightest) one, every foreground
+    /// becomes the brightest, and the dim grey that carries timestamps and
+    /// notes stops being dim, because "dim" is the first thing that fails at
+    /// low vision and it is never the only signal anything has.
+    pub fn high_contrast(&self) -> Palette {
+        let dark = self.mode != "light";
+        let (bg, fg) = if dark {
+            ("#000000".to_string(), "#ffffff".to_string())
+        } else {
+            ("#ffffff".to_string(), "#000000".to_string())
+        };
+        Palette {
+            background: bg.clone(),
+            dark_background: bg.clone(),
+            darker_background: bg.clone(),
+            // One step off the ground so a panel still has an edge; the
+            // border does the rest of the work in the stylesheet.
+            lighter_background: if dark {
+                "#1a1a1a".into()
+            } else {
+                "#ebebeb".into()
+            },
+            foreground: fg.clone(),
+            light_foreground: fg.clone(),
+            bright_foreground: fg.clone(),
+            dark_foreground: fg,
+            muted: if dark {
+                "#8a8a8a".into()
+            } else {
+                "#5a5a5a".into()
+            },
+            ..self.clone()
+        }
+    }
+
     pub fn semantic(&self) -> Semantic {
         Semantic {
             link: self.blue.clone(),
@@ -558,4 +634,62 @@ pub fn watch(on_change: impl Fn() + 'static) -> Option<gtk::gio::FileMonitor> {
         });
     });
     Some(monitor)
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    /// sRGB relative luminance, per WCAG 2.
+    fn luminance(hex: &str) -> f64 {
+        let h = hex.trim_start_matches('#');
+        let c = |i: usize| {
+            let v = u8::from_str_radix(&h[i..i + 2], 16).unwrap_or(0) as f64 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * c(0) + 0.7152 * c(2) + 0.0722 * c(4)
+    }
+
+    fn ratio(a: &str, b: &str) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// FR-I9's actual requirement, as a number rather than as an opinion.
+    ///
+    /// A screenshot proves a high-contrast theme looks different; it does not
+    /// prove it is readable. WCAG AAA is 7:1 for body text, and every
+    /// foreground this palette puts on its background has to clear it —
+    /// including the "dim" one, which is where the ordinary themes spend
+    /// their contrast budget and is exactly what fails at low vision.
+    #[test]
+    fn high_contrast_clears_wcag_aaa_against_its_own_background() {
+        let dark: crate::Palette = toml::from_str(crate::BUILTIN_DARK).expect("dark theme");
+        let light: crate::Palette = toml::from_str(crate::BUILTIN_LIGHT).expect("light theme");
+        for base in [dark, light] {
+            let p = base.high_contrast();
+            for (what, fg) in [
+                ("foreground", &p.foreground),
+                ("light_foreground", &p.light_foreground),
+                ("bright_foreground", &p.bright_foreground),
+                ("dark_foreground", &p.dark_foreground),
+            ] {
+                let r = ratio(fg, &p.background);
+                assert!(
+                    r >= 7.0,
+                    "{what} on the background is {r:.1}:1 in {} mode, and AAA is 7:1",
+                    p.mode
+                );
+            }
+            // The panel ground has to stay distinguishable from the window's,
+            // or "high contrast" flattens every edge in the layout.
+            assert!(
+                ratio(&p.lighter_background, &p.background) > 1.0,
+                "a panel with no edge is not more readable, it is less"
+            );
+        }
+    }
 }

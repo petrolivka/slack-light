@@ -242,6 +242,24 @@ pub enum Msg {
 }
 
 /// The sidebar's groups, in the order the official client shows them.
+/// Apply `[ui] high_contrast` to a palette.
+///
+/// `auto` asks the desktop through the portal, which is the answer somebody
+/// who needs it has already given once, in one place, for every application.
+fn contrast(palette: slk_theme::Palette, setting: &str) -> slk_theme::Palette {
+    let want = match setting {
+        "on" | "true" | "yes" => true,
+        "off" | "false" | "no" => false,
+        _ => slk_theme::prefers_contrast(),
+    };
+    if want {
+        bench::report("high_contrast", "on");
+        palette.high_contrast()
+    } else {
+        palette
+    }
+}
+
 /// The sections a conversation can be in, by their config names.
 ///
 /// `recent` is not a section a conversation *belongs* to — it is a view of
@@ -376,6 +394,8 @@ pub struct App {
     hide_read: bool,
     recents: u8,
     sidebar_order: Vec<String>,
+    /// `[ui] high_contrast`: `auto`, `on` or `off`.
+    high_contrast: String,
     /// Whether Slack currently thinks we are away. Read from our own
     /// `presence_change`, not from what we last asked for, so another client
     /// setting it is reflected here.
@@ -1118,6 +1138,7 @@ impl SimpleComponent for App {
         }
 
         let (palette, source) = slk_theme::load(&theme_choice);
+        let palette = contrast(palette, &config.ui.high_contrast);
         bench::report("theme_source", format!("{source:?}"));
         let theme = slk_theme::Applied::new(&palette, user_css.as_deref());
         let monitor = {
@@ -1240,6 +1261,7 @@ impl SimpleComponent for App {
             hide_read: config.sidebar.hide_read,
             recents: config.sidebar.recents,
             sidebar_order: config.sidebar.order.clone(),
+            high_contrast: config.ui.high_contrast.clone(),
             me_away: false,
             away_by_idle: false,
             idle: slk_idle::Support::Unknown("not watched".into()),
@@ -1611,6 +1633,10 @@ impl SimpleComponent for App {
         match msg {
             Msg::ThemeChanged => {
                 let (palette, source) = slk_theme::load(&self.theme_choice);
+                // Re-read on every theme change, so turning high contrast on
+                // in the desktop's settings takes effect without a restart —
+                // which for somebody who needs it is the whole point.
+                let palette = contrast(palette, &self.high_contrast);
                 self.theme.replace(&palette);
                 *self.shared.pal.borrow_mut() = palette.semantic();
                 // Rows carry their colours in their markup, so they have to
