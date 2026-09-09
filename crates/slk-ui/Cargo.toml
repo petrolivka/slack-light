@@ -12,6 +12,7 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_18"] }
 slk-core = { path = "../slk-core" }
 slk-sync = { path = "../slk-sync" }
 slk-store = { path = "../slk-store" }
+slk-notify = { path = "../slk-notify" }
 slk-config = { path = "../slk-config" }
 slk-theme = { path = "../slk-theme" }
 tokio.workspace = true

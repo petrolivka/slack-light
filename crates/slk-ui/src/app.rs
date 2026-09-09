@@ -31,6 +31,9 @@ pub struct Directory {
     pub channel_ids: HashMap<String, String>,
     /// Handle → id, for `@design-team`.
     pub groups: HashMap<String, String>,
+    /// Who is online. A direct message with a dot beside it is the only
+    /// place presence is worth the pixels.
+    pub active: HashSet<String>,
 }
 
 impl Directory {
@@ -173,6 +176,8 @@ pub enum Msg {
     Picked(String),
     /// The composer's text changed; re-read what is being completed.
     ComposerChanged,
+    /// The window gained or lost the keyboard.
+    Focus,
     /// The conversation's content changed size and has now been measured.
     Settled,
     /// The conversation moved, and where it is now.
@@ -300,6 +305,12 @@ pub struct App {
     /// Slack's skin tone, applied to what the picker shows and to what is
     /// sent, so the two cannot disagree.
     skin: Option<u8>,
+    /// Desktop notifications, and when to mark a conversation read.
+    notifier: slk_notify::Notifier,
+    mark_read: crate::logic::MarkRead,
+    /// The last message this conversation was marked read at, so the same
+    /// mark is not sent on every scroll event.
+    marked: Option<slk_core::Ts>,
     // Made before the view and referenced into it, because `update` needs a
     // handle to each and relm4 hands widgets to the view, not the model.
     sidebar: gtk::ListBox,
@@ -379,6 +390,7 @@ impl App {
         // An edit in flight belongs to the conversation being left.
         self.stash_draft();
         self.editing = None;
+        self.marked = None;
         self.close_completions();
         let found = self.convs().iter().find(|c| c.id == id).cloned();
         self.title = found
@@ -613,6 +625,8 @@ impl SimpleComponent for App {
                 bench::record_frames(w);
                 sender.input(Msg::Mapped);
             },
+            // Coming back to the window is the moment `on_focus` means.
+            connect_is_active_notify[sender] => move |_| sender.input(Msg::Focus),
 
             gtk::Box {
                 set_orientation: gtk::Orientation::Horizontal,
@@ -1022,6 +1036,17 @@ impl SimpleComponent for App {
             follow_bottom: true,
             loading: gtk::Label::new(None),
             skin: (config.emoji.skin_tone > 0).then_some(config.emoji.skin_tone),
+            // The bell and the OSC sequences are terminal channels: they
+            // write escape codes to a stdout nobody is looking at when the
+            // interface is a window. Only the desktop channel survives the
+            // pivot, and it is the one that belongs on a desktop anyway.
+            notifier: slk_notify::Notifier::new(slk_notify::Config {
+                desktop: config.notify.desktop,
+                bell: false,
+                osc: slk_notify::Osc::None,
+            }),
+            mark_read: crate::logic::MarkRead::parse(&config.message.mark_read),
+            marked: None,
             sidebar: gtk::ListBox::new(),
             sidebar_box: gtk::Box::new(gtk::Orientation::Vertical, 0),
             row_map: Vec::new(),
@@ -1343,6 +1368,7 @@ impl SimpleComponent for App {
                 }
             }
             Msg::ComposerChanged => self.refresh_completions(),
+            Msg::Focus => self.maybe_mark(false),
             Msg::Settled => {
                 if self.follow_bottom {
                     self.pin_to_bottom();
@@ -1352,6 +1378,9 @@ impl SimpleComponent for App {
                 self.follow_bottom = at_bottom;
                 if at_top {
                     self.load_older();
+                }
+                if at_bottom {
+                    self.maybe_mark(false);
                 }
             }
             Msg::Link(url) => self.follow_link(&url, &sender),
@@ -1574,6 +1603,7 @@ impl App {
                 self.list.extend_from_iter(rows);
                 self.scroll_to_end();
                 self.refresh_status();
+                self.maybe_mark(true);
                 if !self.loaded_once {
                     self.loaded_once = true;
                     bench::report("first_messages_ms", bench::since_start().as_millis());
@@ -1674,6 +1704,44 @@ impl App {
                         self.list.append(row);
                         self.scroll_to_end();
                     }
+                }
+            }
+            Event::Notify {
+                channel,
+                conversation,
+                who,
+                text,
+                mention,
+            } => {
+                // The engine already decided this matters — it knows about
+                // muting, mentions and keywords. All that is left is whether
+                // the user can already see it.
+                let looking =
+                    is_current && self.open.as_ref() == Some(&channel) && self.thread.is_none();
+                if crate::logic::should_notify(self.focused(), looking, self.follow_bottom) {
+                    let title = if mention {
+                        format!("{who} mentioned you in {conversation}")
+                    } else {
+                        format!("{who} in {conversation}")
+                    };
+                    self.notifier.notify(&title, &text);
+                    bench::report("notified", &title);
+                }
+            }
+            Event::Presence { users, presence } => {
+                {
+                    let mut d = self.shared.names.borrow_mut();
+                    for u in &users {
+                        let id = u.as_str().to_string();
+                        if presence == slk_core::Presence::Active {
+                            d.active.insert(id);
+                        } else {
+                            d.active.remove(&id);
+                        }
+                    }
+                }
+                if is_current {
+                    self.rebuild_sidebar();
                 }
             }
             Event::List { title, items } => {
@@ -1954,7 +2022,8 @@ impl App {
                 self.sidebar_box.set_visible(on);
             }
             "back" | "forward" => self.go(name == "forward"),
-            "help" | "palette" => self.show_shortcuts(),
+            "help" => self.show_shortcuts(),
+            "palette" => self.show_palette(sender),
 
             // Moving the cursor over messages. The list scrolls to follow it,
             // because a selection you cannot see is not a cursor.
@@ -2000,6 +2069,7 @@ impl App {
             "react" => self.open_picker(sender),
             "mark_read" => {
                 if let (Some(ch), Some(m)) = (self.open.clone(), self.newest()) {
+                    self.marked = Some(m.clone());
                     self.send(Command::MarkRead(ch, m));
                     self.notice("marked read".into(), sender);
                 }
@@ -2582,6 +2652,29 @@ impl App {
         self.set_cursor(to);
     }
 
+    /// Mark the open conversation read, if the configured policy says so.
+    ///
+    /// Guarded by the timestamp it was last marked at, because `on_view`
+    /// would otherwise send a mark on every scroll event that ends at the
+    /// bottom, which is most of them.
+    fn maybe_mark(&mut self, just_opened: bool) {
+        let (Some(ch), Some(newest)) = (self.open.clone(), self.newest()) else {
+            return;
+        };
+        if self.marked.as_ref() == Some(&newest) {
+            return;
+        }
+        if crate::logic::should_mark(
+            self.mark_read,
+            self.focused(),
+            self.follow_bottom,
+            just_opened,
+        ) {
+            self.marked = Some(newest.clone());
+            self.send(Command::MarkRead(ch, newest));
+        }
+    }
+
     /// The newest message in the conversation, for marking read.
     fn newest(&self) -> Option<slk_core::Ts> {
         self.list
@@ -2723,6 +2816,13 @@ impl App {
 
     fn window(&self) -> Option<gtk::Window> {
         self.composer.root().and_downcast::<gtk::Window>()
+    }
+
+    /// Whether the window has the keyboard. Everything about notifying and
+    /// marking read hangs off this: a client that clears badges while it is
+    /// buried behind a browser is a client that loses messages.
+    fn focused(&self) -> bool {
+        self.window().is_some_and(|w| w.is_active())
     }
 
     /// The emoji picker: one window rather than a popover per row, because
@@ -2894,6 +2994,133 @@ impl App {
         );
     }
 
+    /// Every action, by name, searchable, with the key it is on.
+    ///
+    /// The palette is what makes an action with no free key still reachable,
+    /// which is why `keys::install` registers actions whether or not they
+    /// got an accelerator.
+    fn show_palette(&mut self, sender: &ComponentSender<Self>) {
+        let win = gtk::Window::new();
+        win.set_title(Some("Run an action"));
+        win.set_modal(true);
+        win.set_transient_for(self.window().as_ref());
+        win.set_default_size(520, 420);
+        win.add_css_class("picker");
+
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        outer.set_margin_top(8);
+        outer.set_margin_bottom(8);
+        outer.set_margin_start(8);
+        outer.set_margin_end(8);
+        let entry = gtk::SearchEntry::new();
+        entry.set_placeholder_text(Some("run an action…"));
+        let list = gtk::ListBox::new();
+        list.add_css_class("sidelist");
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_vexpand(true);
+        scroller.set_child(Some(&list));
+        outer.append(&entry);
+        outer.append(&scroller);
+        win.set_child(Some(&outer));
+
+        let all: Vec<(String, String, String)> = self
+            .bindings
+            .iter()
+            .map(|b| {
+                (
+                    b.action.name().to_string(),
+                    b.action.help().to_string(),
+                    b.accel.clone(),
+                )
+            })
+            .collect();
+        let names = Rc::new(RefCell::new(Vec::<String>::new()));
+        let fill = {
+            let all = all.clone();
+            let names = names.clone();
+            move |list: &gtk::ListBox, q: &str| {
+                while let Some(c) = list.first_child() {
+                    list.remove(&c);
+                }
+                let q = q.to_lowercase();
+                let mut kept = Vec::new();
+                for (name, help, accel) in &all {
+                    if !q.is_empty()
+                        && !name.to_lowercase().contains(&q)
+                        && !help.to_lowercase().contains(&q)
+                    {
+                        continue;
+                    }
+                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                    row.set_margin_start(8);
+                    row.set_margin_end(8);
+                    let what = gtk::Label::new(Some(help));
+                    what.set_xalign(0.0);
+                    what.set_hexpand(true);
+                    let key = gtk::Label::new(Some(if accel.is_empty() { "—" } else { accel }));
+                    key.add_css_class("chip");
+                    row.append(&what);
+                    row.append(&key);
+                    list.append(&row);
+                    kept.push(name.clone());
+                }
+                *names.borrow_mut() = kept;
+                if let Some(r) = list.row_at_index(0) {
+                    list.select_row(Some(&r));
+                }
+            }
+        };
+        fill(&list, "");
+        {
+            let (list2, fill) = (list.clone(), fill.clone());
+            entry.connect_search_changed(move |e| fill(&list2, &e.text()));
+        }
+
+        let run = {
+            let (names, win, s) = (names.clone(), win.clone(), sender.input_sender().clone());
+            move |i: usize| {
+                if let Some(name) = names.borrow().get(i).cloned() {
+                    win.close();
+                    let _ = s.send(Msg::Action(name));
+                }
+            }
+        };
+        {
+            let (list2, run) = (list.clone(), run.clone());
+            entry.connect_activate(move |_| {
+                let i = list2.selected_row().map(|r| r.index()).unwrap_or(0);
+                run(i.max(0) as usize);
+            });
+        }
+        list.connect_row_activated(move |_, row| run(row.index().max(0) as usize));
+        {
+            // The arrows move the list while the entry keeps the keyboard,
+            // which is the only arrangement where one can type and choose
+            // without a click in between.
+            let k = gtk::EventControllerKey::new();
+            let (list2, w) = (list.clone(), win.clone());
+            k.connect_key_pressed(move |_, key, _, _| {
+                let step = match key {
+                    gtk::gdk::Key::Down => 1,
+                    gtk::gdk::Key::Up => -1,
+                    gtk::gdk::Key::Escape => {
+                        w.close();
+                        return gtk::glib::Propagation::Stop;
+                    }
+                    _ => return gtk::glib::Propagation::Proceed,
+                };
+                let at = list2.selected_row().map(|r| r.index()).unwrap_or(0);
+                if let Some(r) = list2.row_at_index((at + step).max(0)) {
+                    list2.select_row(Some(&r));
+                }
+                gtk::glib::Propagation::Stop
+            });
+            win.add_controller(k);
+        }
+        win.present();
+        entry.grab_focus();
+    }
+
     /// The shortcuts window, generated from the live keymap.
     ///
     /// Written by hand it drifts from the bindings within a month; generated
@@ -3058,7 +3285,13 @@ impl App {
                 name.set_hexpand(true);
                 name.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 let label = if c.is_dm() {
-                    format!("  {}", c.name)
+                    // A dot rather than a word: presence is worth one glyph
+                    // in a sidebar and no more.
+                    let here = c
+                        .peer
+                        .as_ref()
+                        .is_some_and(|u| self.shared.names.borrow().active.contains(u.as_str()));
+                    format!("{} {}", if here { "●" } else { "○" }, c.name)
                 } else if c.is_private() {
                     format!("🔒 {}", c.name)
                 } else {

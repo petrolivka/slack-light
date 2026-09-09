@@ -23,7 +23,7 @@ shot() { local g; g=$(hyprctl clients -j | jq -r ".[] | select(.class==\"$CLASS\
 # A stray window from an earlier run confuses tree.py, which reads the first
 # slack-light on the a11y bus. Start clean.
 pkill -x slack-light 2>/dev/null && sleep 1
-LOG=$(mktemp); LOG2=$(mktemp)
+LOG=$(mktemp); LOG2=$(mktemp); LOG3=$(mktemp)
 "$BIN" --anonymous --demo-rows 30 --metrics >"$LOG" 2>&1 &
 PID=$!
 sleep 3
@@ -165,6 +165,26 @@ check "and it got there a page at a time" "$( [ "$(grep -c '^scrollback_asked=' 
 check "the oldest message is now on screen" "$( tree | grep -q 'plain sentence number 0,' && echo 1 || echo 0 )"
 
 kill $PID2 2>/dev/null; wait $PID2 2>/dev/null
+sleep 1
+
+# A third run, with the demo workspace talking, for the one thing that
+# needs somebody else to say something: a notification, and only when the
+# user is not already looking at it.
+"$BIN" --anonymous --no-cache --demo 2 --demo-rows 4 --metrics >"$LOG3" 2>&1 &
+PID3=$!
+sleep 3
+focus
+# Looking straight at #engineering while it talks: nothing may be raised.
+sleep 7
+quiet=$(grep -c '^notified=' "$LOG3" || true)
+check "no notification while looking straight at the conversation" "$( [ "$quiet" = 0 ] && echo 1 || echo 0 )" "$quiet raised"
+# Now look somewhere else. The demo's third line mentions the signed-in
+# user, which is what the engine thinks is worth interrupting for.
+wtype -M ctrl k -m ctrl; sleep 0.5; wtype "des"; sleep 0.3; wtype -k Return; sleep 9
+check "a mention elsewhere is raised" "$( [ "$(grep -c '^notified=' "$LOG3")" -ge 1 ] && echo 1 || echo 0 )" "$(grep '^notified=' "$LOG3" | head -1)"
+check "and it says who and where" "$( grep -q '^notified=.*mentioned you in #' "$LOG3" && echo 1 || echo 0 )"
+
+kill $PID3 2>/dev/null; wait $PID3 2>/dev/null
 # Shift on a character key is delivered as the plain keyval and matches no
 # accelerator (see logic::bindable). A binding like that is dead on arrival,
 # so none may be installed — and every action must have a key or say why not.
@@ -175,5 +195,5 @@ check "every action but the two GTK owns has a key" "$( [ "$unbound" -le 2 ] && 
 
 echo "--- bindings installed ---"; grep '^binding=' "$LOG" | sed 's/^binding=/  /'
 echo; echo "$pass passed, $fail failed"
-rm -f "$LOG" "$LOG2"
+rm -f "$LOG" "$LOG2" "$LOG3"
 [ "$fail" = 0 ]

@@ -185,6 +185,7 @@ pub fn count_update(msg: &crate::app::Msg) {
         RowAction { .. } => "RowAction",
         Picked(_) => "Picked",
         ComposerChanged => "ComposerChanged",
+        Focus => "Focus",
         Settled => "Settled",
         Scrolled { .. } => "Scrolled",
         Link(_) => "Link",

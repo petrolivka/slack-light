@@ -328,8 +328,49 @@ is the whole reason to have a pane.
 `editor` — the terminal client's "edit this draft in $EDITOR" — is the one
 action that does not survive the pivot, and says so.
 
+## 8. M2b, fifth block: notifications, marking read, the palette
+
+**Notifications were not raised at all** — `Event::Notify` fell through the
+window's catch-all arm and nothing happened. The engine had been deciding
+correctly since M0 and nobody was listening.
+
+The decision is deliberately split. The engine knows whether a message
+*matters* — a direct message, a mention, a highlight word, and never a
+muted conversation. The window knows whether the user can already see it:
+the window has focus, that conversation is open, and it is scrolled to the
+bottom. Both halves are now tested, the engine's by three scenario tests
+against the mock's live stream (the first the engine has had), the
+window's by pure functions and by the a11y suite driving the real thing.
+
+Only the desktop channel survives the pivot. The bell and the OSC escape
+sequences are terminal channels: they write to a stdout nobody is looking
+at when the interface is a window.
+
+**Marking read** now follows `[message] mark_read`, which was configurable
+and ignored:
+
+| | |
+|---|---|
+| `manual` | only when asked |
+| `on_focus` | when the conversation is opened, if the window has focus |
+| `on_view` | when the newest message is actually on screen, and the window has focus |
+
+Every one of them checks that the window has the keyboard, because a
+client that clears badges while it is buried behind a browser is a client
+that loses messages. The mark is guarded by the timestamp it was last sent
+at, or `on_view` would send one on every scroll event that ends at the
+bottom, which is most of them.
+
+**Presence** reaches the sidebar: a filled or hollow dot beside a direct
+message, which is one glyph and no more.
+
+**The command palette** (ctrl-p) lists every action by name with the key it
+is on, filterable, arrows to move while the entry keeps the keyboard. It is
+why `keys::install` registers an action whether or not it got an
+accelerator: the two that GTK owns are still reachable by name.
+
 ### What is left in M2b
 
-- **Notifications**: the full policy, mark-read policies, gap fill
-- **The command palette**, which today shows the shortcuts window
 - **The idle repaint** (§2), and the memory budget decision
+- Files: drag-and-drop, and an in-window image viewer
+- Slash commands as commands rather than text

@@ -289,6 +289,55 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/leave", "Leave this conversation"),
 ];
 
+/// When a conversation is marked read.
+///
+/// The requirements are blunt about this one: getting it wrong means
+/// marking things read that the user never saw, and there is no way to find
+/// them again afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkRead {
+    /// Only when asked.
+    Manual,
+    /// As soon as the conversation is opened, if the window has focus.
+    OnFocus,
+    /// When the newest message is actually on screen, and the window has
+    /// focus. The safest, and the slowest to clear a badge.
+    OnView,
+}
+
+impl MarkRead {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "manual" => MarkRead::Manual,
+            "on_view" => MarkRead::OnView,
+            _ => MarkRead::OnFocus,
+        }
+    }
+}
+
+/// Whether to mark the open conversation read right now.
+///
+/// `active` is whether the window has the keyboard: a client that clears
+/// badges while it is buried behind a browser is a client that loses
+/// messages.
+pub fn should_mark(policy: MarkRead, active: bool, at_bottom: bool, just_opened: bool) -> bool {
+    match policy {
+        MarkRead::Manual => false,
+        MarkRead::OnFocus => active && just_opened,
+        MarkRead::OnView => active && at_bottom,
+    }
+}
+
+/// Whether a notification the engine thought worth raising should actually
+/// be raised.
+///
+/// The engine decides whether it *matters* — mentions, keywords, muting.
+/// This decides whether the user can already see it, which is the half that
+/// needs to know about windows.
+pub fn should_notify(active: bool, is_open_conversation: bool, at_bottom: bool) -> bool {
+    !(active && is_open_conversation && at_bottom)
+}
+
 /// A capital letter is written as `<Shift>` plus the lower-case key, which
 /// is the form GTK parses — but see `bindable`: such a chord never actually
 /// arrives, so nothing installs one. The translation is kept correct anyway,
@@ -583,6 +632,44 @@ mod tests {
     fn a_bracket_counts_as_a_word_boundary() {
         assert_eq!(completing("(@al").map(|c| c.kind), Some(Complete::User));
         assert_eq!(completing("\"@al").map(|c| c.kind), Some(Complete::User));
+    }
+
+    #[test]
+    fn marking_read_never_happens_behind_the_user_s_back() {
+        use MarkRead::*;
+        // Manual means manual.
+        assert!(!should_mark(Manual, true, true, true));
+        // On focus: opening it, with the window in front.
+        assert!(should_mark(OnFocus, true, false, true));
+        assert!(
+            !should_mark(OnFocus, false, true, true),
+            "window not in front"
+        );
+        assert!(!should_mark(OnFocus, true, true, false), "not just opened");
+        // On view: the newest message actually on screen.
+        assert!(should_mark(OnView, true, true, false));
+        assert!(!should_mark(OnView, true, false, true), "scrolled back");
+        assert!(!should_mark(OnView, false, true, true));
+    }
+
+    #[test]
+    fn a_notification_is_skipped_only_when_it_is_already_on_screen() {
+        // Looking straight at it.
+        assert!(!should_notify(true, true, true));
+        // Same conversation, but scrolled back through history.
+        assert!(should_notify(true, true, false));
+        // Another conversation, or another window.
+        assert!(should_notify(true, false, true));
+        assert!(should_notify(false, true, true));
+    }
+
+    #[test]
+    fn the_mark_read_policy_names_are_the_configured_ones() {
+        assert_eq!(MarkRead::parse("manual"), MarkRead::Manual);
+        assert_eq!(MarkRead::parse("on_view"), MarkRead::OnView);
+        assert_eq!(MarkRead::parse("on_focus"), MarkRead::OnFocus);
+        // Anything unrecognised is the middle setting, not the riskiest one.
+        assert_eq!(MarkRead::parse("nonsense"), MarkRead::OnFocus);
     }
 
     #[test]
