@@ -89,7 +89,7 @@ def walk(bus, name, path, depth=0, out=None, limit=400):
 
 
 def main():
-    want = "spike"
+    want = "slack-light"
     as_json = "--json" in sys.argv
     if "--app" in sys.argv:
         want = sys.argv[sys.argv.index("--app") + 1]

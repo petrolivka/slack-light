@@ -145,10 +145,10 @@ mod tests {
     #[test]
     fn every_built_in_palette_parses_and_colours_the_css() {
         for text in [
-            include_str!("../themes/dark.toml"),
-            include_str!("../themes/light.toml"),
+            include_str!("../../slk-theme/themes/dark.toml"),
+            include_str!("../../slk-theme/themes/light.toml"),
         ] {
-            let p: crate::theme::Palette = toml::from_str(text).unwrap();
+            let p: slk_theme::Palette = toml::from_str(text).unwrap();
             let css = p.css();
             assert!(
                 css.contains(&p.background),

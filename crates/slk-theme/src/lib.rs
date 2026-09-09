@@ -1,4 +1,4 @@
-//! Spike B: the window coloured by Omarchy's current theme, live.
+//! The window coloured by the desktop's theme, live.
 //!
 //! Omarchy does not theme GTK. What it does is keep `colors.toml` for the
 //! current theme under `~/.local/state/omarchy/current/theme/` — a
@@ -75,18 +75,40 @@ pub enum Source {
     Builtin(&'static str),
 }
 
-pub fn load(explicit: Option<&Path>) -> (Palette, Source) {
-    if let Some(p) = explicit {
-        if let Some(pal) = read(p) {
-            return (pal, Source::File(p.to_path_buf()));
+/// How the configuration asks for the palette. Mirrors `[theme]` in
+/// `config.toml` without depending on the config crate.
+#[derive(Debug, Clone, Default)]
+pub struct Choice {
+    /// `auto` | `omarchy` | `builtin` | `file`
+    pub source: String,
+    /// `auto` | `dark` | `light`
+    pub builtin: String,
+    pub file: Option<PathBuf>,
+}
+
+pub fn load(choice: &Choice) -> (Palette, Source) {
+    let source = choice.source.as_str();
+    if source == "file" || source == "auto" {
+        if let Some(p) = &choice.file {
+            if let Some(pal) = read(p) {
+                return (pal, Source::File(p.clone()));
+            }
         }
     }
-    let omarchy = omarchy_state_dir().join("theme/colors.toml");
-    if let Some(pal) = read(&omarchy) {
-        return (pal, Source::Omarchy(omarchy));
+    if source == "omarchy" || source == "auto" {
+        let omarchy = omarchy_state_dir().join("theme/colors.toml");
+        if let Some(pal) = read(&omarchy) {
+            return (pal, Source::Omarchy(omarchy));
+        }
     }
-    // Off Omarchy: the desktop's preference decides between the built-ins.
-    if prefers_dark() {
+    // Off Omarchy, or told to: the built-ins, chosen by the configuration
+    // or, on `auto`, by the desktop's preference.
+    let dark = match choice.builtin.as_str() {
+        "dark" => true,
+        "light" => false,
+        _ => prefers_dark(),
+    };
+    if dark {
         (
             toml::from_str(BUILTIN_DARK).expect("built-in dark palette"),
             Source::Builtin("dark"),
@@ -236,19 +258,48 @@ paned > separator {{ background-color: @sl_muted; min-width: 1px; }}
 /// `APPLICATION` priority sits above the theme and below `user.css`.
 pub struct Applied {
     provider: gtk::CssProvider,
+    _user: Option<gtk::CssProvider>,
 }
 
 impl Applied {
-    pub fn new(pal: &Palette) -> Self {
+    /// Apply `pal`, and `user_css` over it at `USER` priority — the one file
+    /// a person edits to disagree with the generator, referring to the
+    /// `@define-color` names it publishes.
+    pub fn new(pal: &Palette, user_css: Option<&Path>) -> Self {
+        let display = gtk::gdk::Display::default().expect("display");
         let provider = gtk::CssProvider::new();
         provider.load_from_string(&pal.css());
         gtk::style_context_add_provider_for_display(
-            &gtk::gdk::Display::default().expect("display"),
+            &display,
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        let user = user_css.filter(|p| p.is_file()).map(|p| {
+            let u = gtk::CssProvider::new();
+            u.load_from_path(p);
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &u,
+                gtk::STYLE_PROVIDER_PRIORITY_USER,
+            );
+            u
+        });
         set_mode(pal);
-        Applied { provider }
+        Applied {
+            provider,
+            _user: user,
+        }
+    }
+
+    /// A human-readable name for where the palette came from.
+    pub fn describe(source: &Source) -> String {
+        match source {
+            Source::Omarchy(_) => std::fs::read_to_string(omarchy_state_dir().join("theme.name"))
+                .map(|s| format!("omarchy/{}", s.trim()))
+                .unwrap_or_else(|_| "omarchy".into()),
+            Source::File(p) => p.display().to_string(),
+            Source::Builtin(n) => format!("built-in {n}"),
+        }
     }
 
     pub fn replace(&self, pal: &Palette) {

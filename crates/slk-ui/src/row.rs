@@ -107,9 +107,10 @@ impl RelmListItem for Row {
         let m = &self.msg;
         let names = self.shared.names.borrow();
         let pal = self.shared.pal.borrow();
+        let self_id = self.shared.self_id.borrow();
         let ctx = markup::Ctx {
             names: &*names,
-            self_id: self.shared.self_id.as_str(),
+            self_id: self_id.as_str(),
             pal: &pal,
         };
 

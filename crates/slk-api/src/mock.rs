@@ -173,6 +173,17 @@ impl MockBackend {
         self
     }
 
+    /// The demo's own picture, written to a temp file and posted, so a
+    /// demo without any file on disk still has an image to draw.
+    pub fn with_demo_image(self) -> Self {
+        let p = std::env::temp_dir().join(format!("slack-light-demo-{}.png", std::process::id()));
+        if std::fs::write(&p, include_bytes!("../assets/demo.png")).is_ok() {
+            self.with_image(&p)
+        } else {
+            self
+        }
+    }
+
     /// Post `path` as a picture into `#engineering`, so the demo has an
     /// image to draw. Goes through the same `upload` the client uses, which
     /// is what makes the download side real.

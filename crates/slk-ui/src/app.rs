@@ -1,23 +1,25 @@
-//! The window: sidebar, conversation, composer — fed by the engine.
+//! The window: sidebar, conversation, composer — fed by the engines.
 //!
 //! `App` owns the component model and the channel ends, and nothing else.
-//! Every `Event` arrives as an input message; every action the user takes
-//! becomes a `Command`. The engine is on other threads and the model never
-//! blocks on it.
+//! Every `Event` arrives as an input message tagged with its workspace;
+//! every action the user takes becomes a `Command` to that workspace's
+//! engine. The engines are on other threads and the model never blocks on
+//! them.
 
 use crate::bench::{self, Options};
 use crate::row::Row;
 use gtk::prelude::*;
 use relm4::prelude::*;
 use relm4::typed_view::list::TypedListView;
-use slk_core::{ChannelId, Names, UserId};
+use slk_core::{ChannelId, Names, TeamId, UserId};
 use slk_sync::{Command, Event, SidebarEntry};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use tokio::sync::mpsc;
 
-/// Name lookups for the renderer.
+/// Name lookups for the renderer. Ids are unique across workspaces, so one
+/// directory serves all of them.
 #[derive(Default)]
 pub struct Directory {
     pub users: HashMap<String, String>,
@@ -33,12 +35,12 @@ impl Names for Directory {
     }
 }
 
-/// What every row needs and the model owns: names, the texture cache, the
-/// pictures waiting for a texture, and a way to ask for one.
+/// What every row needs and the model owns: names, the palette, the texture
+/// cache, the pictures waiting for a texture, and a way to ask for one.
 pub struct Shared {
     pub names: RefCell<Directory>,
-    pub pal: RefCell<crate::theme::Semantic>,
-    pub self_id: UserId,
+    pub pal: RefCell<slk_theme::Semantic>,
+    pub self_id: RefCell<UserId>,
     pub textures: RefCell<HashMap<String, gtk::gdk::Texture>>,
     pub pending: RefCell<HashMap<String, Vec<gtk::Picture>>>,
     sender: relm4::Sender<Msg>,
@@ -53,13 +55,24 @@ impl Shared {
     }
 }
 
-pub struct Init {
+/// One connected workspace, as the binary hands it over.
+pub struct Workspace {
+    pub team: TeamId,
+    pub name: String,
     pub commands: mpsc::Sender<Command>,
-    pub events: Option<mpsc::Receiver<Event>>,
+}
+
+pub struct Init {
+    pub workspaces: Vec<Workspace>,
+    /// Every workspace's events, folded into one stream and tagged.
+    pub events: Option<mpsc::Receiver<(TeamId, Event)>>,
     pub runtime: tokio::runtime::Handle,
     pub media_dir: std::path::PathBuf,
+    pub config: slk_config::Config,
+    pub theme: slk_theme::Choice,
+    pub user_css: Option<std::path::PathBuf>,
+    pub read_only: bool,
     pub options: Options,
-    pub theme_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -69,7 +82,7 @@ pub enum Msg {
     Action(String),
     JumpChanged(String),
     JumpAccept,
-    Engine(Event),
+    Engine(TeamId, Event),
     Open(usize),
     Send(String),
     NeedImage {
@@ -81,17 +94,26 @@ pub enum Msg {
     IdleDone,
 }
 
-pub struct App {
+struct WorkspaceState {
+    team: TeamId,
+    name: String,
     commands: mpsc::Sender<Command>,
+    convs: Vec<SidebarEntry>,
+    connected: bool,
+}
+
+pub struct App {
     runtime: tokio::runtime::Handle,
     media_dir: std::path::PathBuf,
     options: Options,
+    read_only: bool,
     shared: Rc<Shared>,
-    convs: Vec<SidebarEntry>,
+    workspaces: Vec<WorkspaceState>,
+    current: usize,
     open: Option<ChannelId>,
     list: TypedListView<Row, gtk::NoSelection>,
     // Made before the view and referenced into it, because `update` needs a
-    // handle to both and relm4 hands widgets to the view, not the model.
+    // handle to each and relm4 hands widgets to the view, not the model.
     sidebar: gtk::ListBox,
     scroller: gtk::ScrolledWindow,
     composer: gtk::Entry,
@@ -99,23 +121,35 @@ pub struct App {
     jump_query: Rc<RefCell<String>>,
     bindings: Vec<(String, String, bool)>,
     requested: HashSet<String>,
-    theme: crate::theme::Applied,
-    theme_file: Option<std::path::PathBuf>,
+    theme: slk_theme::Applied,
+    theme_choice: slk_theme::Choice,
     _theme_monitor: Option<gtk::gio::FileMonitor>,
     status: String,
     title: String,
+    window_title: String,
     loaded_once: bool,
     bench_started: bool,
     sent_at: Option<std::time::Instant>,
 }
 
 impl App {
+    fn ws(&self) -> Option<&WorkspaceState> {
+        self.workspaces.get(self.current)
+    }
+
+    fn convs(&self) -> &[SidebarEntry] {
+        self.ws().map(|w| w.convs.as_slice()).unwrap_or(&[])
+    }
+
+    /// Send to the current workspace's engine. Fire and forget on the
+    /// runtime; the main thread does not wait.
     fn send(&self, cmd: Command) {
-        let tx = self.commands.clone();
-        // Fire and forget on the runtime; the main thread does not wait.
-        self.runtime.spawn(async move {
-            let _ = tx.send(cmd).await;
-        });
+        if let Some(w) = self.ws() {
+            let tx = w.commands.clone();
+            self.runtime.spawn(async move {
+                let _ = tx.send(cmd).await;
+            });
+        }
     }
 
     fn open_channel(&mut self, id: ChannelId) {
@@ -123,7 +157,7 @@ impl App {
             return;
         }
         self.title = self
-            .convs
+            .convs()
             .iter()
             .find(|c| c.id == id)
             .map(|c| {
@@ -137,6 +171,34 @@ impl App {
         self.open = Some(id.clone());
         self.list.clear();
         self.send(Command::Open(id));
+    }
+
+    fn switch_to(&mut self, i: usize) {
+        if i >= self.workspaces.len() || i == self.current {
+            return;
+        }
+        self.current = i;
+        self.open = None;
+        self.list.clear();
+        self.window_title = format!("slack-light — {}", self.workspaces[i].name);
+        self.rebuild_sidebar();
+        self.land();
+    }
+
+    /// Open the conversation worth opening in the current workspace.
+    fn land(&mut self) {
+        if self.open.is_some() {
+            return;
+        }
+        let pick = crate::logic::landing(
+            self.convs()
+                .iter()
+                .map(|c| (&c.is_muted, &c.unread, &c.mentions)),
+        );
+        if let Some(c) = self.convs().get(pick) {
+            let id = c.id.clone();
+            self.open_channel(id);
+        }
     }
 
     /// Index of the first row matching `f`. relm4 has `find`, behind a
@@ -168,8 +230,9 @@ impl SimpleComponent for App {
     view! {
         #[root]
         window = gtk::Window {
-            set_title: Some("slack-light — spike A"),
-            set_default_size: (1100, 720),
+            #[watch]
+            set_title: Some(&model.window_title),
+            set_default_size: (model.options.width, model.options.height),
             connect_map[sender] => move |w| {
                 bench::record_frames(w);
                 sender.input(Msg::Mapped);
@@ -180,7 +243,7 @@ impl SimpleComponent for App {
 
                 gtk::Paned {
                     set_orientation: gtk::Orientation::Horizontal,
-                    set_position: 240,
+                    set_position: model.options.sidebar_width,
                     set_vexpand: true,
                     set_shrink_start_child: false,
 
@@ -201,18 +264,18 @@ impl SimpleComponent for App {
                         },
 
                         gtk::ScrolledWindow {
-                        set_hscrollbar_policy: gtk::PolicyType::Never,
-                        set_vexpand: true,
-                        #[local_ref]
-                        sidebar -> gtk::ListBox {
-                            add_css_class: "navigation-sidebar",
-                            add_css_class: "sidebar",
-                            connect_row_selected[sender] => move |_, row| {
-                                if let Some(r) = row {
-                                    sender.input(Msg::Open(r.index() as usize));
-                                }
+                            set_hscrollbar_policy: gtk::PolicyType::Never,
+                            set_vexpand: true,
+                            #[local_ref]
+                            sidebar -> gtk::ListBox {
+                                add_css_class: "navigation-sidebar",
+                                add_css_class: "sidebar",
+                                connect_row_selected[sender] => move |_, row| {
+                                    if let Some(r) = row {
+                                        sender.input(Msg::Open(r.index() as usize));
+                                    }
+                                },
                             },
-                        },
                         },
                     },
 
@@ -242,7 +305,10 @@ impl SimpleComponent for App {
                         #[local_ref]
                         composer -> gtk::Entry {
                             set_margin_all: 8,
-                            set_placeholder_text: Some("Message…  (Enter sends)"),
+                            #[watch]
+                            set_placeholder_text: Some(if model.read_only { "read-only" } else { "Message…  (Enter sends)" }),
+                            #[watch]
+                            set_sensitive: !model.read_only,
                             connect_activate[sender] => move |e| {
                                 let text = e.text().to_string();
                                 if !text.trim().is_empty() {
@@ -271,31 +337,34 @@ impl SimpleComponent for App {
 
     fn init(init: Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         let Init {
-            commands,
+            workspaces,
             events,
             runtime,
             media_dir,
+            config,
+            theme: theme_choice,
+            user_css,
+            read_only,
             options,
-            theme_file,
         } = init;
 
-        let (palette, source) = crate::theme::load(theme_file.as_deref());
+        let (palette, source) = slk_theme::load(&theme_choice);
         bench::report("theme_source", format!("{source:?}"));
-        let theme = crate::theme::Applied::new(&palette);
+        let theme = slk_theme::Applied::new(&palette, user_css.as_deref());
         let monitor = {
             let s = sender.input_sender().clone();
-            crate::theme::watch(move || {
+            slk_theme::watch(move || {
                 let _ = s.send(Msg::ThemeChanged);
             })
         };
 
-        // Events from the engine become input messages. The forwarder runs on
-        // the runtime; `Sender::send` is the only thing that crosses threads.
+        // Events from the engines become input messages. The forwarder runs
+        // on the runtime; `Sender::send` is the only thing that crosses.
         if let Some(mut rx) = events {
             let tx = sender.input_sender().clone();
             runtime.spawn(async move {
-                while let Some(ev) = rx.recv().await {
-                    if tx.send(Msg::Engine(ev)).is_err() {
+                while let Some((team, ev)) = rx.recv().await {
+                    if tx.send(Msg::Engine(team, ev)).is_err() {
                         return;
                     }
                 }
@@ -305,19 +374,38 @@ impl SimpleComponent for App {
         let shared = Rc::new(Shared {
             names: RefCell::new(Directory::default()),
             pal: RefCell::new(palette.semantic()),
-            self_id: UserId::new("U0SELF"),
+            self_id: RefCell::new(UserId::new("")),
             textures: RefCell::new(HashMap::new()),
             pending: RefCell::new(HashMap::new()),
             sender: sender.input_sender().clone(),
         });
 
+        let first_name = workspaces
+            .first()
+            .map(|w| w.name.clone())
+            .unwrap_or_default();
         let model = App {
-            commands,
             runtime,
             media_dir,
-            options,
+            options: Options {
+                width: config.window.width,
+                height: config.window.height,
+                sidebar_width: config.window.sidebar_width,
+                ..options
+            },
+            read_only,
             shared,
-            convs: Vec::new(),
+            workspaces: workspaces
+                .into_iter()
+                .map(|w| WorkspaceState {
+                    team: w.team,
+                    name: w.name,
+                    commands: w.commands,
+                    convs: Vec::new(),
+                    connected: false,
+                })
+                .collect(),
+            current: 0,
             open: None,
             list: TypedListView::new(),
             sidebar: gtk::ListBox::new(),
@@ -328,10 +416,15 @@ impl SimpleComponent for App {
             bindings: Vec::new(),
             requested: HashSet::new(),
             theme,
-            theme_file,
+            theme_choice,
             _theme_monitor: monitor,
             status: "starting".into(),
             title: String::new(),
+            window_title: if first_name.is_empty() {
+                "slack-light".into()
+            } else {
+                format!("slack-light — {first_name}")
+            },
             loaded_once: false,
             bench_started: false,
             sent_at: None,
@@ -345,15 +438,15 @@ impl SimpleComponent for App {
 
         // Keys: the preset's chords as accelerators on application actions.
         let mut model = model;
-        model.bindings =
-            crate::keys::install(&relm4::main_application(), sender.input_sender().clone());
+        model.bindings = crate::keys::install(
+            &relm4::main_application(),
+            &config.keymap.preset,
+            sender.input_sender().clone(),
+        );
         for (name, acc, from) in &model.bindings {
             bench::report(
                 "binding",
-                format!(
-                    "{name}={acc}{}",
-                    if *from { "" } else { " (spike default)" }
-                ),
+                format!("{name}={acc}{}", if *from { "" } else { " (default)" }),
             );
         }
         // The sidebar filters by the jump query; rows are (label, badge) boxes.
@@ -378,7 +471,7 @@ impl SimpleComponent for App {
     fn update(&mut self, msg: Msg, sender: ComponentSender<Self>) {
         match msg {
             Msg::ThemeChanged => {
-                let (palette, source) = crate::theme::load(self.theme_file.as_deref());
+                let (palette, source) = slk_theme::load(&self.theme_choice);
                 self.theme.replace(&palette);
                 *self.shared.pal.borrow_mut() = palette.semantic();
                 // Rows carry their colours in their markup, so they have to
@@ -388,13 +481,8 @@ impl SimpleComponent for App {
                 self.list.view.set_model(None::<&gtk::NoSelection>);
                 self.list.view.set_model(Some(&model));
                 self.rebuild_sidebar();
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                bench::report("theme_reloaded_epoch_ms", now);
                 bench::report("theme_source", format!("{source:?}"));
-                self.status = format!("theme: {}", palette_name(&source));
+                self.status = format!("theme: {}", slk_theme::Applied::describe(&source));
             }
             Msg::Action(name) => self.action(&name),
             Msg::JumpChanged(q) => {
@@ -421,19 +509,23 @@ impl SimpleComponent for App {
                 bench::report_memory("map");
             }
             Msg::Open(i) => {
-                if let Some(c) = self.convs.get(i) {
+                if let Some(c) = self.convs().get(i) {
                     let id = c.id.clone();
                     self.open_channel(id);
                 }
             }
             Msg::Send(text) => {
+                if self.read_only {
+                    self.status = "read-only: nothing is sent".into();
+                    return;
+                }
                 if let Some(ch) = self.open.clone() {
                     self.sent_at = Some(std::time::Instant::now());
                     self.send(Command::Send {
                         channel: ch,
                         thread: None,
                         text,
-                        local_id: format!("spike-{}", bench::since_start().as_nanos()),
+                        local_id: format!("sl-{}", bench::since_start().as_nanos()),
                         broadcast: false,
                     });
                 }
@@ -447,7 +539,7 @@ impl SimpleComponent for App {
                     });
                 }
             }
-            Msg::Engine(ev) => self.apply(ev, &sender),
+            Msg::Engine(team, ev) => self.apply(team, ev, &sender),
             Msg::BenchScrollDone => {
                 if self.options.idle_secs > 0 {
                     let cpu0 = bench::cpu_ns();
@@ -478,12 +570,44 @@ impl SimpleComponent for App {
 }
 
 impl App {
-    fn apply(&mut self, ev: Event, sender: &ComponentSender<Self>) {
+    fn apply(&mut self, team: TeamId, ev: Event, sender: &ComponentSender<Self>) {
+        let Some(idx) = self.workspaces.iter().position(|w| w.team == team) else {
+            return;
+        };
+        let is_current = idx == self.current;
         match ev {
-            Event::Ready { .. } => self.status = "ready".into(),
-            Event::Connected => self.status = "✓ connected".into(),
-            Event::Disconnected(why) => self.status = format!("disconnected: {why}"),
-            Event::Notice(t) => self.status = t,
+            Event::Ready { self_id, .. } => {
+                if is_current {
+                    *self.shared.self_id.borrow_mut() = self_id;
+                    self.status = "ready".into();
+                }
+            }
+            Event::Connected => {
+                self.workspaces[idx].connected = true;
+                if is_current {
+                    self.status = "✓ connected".into();
+                }
+            }
+            Event::Disconnected(why) => {
+                self.workspaces[idx].connected = false;
+                if is_current {
+                    self.status = format!("disconnected: {why}");
+                }
+            }
+            Event::AuthLost => {
+                self.status = format!(
+                    "{}: session expired — run `slack-light auth add`",
+                    self.workspaces[idx].name
+                );
+            }
+            Event::Notice(t) => {
+                if is_current {
+                    self.status = t;
+                }
+            }
+            Event::RateLimited { seconds } => {
+                self.status = format!("Slack asked us to wait {seconds}s");
+            }
             Event::Users(users) => {
                 let mut d = self.shared.names.borrow_mut();
                 for u in users {
@@ -497,19 +621,10 @@ impl App {
                         d.channels.insert(c.id.as_str().to_string(), c.name.clone());
                     }
                 }
-                self.convs = convs;
-                self.rebuild_sidebar();
-                if self.open.is_none() {
-                    // Land where there is something to read, as the client did.
-                    let pick = crate::logic::landing(
-                        self.convs
-                            .iter()
-                            .map(|c| (&c.is_muted, &c.unread, &c.mentions)),
-                    );
-                    if let Some(c) = self.convs.get(pick) {
-                        let id = c.id.clone();
-                        self.open_channel(id);
-                    }
+                self.workspaces[idx].convs = convs;
+                if is_current {
+                    self.rebuild_sidebar();
+                    self.land();
                 }
             }
             Event::Messages {
@@ -517,7 +632,7 @@ impl App {
                 messages,
                 append_older,
             } => {
-                if self.open.as_ref() != Some(&channel) {
+                if !is_current || self.open.as_ref() != Some(&channel) {
                     return;
                 }
                 let n = messages.len();
@@ -545,8 +660,6 @@ impl App {
                         );
                     }
                     if let Some(text) = self.options.send.clone() {
-                        // Through `update`, exactly as the Entry's activate
-                        // handler goes, so the timing is of the real path.
                         sender.input(Msg::Send(text));
                     }
                     if self.options.bench && !self.bench_started {
@@ -560,7 +673,7 @@ impl App {
                 message,
                 replaces,
             } => {
-                if self.open.as_ref() != Some(&channel) {
+                if !is_current || self.open.as_ref() != Some(&channel) {
                     return;
                 }
                 if let Some(t0) = self.sent_at {
@@ -602,7 +715,7 @@ impl App {
                 }
             }
             Event::Deleted { channel, ts } => {
-                if self.open.as_ref() == Some(&channel) {
+                if is_current && self.open.as_ref() == Some(&channel) {
                     if let Some(pos) = self.position(|r| r.msg.ts == ts) {
                         self.list.remove(pos);
                     }
@@ -644,7 +757,7 @@ impl App {
             "normal" => self.close_jump(),
             "next_conversation" | "prev_conversation" => {
                 let selected = self.sidebar.selected_row().map(|r| r.index() as usize);
-                let len = self.convs.len();
+                let len = self.convs().len();
                 if let Some(i) = crate::logic::step(selected, len, name == "next_conversation") {
                     if let Some(row) = self.sidebar.row_at_index(i as i32) {
                         self.sidebar.select_row(Some(&row));
@@ -652,7 +765,12 @@ impl App {
                 }
                 self.composer.grab_focus();
             }
-            "workspace_1" => self.status = "workspace 1 (the demo has one)".into(),
+            "next_workspace" => {
+                let n = self.workspaces.len();
+                if n > 1 {
+                    self.switch_to((self.current + 1) % n);
+                }
+            }
             "clear_composer" => self.composer.set_text(""),
             "help" | "palette" => {
                 self.status = self
@@ -662,17 +780,30 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("   ");
             }
-            other => self.status = format!("unbound action {other}"),
+            other => {
+                if let Some(n) = other
+                    .strip_prefix("workspace_")
+                    .and_then(|d| d.parse::<usize>().ok())
+                {
+                    if n >= 1 && n <= self.workspaces.len() {
+                        self.switch_to(n - 1);
+                    } else {
+                        self.status = format!("no workspace {n}");
+                    }
+                } else {
+                    self.status = format!("unbound action {other}");
+                }
+            }
         }
     }
 
     fn rebuild_sidebar(&mut self) {
-        // A plain ListBox: a dozen rows, not five thousand. Rebuilt
-        // wholesale; the spike is not about the sidebar.
+        // A plain ListBox: a dozen rows, not five thousand. Rebuilt wholesale.
         while let Some(child) = self.sidebar.first_child() {
             self.sidebar.remove(&child);
         }
-        for c in &self.convs {
+        let convs: Vec<SidebarEntry> = self.convs().to_vec();
+        for c in &convs {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             row.set_margin_start(8);
             row.set_margin_end(8);
@@ -694,6 +825,19 @@ impl App {
                 name.set_label(&label);
             }
             row.append(&name);
+            // One accessible name for the row, so a screen reader says
+            // "engineering, 1 mention" rather than reading two labels.
+            let spoken = if c.mentions > 0 {
+                format!(
+                    "{label}, {} mention{}",
+                    c.mentions,
+                    if c.mentions == 1 { "" } else { "s" }
+                )
+            } else if c.unread > 0 {
+                format!("{label}, {} unread", c.unread)
+            } else {
+                label.clone()
+            };
             if c.mentions > 0 {
                 let b = gtk::Label::new(Some(&c.mentions.to_string()));
                 b.add_css_class("badge");
@@ -701,7 +845,20 @@ impl App {
             } else if c.unread > 0 {
                 row.append(&gtk::Label::new(Some(&c.unread.to_string())));
             }
+            // GTK does not take a list item's name from its `label` property
+            // (measured: the node stayed nameless), but a Label honours it.
+            // So the name label speaks for the row: "engineering, 1 mention".
+            name.update_property(&[gtk::accessible::Property::Label(&spoken)]);
             self.sidebar.append(&row);
+        }
+        // Keep the open conversation selected across a rebuild, or the
+        // sidebar loses its place every time a badge changes.
+        if let Some(open) = &self.open {
+            if let Some(i) = convs.iter().position(|c| &c.id == open) {
+                if let Some(row) = self.sidebar.row_at_index(i as i32) {
+                    self.sidebar.select_row(Some(&row));
+                }
+            }
         }
     }
 
@@ -728,9 +885,14 @@ impl App {
                     bench::report("scroll_px", (adj.upper() - adj.value()) as i64);
                     bench::frame_summary("scroll");
                     bench::report_memory("scroll");
-                    // Jumps: far apart, so every one realises rows from cold.
                     bench::reset_frames();
-                    let targets = [0u32, total / 2, total - 1, total / 4, (total * 3) / 4];
+                    let targets = [
+                        0u32,
+                        total / 2,
+                        total.saturating_sub(1),
+                        total / 4,
+                        (total * 3) / 4,
+                    ];
                     let mut i = 0;
                     let view = view.clone();
                     let s3 = s2.clone();
@@ -760,21 +922,11 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        let tx = self.commands.clone();
-        self.runtime.spawn(async move {
-            let _ = tx.send(Command::Shutdown).await;
-        });
-    }
-}
-
-fn palette_name(source: &crate::theme::Source) -> String {
-    match source {
-        crate::theme::Source::Omarchy(_) => {
-            std::fs::read_to_string(crate::theme::omarchy_state_dir().join("theme.name"))
-                .map(|s| format!("omarchy/{}", s.trim()))
-                .unwrap_or_else(|_| "omarchy".into())
+        for w in &self.workspaces {
+            let tx = w.commands.clone();
+            self.runtime.spawn(async move {
+                let _ = tx.send(Command::Shutdown).await;
+            });
         }
-        crate::theme::Source::File(p) => p.display().to_string(),
-        crate::theme::Source::Builtin(n) => format!("built-in {n}"),
     }
 }

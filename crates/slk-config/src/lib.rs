@@ -24,6 +24,8 @@ pub struct Config {
     pub notify: Notify,
     pub keymap: KeymapCfg,
     pub ui: Ui,
+    pub theme: ThemeCfg,
+    pub window: WindowCfg,
     pub store: StoreCfg,
     pub log: Log,
     /// `[keys.normal]` and `[keys.insert]`: chord to action name.
@@ -201,7 +203,9 @@ pub struct KeymapCfg {
 impl Default for KeymapCfg {
     fn default() -> Self {
         KeymapCfg {
-            preset: "vim".into(),
+            // Non-modal: a window whose composer swallows `j` because it is
+            // in the wrong mode is a bug report. `vim` is one line away.
+            preset: "slack".into(),
         }
     }
 }
@@ -229,6 +233,47 @@ impl Default for Ui {
             reduced_motion: false,
             linear: false,
             mouse: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeCfg {
+    /// `auto` uses Omarchy's palette when its state directory exists, else a
+    /// built-in; `omarchy`, `builtin` and `file` insist.
+    pub source: String,
+    /// `auto` follows the desktop's colour scheme; `dark` or `light` insist.
+    pub builtin: String,
+    /// A `colors.toml` of your own, in Omarchy's schema.
+    pub file: String,
+    /// Layer `~/.config/slack-light/user.css` on top of the generated CSS.
+    pub user_css: bool,
+}
+impl Default for ThemeCfg {
+    fn default() -> Self {
+        ThemeCfg {
+            source: "auto".into(),
+            builtin: "auto".into(),
+            file: String::new(),
+            user_css: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowCfg {
+    pub width: i32,
+    pub height: i32,
+    pub sidebar_width: i32,
+}
+impl Default for WindowCfg {
+    fn default() -> Self {
+        WindowCfg {
+            width: 1100,
+            height: 720,
+            sidebar_width: 240,
         }
     }
 }

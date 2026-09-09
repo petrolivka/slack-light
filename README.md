@@ -18,14 +18,15 @@ your desktop.
 Built for Wayland, verified on Hyprland, themed by
 [Omarchy](https://omarchy.org) when it is there.
 
-> **Status: M0-GUI spikes done, M1 next.** This is the successor to a
+> **Status: M1 — skeleton.** `slack-light --anonymous` opens a themed window on a demo workspace; with a session it follows a conversation and replies. This is the successor to a
 > terminal client that reached parity and turned out to be the wrong shape
 > for a medium full of images and threads. The Slack layer — session route,
 > websocket, cache, sync engine — carries over intact and verified. The GTK
-> shell has been spiked and measured: 60 fps over 5 000 rows, 0.08 % idle,
+> shell was spiked and measured — 60 fps over 5 000 rows, 0.06 % idle,
 > themed live from Omarchy, driven from the keyboard and asserted through
-> the accessibility tree. See [ADR-001](docs/ADR-001-native-gui.md) for why
-> and [the findings](docs/M0-GUI-FINDINGS.md) for the numbers.
+> the accessibility tree — and then built. See [ADR-001](docs/ADR-001-native-gui.md)
+> for why, [the findings](docs/M0-GUI-FINDINGS.md) for the numbers, and
+> [M1-STATUS.md](docs/M1-STATUS.md) for what works today.
 
 ---
 
@@ -79,6 +80,8 @@ writes one.
 ```bash
 ./build.sh                 # cargo build --release, in a cgroup of its own — read CONTRIBUTING.md for why
 ./build.sh test
+target/release/slack-light --anonymous     # the demo workspace, no credentials
+tests/a11y/e2e.sh                          # keyboard in, accessibility tree out
 ```
 
 Needs GTK 4.14+ development files (`gtk4` on Arch). No libadwaita.
@@ -92,6 +95,7 @@ Needs GTK 4.14+ development files (`gtk4` on Arch). No libadwaita.
 | [docs/SLACK-ACCESS-STRATEGY.md](docs/SLACK-ACCESS-STRATEGY.md) | Session token vs official app: coverage, stability, rate limits, risk |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crates, data model, storage, sync engine, the GTK runtime, theming, config |
 | [docs/M0-GUI-SPIKE-PLAN.md](docs/M0-GUI-SPIKE-PLAN.md) | What the GTK client must prove before anything else is built |
+| [docs/M0-GUI-FINDINGS.md](docs/M0-GUI-FINDINGS.md) · [docs/M1-STATUS.md](docs/M1-STATUS.md) | What the GTK spikes measured; what the skeleton delivers |
 | [docs/M0-SPIKE-PLAN.md](docs/M0-SPIKE-PLAN.md) · [docs/M0-FINDINGS.md](docs/M0-FINDINGS.md) | The original spike: what was proved about Slack's API, measured against a live workspace |
 
 ## Licence

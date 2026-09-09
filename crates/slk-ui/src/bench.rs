@@ -1,4 +1,4 @@
-//! The numbers. Everything the spike plan asks to be *measured* rather than
+//! The numbers. Everything the requirements ask to be *measured* rather than
 //! judged is collected here and printed to stdout as `key=value` lines, so a
 //! run is a record and not an impression.
 //!
@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 pub struct Options {
     pub bench: bool,
     pub idle_secs: u64,
+    pub width: i32,
+    pub height: i32,
+    pub sidebar_width: i32,
     /// Send this text once the conversation has loaded, through the same
     /// path the composer uses, and time the optimistic row and its
     /// confirmation. A6 as a number rather than a keystroke.
@@ -26,6 +29,12 @@ pub struct Options {
 }
 
 static START: OnceLock<Instant> = OnceLock::new();
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `report` prints. Off by default: a client's stdout is not a log.
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 
 pub fn mark_start(t: Instant) {
     let _ = START.set(t);
@@ -69,7 +78,14 @@ pub fn cpu_ns() -> u64 {
 }
 
 pub fn report(key: &str, value: impl std::fmt::Display) {
-    println!("{key}={value}");
+    if ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        use std::io::Write;
+        // Flushed, because a test redirects this to a file and then kills the
+        // process: block-buffered stdout would lose the line that matters.
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{key}={value}");
+        let _ = out.flush();
+    }
 }
 
 /// Frame intervals recorded from a frame clock, in microseconds.

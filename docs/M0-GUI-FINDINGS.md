@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Spikes A–E complete, 2026-09-09; C's success path awaits a human sign-in |
+| Status | Spikes A–E complete, 2026-09-09; promoted into the client in M1 ([M1-STATUS.md](./M1-STATUS.md)); C's success path awaits a human sign-in |
 | Plan | [M0-GUI-SPIKE-PLAN.md](./M0-GUI-SPIKE-PLAN.md) |
 | Binary | `spike/shell` — relm4 0.11 over the real `slk-sync` engine against `MockBackend`, no network |
 | Environment | Rust 1.98.1, GTK 4.22.4, relm4 0.11.0 / gtk4-rs 0.11.4, Arch Linux 7.1.9, Hyprland on Wayland, Mesa (default GSK renderer), integrated GPU |

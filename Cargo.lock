@@ -2295,16 +2295,20 @@ dependencies = [
  "anyhow",
  "clap",
  "futures-util",
+ "gtk4",
  "jiff",
  "reqwest",
  "serde",
  "serde_json",
  "slk-api",
+ "slk-auth",
  "slk-config",
  "slk-core",
  "slk-notify",
  "slk-store",
  "slk-sync",
+ "slk-theme",
+ "slk-ui",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -2326,6 +2330,17 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+]
+
+[[package]]
+name = "slk-auth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "slk-config",
 ]
 
 [[package]]
@@ -2382,6 +2397,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "slk-theme"
+version = "0.1.0"
+dependencies = [
+ "gtk4",
+ "serde",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
+name = "slk-ui"
+version = "0.1.0"
+dependencies = [
+ "gtk4",
+ "jiff",
+ "relm4",
+ "slk-config",
+ "slk-core",
+ "slk-sync",
+ "slk-theme",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2395,38 +2436,6 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "spike-shell"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "gtk4",
- "jiff",
- "relm4",
- "serde",
- "slk-api",
- "slk-config",
- "slk-core",
- "slk-store",
- "slk-sync",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "spike-signin"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "libc",
- "reqwest",
- "serde_json",
- "slack-light",
- "tokio",
 ]
 
 [[package]]

@@ -1,15 +1,10 @@
-//! M0-GUI spike C: sign in with your browser.
+//! Sign in with your browser.
 //!
 //! Launches a Chromium-family browser in a throwaway profile at Slack's
 //! sign-in page, watches over the DevTools protocol for the `d` cookie and
 //! the `xoxc` tokens the web client keeps in local storage, and wipes the
 //! profile. Never the user's real profile; never the Slack desktop app's
 //! data. The same flow msga proved, written the plain way.
-//!
-//!   spike-signin                       # opens the browser, waits up to 5 minutes
-//!   spike-signin --timeout 20          # …or that many seconds
-//!   spike-signin --browser /usr/bin/x  # a specific binary (or a nonexistent one, to test that path)
-//!   spike-signin --save                # store the result the way `auth add` does — slk-dev ONLY
 //!
 //! Transport: `--remote-debugging-pipe`. The browser reads CDP from its fd 3
 //! and writes to its fd 4, one JSON message per NUL byte. No port, no
@@ -21,9 +16,9 @@
 //! no_devtools, cancelled, timeout. A silent hang is the one outcome this
 //! program is not allowed to have (D9).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -41,13 +36,8 @@ const BROWSERS: [&str; 6] = [
     "chromium-browser",
 ];
 
-/// The only workspace this spike will ever store credentials for. The `d`
-/// cookie reaches every workspace on the account, so the guard is on the
-/// team, and the team is the test one.
-const ALLOWED_TEAM: &str = "slk-dev";
-
 #[derive(Debug)]
-enum Failure {
+pub enum Failure {
     NoBrowser,
     LaunchFailed(String),
     NoDevTools,
@@ -56,7 +46,7 @@ enum Failure {
 }
 
 impl Failure {
-    fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Failure::NoBrowser => "no_browser",
             Failure::LaunchFailed(_) => "launch_failed",
@@ -65,7 +55,7 @@ impl Failure {
             Failure::Timeout => "timeout",
         }
     }
-    fn advice(&self) -> String {
+    pub fn advice(&self) -> String {
         match self {
             Failure::NoBrowser => "no Chromium-family browser found on PATH (chromium, google-chrome, brave). Install one, or paste the token and cookie by hand.".into(),
             Failure::LaunchFailed(e) => format!("the browser refused to start: {e}"),
@@ -76,64 +66,18 @@ impl Failure {
     }
 }
 
-struct Session {
-    team: String,
-    domain: String,
-    token: String,
+pub struct Session {
+    pub team: String,
+    pub domain: String,
+    pub token: String,
 }
 
-struct Outcome {
-    cookie: String,
-    teams: Vec<Session>,
+pub struct Outcome {
+    pub cookie: String,
+    pub teams: Vec<Session>,
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let value = |name: &str| {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-    };
-    let timeout = value("--timeout")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300u64);
-    let save = args.iter().any(|a| a == "--save");
-    let browser = value("--browser").map(PathBuf::from);
-
-    let t0 = Instant::now();
-    match run(browser, Duration::from_secs(timeout)) {
-        Ok(out) => {
-            println!("result=ok");
-            println!("elapsed_ms={}", t0.elapsed().as_millis());
-            // Never the credential itself. The prefix says which kind it is
-            // and nothing else.
-            println!("cookie_prefix={}", &out.cookie[..out.cookie.len().min(5)]);
-            for t in &out.teams {
-                println!(
-                    "team={} domain={} token_prefix={}",
-                    t.team,
-                    t.domain,
-                    &t.token[..t.token.len().min(5)]
-                );
-            }
-            if save {
-                match store(&out) {
-                    Ok(n) => println!("saved={n}"),
-                    Err(e) => println!("saved=0 reason={e}"),
-                }
-            }
-        }
-        Err(f) => {
-            println!("result={}", f.code());
-            println!("elapsed_ms={}", t0.elapsed().as_millis());
-            eprintln!("{}", f.advice());
-            std::process::exit(1);
-        }
-    }
-}
-
-fn find_browser(explicit: Option<PathBuf>) -> Result<PathBuf, Failure> {
+pub fn find_browser(explicit: Option<PathBuf>) -> Result<PathBuf, Failure> {
     if let Some(p) = explicit {
         return if p.is_file() {
             Ok(p)
@@ -320,7 +264,8 @@ impl Cdp {
     }
 }
 
-fn run(browser: Option<PathBuf>, timeout: Duration) -> Result<Outcome, Failure> {
+/// The whole flow. Blocks the calling thread for up to `timeout`.
+pub fn sign_in(browser: Option<PathBuf>, timeout: Duration) -> Result<Outcome, Failure> {
     let browser = find_browser(browser)?;
     let profile = std::env::temp_dir().join(format!("slack-light-signin-{}", std::process::id()));
     seed_profile(&profile).map_err(|e| Failure::LaunchFailed(e.to_string()))?;
@@ -348,8 +293,8 @@ fn drive(browser: &Path, profile: &Path, timeout: Duration) -> Result<Outcome, F
             &mut events,
         )
         .map_err(|_| Failure::NoDevTools)?;
-    println!(
-        "browser={}",
+    eprintln!(
+        "browser: {}",
         version
             .get("product")
             .and_then(Value::as_str)
@@ -402,7 +347,7 @@ fn drive(browser: &Path, profile: &Path, timeout: Duration) -> Result<Outcome, F
 
         if let Some(cookie) = d {
             if !announced {
-                println!("cookie_seen_ms={}", started.elapsed().as_millis());
+                eprintln!("signed in; waiting for the web client to boot…");
                 announced = true;
             }
             // The tokens live in the web client's local storage, which
@@ -488,50 +433,3 @@ fn read_teams(cdp: &mut Cdp, events: &mut Vec<Value>) -> Option<Vec<Session>> {
         Some(teams)
     }
 }
-
-/// Store the way `auth add` stores, for the test workspace only — and
-/// only after `auth.test` has said the credentials are real.
-fn store(out: &Outcome) -> Result<usize> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let mut saved = 0;
-    for t in &out.teams {
-        if t.domain != ALLOWED_TEAM {
-            println!("skipped={} reason=not_the_test_workspace", t.domain);
-            continue;
-        }
-        let ok = rt.block_on(auth_test(&t.domain, &t.token, &out.cookie))?;
-        if !ok {
-            println!("skipped={} reason=auth_test_failed", t.domain);
-            continue;
-        }
-        let mut all = slack_light::auth::load_all().unwrap_or_default();
-        all.retain(|a| a.team != t.domain);
-        all.push(slack_light::auth::Account {
-            team: t.domain.clone(),
-            token: t.token.clone(),
-            cookie: out.cookie.clone(),
-        });
-        slack_light::auth::save_all(&all).context("saving")?;
-        saved += 1;
-    }
-    Ok(saved)
-}
-
-async fn auth_test(domain: &str, token: &str, cookie: &str) -> Result<bool> {
-    let client = reqwest::Client::builder()
-        .user_agent("slack-light/0.0 signin-spike")
-        .build()?;
-    let v: Value = client
-        .post(format!("https://{domain}.slack.com/api/auth.test"))
-        .header("Cookie", format!("d={cookie}"))
-        .bearer_auth(token)
-        .send()
-        .await?
-        .json()
-        .await?;
-    Ok(v.get("ok").and_then(Value::as_bool) == Some(true))
-}
-
-// Keep `Read` in scope for BufReader::read_until on older toolchains.
-#[allow(dead_code)]
-fn _uses_read<R: Read>(_: R) {}

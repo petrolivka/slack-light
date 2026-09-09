@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "spike/shell", "spike/signin"]
+members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
@@ -48,6 +48,10 @@ readme = "README.md"
 keywords = ["slack", "gtk", "gtk4", "chat", "client"]
 categories = ["gui"]
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+
 # Only slack-light is installed. The probes are development tools with
 # deliberately generic names and have no business in a user's PATH.
 [features]
@@ -84,6 +88,10 @@ slk-store = { path = "crates/slk-store" }
 slk-sync = { path = "crates/slk-sync" }
 slk-config = { path = "crates/slk-config" }
 slk-notify = { path = "crates/slk-notify" }
+slk-ui = { path = "crates/slk-ui" }
+slk-theme = { path = "crates/slk-theme" }
+slk-auth = { path = "crates/slk-auth" }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_18"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

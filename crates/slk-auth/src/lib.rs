@@ -1,10 +1,15 @@
-//! Where credentials live, and why not in the environment.
+//! Credentials: where they live, and the two ways they arrive.
+//!
+//! `browser` signs in through a throwaway Chromium profile; `add` is the
+//! guided paste. Both end in the same 0600 file.
 //!
 //! A session token and the `d` cookie are as good as the account, and the
 //! cookie is account-wide: it reaches every workspace the user is signed in to,
 //! not only the one named here. So they are read from a file with owner-only
 //! permissions rather than from the environment, which anything running as the
 //! same user can read out of `/proc`, or a command line, which is in `ps`.
+
+pub mod browser;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};

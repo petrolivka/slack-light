@@ -60,8 +60,7 @@ slack-light/
 ├── Cargo.toml                 # workspace; the `slack-light` binary lives at the root
 ├── src/
 │   ├── main.rs                # GApplication, CLI (clap), config load, panic hook, wiring, --doctor
-│   ├── auth.rs                # credential storage (keyring / 0600 file)         (carried over)
-│   ├── doctor.rs              # GTK, Wayland, portal, theme, browser, keyring, workspaces
+│   ├── doctor.rs              # GTK, Wayland, portal, theme, browser, credentials, cache
 │   └── bin/
 │       ├── probe.rs           # dev-tools: read-only tour of every endpoint, dumps fixtures
 │       ├── seed.rs            # dev-tools: fill the test workspace with the fixture corpus
@@ -73,7 +72,7 @@ slack-light/
 │   ├── slk-sync/              # engine per workspace: boot, counts, history, gap fill, outbox, notifications
 │   ├── slk-config/            # TOML config + action names + keymap
 │   ├── slk-notify/            # desktop notifications over D-Bus
-│   ├── slk-auth/              # browser sign-in over the DevTools protocol; manual paste
+│   ├── slk-auth/              # browser sign-in over the DevTools protocol; the guided paste; the 0600 file
 │   ├── slk-theme/             # Omarchy colors.toml → GTK CSS; built-in dark/light; live reload
 │   └── slk-ui/                # relm4 components; AST → Pango markup; Block Kit → widgets; shortcuts
 └── fuzz/                      # cargo-fuzz targets: mrkdwn, rich_text, event JSON, keymap

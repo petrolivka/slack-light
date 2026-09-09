@@ -114,10 +114,13 @@ Three layers, fastest first:
 
 1. **Component logic without widgets.** A relm4 component's `update()` is
    driven with a test sender and asserted on. Most behaviour lives here.
-2. **The accessibility tree.** The application runs under a headless
-   Wayland compositor against `--anonymous`, and tests walk the AT-SPI tree
-   the way the predecessor's pty harness walked the screen. If a widget is
-   not in the tree with a usable name, that is a defect twice over: a test
+2. **The accessibility tree.** `tests/a11y/e2e.sh` drives the binary with
+   `wtype` against `--anonymous` and asserts on the AT-SPI tree through
+   `tests/a11y/tree.py` — the way the predecessor's pty harness asserted on
+   the screen. On a developer's machine it runs against the live Hyprland;
+   CI needs `weston --backend=headless` (GTK's AT-SPI backend exists only
+   for X11 and Wayland displays — Broadway will not do). If a widget is not
+   in the tree with a usable name, that is a defect twice over: a test
    cannot see it and neither can a screen reader.
 3. **Eyes.** Screenshots at two window sizes in the pull request, taken on
    Hyprland.

@@ -1,0 +1,13 @@
+[package]
+name = "slk-theme"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Omarchy's colors.toml, or a built-in palette in the same schema, as GTK CSS — applied live"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_18"] }
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true

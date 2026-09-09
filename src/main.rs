@@ -1,15 +1,18 @@
 //! Wiring: parse the arguments, build the pieces, hand them to each other.
 //!
-//! Until M0-GUI lands there is no window here. What there is, is everything
-//! that does not need one: credentials, the cache, the action list — the
-//! parts that were carried over intact and are worth being able to run.
-
-use slack_light::auth;
+//! Order matters here and it is the one place it does: the tokio runtime and
+//! every engine exist before GTK is initialised, the window holds channel
+//! ends and nothing else, and the runtime outlives the window.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use slack_light::doctor;
+use slk_api::{Credentials, MockBackend, SessionBackend, SlackBackend};
+use slk_auth as auth;
 use slk_config::Config;
 use slk_store::Store;
+use slk_sync::Engine;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
@@ -27,6 +30,16 @@ struct Cli {
     #[arg(long)]
     anonymous: bool,
 
+    /// With `--anonymous`, have the demo workspace keep talking: a scripted
+    /// message every few seconds.
+    #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "5")]
+    demo: Option<u64>,
+
+    /// With `--anonymous`, this many synthetic messages in `#engineering`,
+    /// for a conversation the size of a real one.
+    #[arg(long, value_name = "N", default_value = "0")]
+    demo_rows: usize,
+
     /// Make no writes of any kind: no posts, no read marks.
     #[arg(long)]
     read_only: bool,
@@ -35,6 +48,14 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
+    /// A `colors.toml` to use instead of the configured theme.
+    #[arg(long, value_name = "PATH")]
+    theme: Option<std::path::PathBuf>,
+
+    /// Report what this machine and this desktop can do.
+    #[arg(long)]
+    doctor: bool,
+
     /// Write a commented default configuration file.
     #[arg(long)]
     write_config: bool,
@@ -42,6 +63,23 @@ struct Cli {
     /// Print every bindable action name.
     #[arg(long)]
     list_actions: bool,
+
+    /// Print timing and memory lines to stdout as things happen.
+    #[arg(long)]
+    metrics: bool,
+
+    /// Scroll the open conversation, report frame times and memory, exit.
+    #[arg(long)]
+    bench: bool,
+
+    /// With `--bench`, sit idle this long afterwards and report CPU.
+    #[arg(long, value_name = "SECONDS", default_value = "0")]
+    idle: u64,
+
+    /// Send this text once the conversation has loaded, through the same
+    /// path the composer uses. For tests without a keyboard.
+    #[arg(long, value_name = "TEXT", hide = true)]
+    send: Option<String>,
 
     #[arg(long, value_name = "LEVEL")]
     log_level: Option<String>,
@@ -76,9 +114,19 @@ enum CacheCmd {
 
 #[derive(Subcommand)]
 enum AuthCmd {
-    /// Sign in. Browser sign-in arrives with M0-GUI; until then this is the
-    /// guided paste of a token and cookie.
-    Add,
+    /// Sign in with your browser: a throwaway Chromium profile opens at
+    /// Slack's sign-in page; nothing is copied by hand.
+    Add {
+        /// Paste the token and cookie yourself instead.
+        #[arg(long)]
+        paste: bool,
+        /// A specific browser binary to drive.
+        #[arg(long, value_name = "PATH")]
+        browser: Option<std::path::PathBuf>,
+        /// Give up after this many seconds.
+        #[arg(long, value_name = "SECONDS", default_value = "300")]
+        timeout: u64,
+    },
     /// Show which workspaces are configured. Never prints the credentials.
     List,
     /// Forget one workspace, or all of them.
@@ -89,6 +137,8 @@ enum AuthCmd {
 }
 
 fn main() -> Result<()> {
+    let t0 = std::time::Instant::now();
+    slk_ui::bench::mark_start(t0);
     let cli = Cli::parse();
 
     if cli.write_config {
@@ -113,7 +163,17 @@ fn main() -> Result<()> {
         Some(Cmd::Cache { what }) => return cache_cmd(what),
         Some(Cmd::Auth { what }) => {
             return match what {
-                AuthCmd::Add => auth::add(),
+                AuthCmd::Add {
+                    paste,
+                    browser,
+                    timeout,
+                } => {
+                    if *paste {
+                        auth::add()
+                    } else {
+                        browser_sign_in(browser.clone(), *timeout)
+                    }
+                }
                 AuthCmd::List => {
                     match auth::load_all() {
                         Ok(all) => {
@@ -151,23 +211,224 @@ fn main() -> Result<()> {
         }
         None => {}
     }
+    if cli.doctor {
+        return doctor::report(cli.anonymous);
+    }
 
     let (config, problems) = Config::load();
     init_logging(&cli, &config)?;
     for p in &problems {
         eprintln!("config: {p}");
     }
+    slk_ui::bench::set_enabled(cli.metrics || cli.bench);
+    install_panic_hook();
 
-    // Honest rather than a stub window: the interface is the subject of the
-    // M0-GUI spike, and a binary that opened an empty frame would be a demo
-    // of nothing.
-    eprintln!(
-        "slack-light {}: the window is not built yet.\n\
-         The Slack layer, the cache and the credentials are; see docs/M0-GUI-SPIKE-PLAN.md.\n\
-         `slack-light auth …`, `slack-light cache …` and `--list-actions` work today.",
-        env!("CARGO_PKG_VERSION")
+    // The engines' home. Built before GTK, kept until after the window closes.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+
+    // One backend per configured workspace. A workspace that will not connect
+    // does not stop the others: losing one company's Slack because another's
+    // session expired would be absurd.
+    let mut backends: Vec<(String, Arc<dyn SlackBackend>)> = Vec::new();
+    if cli.anonymous {
+        let mut demo = MockBackend::new().with_demo_image();
+        if cli.demo_rows > 0 {
+            demo = demo.with_synthetic(cli.demo_rows);
+        }
+        match cli.demo {
+            Some(secs) => {
+                backends.push(("demo".into(), Arc::new(demo.with_live_stream(secs.max(1)))));
+                backends.push(("other-corp".into(), Arc::new(MockBackend::second())));
+            }
+            None => backends.push(("demo".into(), Arc::new(demo))),
+        }
+    } else {
+        let accounts = auth::load_all()?;
+        for a in accounts {
+            let team = a.team.clone();
+            let r = runtime.block_on(SessionBackend::connect(Credentials {
+                domain: a.team,
+                token: a.token,
+                cookie: a.cookie,
+            }));
+            match r {
+                Ok(b) => backends.push((team, Arc::new(b))),
+                Err(e) => eprintln!("{team}: not connected — {}", e.user_message()),
+            }
+        }
+        if backends.is_empty() {
+            anyhow::bail!("no workspace could be reached. Try `slack-light auth add`.");
+        }
+    }
+
+    let store_path = if cli.no_cache || !config.store.enabled {
+        None
+    } else {
+        Some(slk_config::data_dir().join("store.sqlite"))
+    };
+
+    // Retention runs once at start-up rather than on a timer: it is the only
+    // moment nothing else is touching the store.
+    if let Some(p) = &store_path {
+        if let Ok(mut store) = Store::open(Some(p)) {
+            match store.trim(
+                config.store.max_messages_per_channel,
+                config.store.max_age_days,
+            ) {
+                Ok(n) if n > 0 => tracing::info!("retention removed {n} messages"),
+                Err(e) => tracing::warn!("retention: {e}"),
+                _ => {}
+            }
+        }
+        let media = slk_config::cache_dir().join("media");
+        let freed = trim_media(&media, config.images.cache_mb);
+        if freed > 0 {
+            tracing::info!("media cache trimmed by {}", human_bytes(freed));
+        }
+    }
+
+    // Each engine owns its own connection to the store; every workspace's
+    // events are folded into one stream, tagged with which.
+    let (ev_tx, ev_rx) = tokio::sync::mpsc::channel(512);
+    let mut workspaces = Vec::new();
+    {
+        let _guard = runtime.enter();
+        for (name, backend) in backends {
+            let team = backend.team().clone();
+            let store = Store::open(store_path.as_deref()).context("opening the message cache")?;
+            let (cmd_tx, mut rx) = Engine::spawn(backend, store, config.notify.keywords.clone());
+            workspaces.push(slk_ui::Workspace {
+                team: team.clone(),
+                name,
+                commands: cmd_tx,
+            });
+            let ev_tx = ev_tx.clone();
+            runtime.spawn(async move {
+                while let Some(ev) = rx.recv().await {
+                    if ev_tx.send((team.clone(), ev)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+    drop(ev_tx);
+
+    let media_dir = if cli.anonymous {
+        std::env::temp_dir().join(format!("slack-light-demo-{}", std::process::id()))
+    } else {
+        slk_config::cache_dir().join("media")
+    };
+
+    let theme = slk_theme::Choice {
+        source: if cli.theme.is_some() {
+            "file".into()
+        } else {
+            config.theme.source.clone()
+        },
+        builtin: config.theme.builtin.clone(),
+        file: cli.theme.clone().or_else(|| {
+            Some(config.theme.file.clone())
+                .filter(|f| !f.is_empty())
+                .map(std::path::PathBuf::from)
+        }),
+    };
+    let user_css = config
+        .theme
+        .user_css
+        .then(|| slk_config::config_dir().join("user.css"));
+
+    slk_ui::run(slk_ui::Init {
+        workspaces,
+        events: Some(ev_rx),
+        runtime: runtime.handle().clone(),
+        media_dir: media_dir.clone(),
+        config,
+        theme,
+        user_css,
+        read_only: cli.read_only,
+        options: slk_ui::bench::Options {
+            bench: cli.bench,
+            idle_secs: cli.idle,
+            send: cli.send.clone(),
+            ..Default::default()
+        },
+    });
+
+    // The window is gone. Nothing needs flushing — the store is written as
+    // it goes — so the runtime goes down with whatever is still on it.
+    runtime.shutdown_background();
+    if cli.anonymous {
+        let _ = std::fs::remove_dir_all(&media_dir);
+    }
+    Ok(())
+}
+
+/// `slack-light auth add`: the browser flow, then a choice.
+///
+/// The `d` cookie the browser hands back reaches every workspace on the
+/// account, and `localConfig_v2` lists every one the user is signed in to —
+/// including the ones they would rather this client never touched. So the
+/// teams are listed and the user picks; nothing is stored unasked.
+fn browser_sign_in(browser: Option<std::path::PathBuf>, timeout: u64) -> Result<()> {
+    use std::io::{self, Write};
+    println!(
+        "A browser window will open at Slack's sign-in page, in a throwaway profile.\n\
+         Sign in as you normally would. The window closes by itself afterwards."
     );
-    std::process::exit(2);
+    let out = match auth::browser::sign_in(browser, std::time::Duration::from_secs(timeout)) {
+        Ok(o) => o,
+        Err(f) => {
+            eprintln!("{}", f.advice());
+            eprintln!("(`slack-light auth add --paste` is the other way in.)");
+            std::process::exit(1);
+        }
+    };
+    if out.teams.is_empty() {
+        anyhow::bail!("signed in, but no workspace with a session token was found");
+    }
+    println!("\nSigned in. Workspaces on this account:");
+    for (i, t) in out.teams.iter().enumerate() {
+        println!("  {}. {}  ({})", i + 1, t.domain, t.team);
+    }
+    print!("\nStore which? Numbers separated by spaces, `all`, or nothing for none: ");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    let line = line.trim();
+    let chosen: Vec<usize> = if line.eq_ignore_ascii_case("all") {
+        (0..out.teams.len()).collect()
+    } else {
+        line.split_whitespace()
+            .filter_map(|s| s.parse::<usize>().ok())
+            .filter(|n| *n >= 1 && *n <= out.teams.len())
+            .map(|n| n - 1)
+            .collect()
+    };
+    if chosen.is_empty() {
+        println!("nothing stored.");
+        return Ok(());
+    }
+    let mut all = auth::load_all().unwrap_or_default();
+    for i in chosen {
+        let t = &out.teams[i];
+        all.retain(|a| a.team != t.domain);
+        all.push(auth::Account {
+            team: t.domain.clone(),
+            token: t.token.clone(),
+            cookie: out.cookie.clone(),
+        });
+        println!("  stored {}", t.domain);
+    }
+    let p = auth::save_all(&all)?;
+    println!(
+        "saved to {} (0600). Run `slack-light` to start.",
+        p.display()
+    );
+    Ok(())
 }
 
 /// `slack-light cache stats | trim | purge`.
@@ -238,7 +499,7 @@ fn cache_cmd(what: &CacheCmd) -> Result<()> {
     Ok(())
 }
 
-fn human_bytes(n: i64) -> String {
+pub fn human_bytes(n: i64) -> String {
     const U: [&str; 4] = ["B", "kB", "MB", "GB"];
     let mut v = n as f64;
     let mut i = 0;
@@ -274,11 +535,6 @@ fn dir_size(dir: &std::path::Path) -> i64 {
 }
 
 /// Hold the media directory under its limit, oldest-used first.
-///
-/// Least-recently-used by access time where the filesystem keeps one and by
-/// modification time where it does not, which on a cache that is only ever
-/// written once and read many times is the same ordering for anything that has
-/// actually been looked at.
 fn trim_media(dir: &std::path::Path, limit_mb: u64) -> i64 {
     let limit = limit_mb as i64 * 1024 * 1024;
     let mut files: Vec<(std::time::SystemTime, i64, std::path::PathBuf)> = std::fs::read_dir(dir)
@@ -310,6 +566,32 @@ fn trim_media(dir: &std::path::Path, limit_mb: u64) -> i64 {
         }
     }
     freed
+}
+
+/// Leave a report worth reading. Nothing about credentials or message
+/// content is included: a crash report is something people paste into
+/// issues.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let dir = slk_config::state_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!(
+            "crash-{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ));
+        let body = format!(
+            "slack-light {} panicked\n\n{info}\n\nbacktrace:\n{}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::backtrace::Backtrace::force_capture()
+        );
+        let _ = std::fs::write(&path, &body);
+        eprintln!("slack-light crashed. Report written to {}", path.display());
+        previous(info);
+    }));
 }
 
 fn init_logging(cli: &Cli, config: &Config) -> Result<()> {
@@ -344,7 +626,11 @@ fn init_logging(cli: &Cli, config: &Config) -> Result<()> {
                 .init();
         }
         None => {
-            tracing_subscriber::registry().with(filter).init();
+            // stderr, never stdout: stdout is where `--metrics` writes.
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt::layer().with_writer(std::io::stderr))
+                .init();
         }
     }
     Ok(())

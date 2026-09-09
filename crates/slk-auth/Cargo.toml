@@ -1,0 +1,14 @@
+[package]
+name = "slk-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Credentials: browser sign-in in a throwaway profile, the guided paste, and the 0600 file"
+
+[dependencies]
+slk-config = { path = "../slk-config" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true

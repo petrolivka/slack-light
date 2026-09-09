@@ -1,0 +1,19 @@
+[package]
+name = "slk-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The window: relm4 components over the sync engine"
+
+[dependencies]
+relm4 = { version = "0.11", features = ["macros"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_18"] }
+slk-core = { path = "../slk-core" }
+slk-sync = { path = "../slk-sync" }
+slk-config = { path = "../slk-config" }
+slk-theme = { path = "../slk-theme" }
+tokio.workspace = true
+tracing.workspace = true
+jiff.workspace = true
+toml.workspace = true

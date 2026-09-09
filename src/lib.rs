@@ -1,7 +1,9 @@
 //! The pieces the binary and its development tools share.
 //!
-//! `slack-light` is a binary, but its credential handling is also wanted by
-//! the probes under `src/bin/`, which are gated behind the `dev-tools`
-//! feature so they never land in a user's PATH.
+//! `slack-light` is a binary; the probes under `src/bin/` are gated behind
+//! the `dev-tools` feature so they never land in a user's PATH, and they
+//! reach the credential store through the same path the binary does.
 
-pub mod auth;
+pub mod doctor;
+
+pub use slk_auth as auth;

@@ -10,7 +10,7 @@ use gtk::glib;
 use slk_core::ast::{BlockNode, Doc, Inline, ListStyle, Style};
 use slk_core::Names;
 
-pub use crate::theme::Semantic as Palette;
+pub use slk_theme::Semantic as Palette;
 
 pub struct Ctx<'a> {
     pub names: &'a dyn Names,
