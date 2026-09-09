@@ -261,6 +261,19 @@ w -M ctrl k -m ctrl; sleep 0.5; w "des"; sleep 0.3; w -k Return; sleep 9
 check "a mention elsewhere is raised" "$( [ "$(grep -c '^notified=' "$LOG3")" -ge 1 ] && echo 1 || echo 0 )" "$(grep '^notified=' "$LOG3" | head -1)"
 check "and it says who and where" "$( grep -q '^notified=.*mentioned you in #' "$LOG3" && echo 1 || echo 0 )"
 
+# The received typing indicator: the demo stream says somebody is typing
+# before each line, so going back to #engineering has to show it under the
+# composer, and it has to go away on its own.
+w -M ctrl k -m ctrl; sleep 0.5; w "engi"; sleep 0.3; w -k Return; sleep 1.0
+typed=0
+for _ in 1 2 3 4 5 6 7 8; do
+  if tree | grep -q 'is typing…'; then typed=1; break; fi
+  sleep 0.6
+done
+check "somebody typing shows under the composer" "$typed" "$(tree | grep -oE "label '[^']*typing[^']*'" | head -1)"
+sleep 6
+check "and it clears itself, because Slack sends no 'stopped'" "$( tree | grep -q 'is typing…' && echo 0 || echo 1 )"
+
 kill $PID3 2>/dev/null; wait $PID3 2>/dev/null
 sleep 1
 

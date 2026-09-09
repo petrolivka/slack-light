@@ -1,0 +1,12 @@
+[package]
+name = "slk-idle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Away when the desktop is idle: ext-idle-notify-v1, with an honest answer when it is absent"
+
+[dependencies]
+tracing.workspace = true
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }

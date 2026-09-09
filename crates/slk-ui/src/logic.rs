@@ -304,6 +304,21 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/pins", "What is pinned here"),
 ];
 
+/// "alice is typing…", for however many people are.
+///
+/// Names rather than a count, and at most two of them: "3 people are typing"
+/// tells you nothing you wanted, and a line that grows with the room pushes
+/// the composer around. Empty when nobody is, so the caller can fall back to
+/// whatever the hint normally says.
+pub fn typing_line(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => format!("{one} is typing…"),
+        [a, b] => format!("{a} and {b} are typing…"),
+        [a, b, rest @ ..] => format!("{a}, {b} and {} more are typing…", rest.len()),
+    }
+}
+
 /// A message, as a quote to put in front of a reply.
 ///
 /// Slack's own mrkdwn quote is a leading `>` per line, and a blank line ends
@@ -528,6 +543,22 @@ pub fn accel(rendered: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_typing_line_names_people_rather_than_counting_them() {
+        use super::typing_line;
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(typing_line(&n(&[])), "");
+        assert_eq!(typing_line(&n(&["alice"])), "alice is typing…");
+        assert_eq!(
+            typing_line(&n(&["alice", "bob"])),
+            "alice and bob are typing…"
+        );
+        assert_eq!(
+            typing_line(&n(&["alice", "bob", "carol", "dave"])),
+            "alice, bob and 2 more are typing…"
+        );
+    }
+
     #[test]
     fn a_quote_survives_the_blank_line_in_the_middle_of_it() {
         // A bare empty line ends a mrkdwn quote, so the second paragraph

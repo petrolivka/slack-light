@@ -74,6 +74,10 @@ actions! {
     SearchLocal    => "search_local",    "Search what is already downloaded",    "global";
     Pinned         => "pinned",          "What is pinned in this conversation",  "global";
 
+    TogglePresence => "presence",        "Set yourself away, or active again",   "you";
+    SetStatus      => "status",          "Set your status",                      "you";
+    Snooze         => "dnd",             "Snooze notifications",                 "you";
+
     Star           => "star",            "Star or unstar this conversation",     "conversation";
     Mute           => "mute",            "Mute or unmute this conversation",     "conversation";
     SetTopic       => "set_topic",       "Set the conversation's topic",         "conversation";

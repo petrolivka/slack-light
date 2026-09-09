@@ -85,6 +85,9 @@ const DEFAULTS: &[(Action, &str)] = &[
     (Action::ToggleBroadcast, "<Control>b"),
     (Action::CopyLink, "<Control>l"),
     (Action::Quote, "<Control>q"),
+    (Action::TogglePresence, "<Control><Alt>a"),
+    // Status and DND take a word, so they prefill the composer and have no
+    // key of their own — the palette runs them by name.
     (Action::Star, "<Control><Alt>s"),
     (Action::Mute, "<Control><Alt>m"),
     // Not <Control><Alt>p, which reads better and is already this table's

@@ -90,6 +90,7 @@ slk-config = { path = "crates/slk-config" }
 slk-notify = { path = "crates/slk-notify" }
 slk-ui = { path = "crates/slk-ui" }
 slk-theme = { path = "crates/slk-theme" }
+slk-idle = { path = "crates/slk-idle" }
 slk-auth = { path = "crates/slk-auth" }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_18"] }
 anyhow.workspace = true

@@ -221,11 +221,25 @@ pub trait SlackBackend: Send + Sync {
     /// Post as `/me`.
     async fn me_message(&self, ch: &ChannelId, text: &str) -> Result<()>;
 
+    /// Say that we are typing here.
+    ///
+    /// There is no REST endpoint for this: the web client sends a frame down
+    /// the websocket it already has. A backend with no socket cannot do it,
+    /// and says so by doing nothing rather than by failing — a typing
+    /// indicator is the least important thing in the client and must never be
+    /// the reason a message does not go.
+    async fn typing(&self, _ch: &ChannelId) -> Result<()> {
+        Ok(())
+    }
+
     /// Set our own presence: `true` for active, `false` for away.
     async fn set_presence(&self, active: bool) -> Result<()>;
 
-    /// Set or clear the status. `None` clears it.
-    async fn set_status(&self, text: &str, emoji: &str) -> Result<()>;
+    /// Set or clear the status; empty text and emoji clear it.
+    ///
+    /// `expires` is a Unix time, or zero for "until I change it". Slack calls
+    /// it `status_expiration` and treats zero the same way.
+    async fn set_status(&self, text: &str, emoji: &str, expires: i64) -> Result<()>;
 
     /// Snooze notifications for so many minutes, or end a snooze with zero.
     async fn snooze(&self, minutes: u32) -> Result<()>;

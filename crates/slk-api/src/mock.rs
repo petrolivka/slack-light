@@ -46,6 +46,13 @@ pub struct MockBackend {
     /// long-lived one and a client that cannot come back from it is broken in
     /// a way nothing else reveals.
     connects: std::sync::atomic::AtomicUsize,
+    /// What this workspace has been told about its own user, so the interface
+    /// can read back what it set.
+    me_active: Mutex<bool>,
+    me_status: Mutex<(String, String, i64)>,
+    me_snoozed: Mutex<u32>,
+    /// Conversations we have said we are typing in.
+    typed: Mutex<Vec<ChannelId>>,
 }
 
 impl MockBackend {
@@ -80,6 +87,10 @@ impl MockBackend {
             domain: domain.to_string(),
             self_id: self_id.clone(),
             convs: Mutex::new(Vec::new()),
+            me_active: Mutex::new(true),
+            me_status: Mutex::new((String::new(), String::new(), 0)),
+            me_snoozed: Mutex::new(0),
+            typed: Mutex::new(Vec::new()),
             users: Vec::new(),
             messages: Mutex::new(HashMap::new()),
             uploaded: Mutex::new(HashMap::new()),
@@ -710,13 +721,23 @@ impl SlackBackend for MockBackend {
         Ok(())
     }
 
-    async fn set_presence(&self, _active: bool) -> Result<()> {
+    // The demo keeps its own presence, status and snooze, so the interface
+    // has something to read back. A "you are away" that never changes is
+    // indistinguishable from one that is not wired up.
+    async fn set_presence(&self, active: bool) -> Result<()> {
+        *self.me_active.lock().unwrap() = active;
         Ok(())
     }
-    async fn set_status(&self, _text: &str, _emoji: &str) -> Result<()> {
+    async fn set_status(&self, text: &str, emoji: &str, expires: i64) -> Result<()> {
+        *self.me_status.lock().unwrap() = (text.to_string(), emoji.to_string(), expires);
         Ok(())
     }
-    async fn snooze(&self, _minutes: u32) -> Result<()> {
+    async fn snooze(&self, minutes: u32) -> Result<()> {
+        *self.me_snoozed.lock().unwrap() = minutes;
+        Ok(())
+    }
+    async fn typing(&self, ch: &ChannelId) -> Result<()> {
+        self.typed.lock().unwrap().push(ch.clone());
         Ok(())
     }
     async fn pins(&self, ch: &ChannelId) -> Result<Vec<Ts>> {
@@ -994,6 +1015,16 @@ impl SlackBackend for MockBackend {
                 }
                 let (user, text) = lines[i % lines.len()];
                 i += 1;
+                // Somebody types before they say something, the way people
+                // do. Without this the received indicator has nothing to
+                // draw and cannot be tested at all.
+                let _ = tx
+                    .send(RtEvent::Typing {
+                        channel: ChannelId::new(eng.clone()),
+                        user: UserId::new(user),
+                    })
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
                 let ts = format!(
                     "{}.000100",
                     std::time::SystemTime::now()

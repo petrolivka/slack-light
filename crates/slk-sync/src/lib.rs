@@ -109,6 +109,10 @@ pub enum Command {
     ListPinned(ChannelId),
     ListThreads,
     ListMentions,
+    /// Tell the conversation we are typing. Throttled by the caller.
+    Typing(ChannelId),
+    /// Set our own presence: `true` active, `false` away.
+    Presence(bool),
     /// Star this conversation, or unstar it.
     Star {
         channel: ChannelId,
@@ -455,25 +459,28 @@ impl Engine {
                     .await
                     .map(|_| None)
             }
-            "/away" => self.backend.set_presence(false).await.map(|_| Some("away")),
-            "/active" => self
-                .backend
-                .set_presence(true)
-                .await
-                .map(|_| Some("active")),
+            "/away" | "/active" => {
+                Box::pin(self.handle(Command::Presence(command == "/active"))).await;
+                return;
+            }
             "/status" => {
-                // `:emoji: the rest`, or nothing at all to clear it.
-                let (emoji, rest) = match text.trim().strip_prefix(':') {
-                    Some(r) => match r.split_once(':') {
-                        Some((e, rest)) => (e.to_string(), rest.trim().to_string()),
-                        None => (String::new(), text.trim().to_string()),
-                    },
-                    None => (String::new(), text.trim().to_string()),
-                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let (emoji, rest, expires) = parse_status(&text, now);
                 self.backend
-                    .set_status(&rest, &emoji)
+                    .set_status(&rest, &emoji, expires)
                     .await
-                    .map(|_| Some("status set"))
+                    .map(|_| {
+                        Some(if rest.is_empty() && emoji.is_empty() {
+                            "status cleared"
+                        } else if expires > 0 {
+                            "status set, with an expiry"
+                        } else {
+                            "status set"
+                        })
+                    })
             }
             "/dnd" => {
                 let minutes = parse_minutes(&text);
@@ -1192,6 +1199,20 @@ impl Engine {
                 .await;
             }
 
+            Command::Presence(active) => match self.backend.set_presence(active).await {
+                Ok(()) => {
+                    self.emit(Event::Notice(if active { "active" } else { "away" }.into()))
+                        .await
+                }
+                Err(e) => self.emit(Event::Notice(e.user_message())).await,
+            },
+
+            Command::Typing(ch) => {
+                // Never worth a notice and never worth a retry: an indicator
+                // that arrives late is worse than one that does not arrive.
+                let _ = self.backend.typing(&ch).await;
+            }
+
             Command::Star { channel, on } => {
                 self.conversation_op(
                     slk_api::backend::ChannelOp::Star(channel.clone(), on),
@@ -1877,6 +1898,58 @@ fn unique_path(want: &std::path::Path) -> std::path::PathBuf {
         }
     }
     want.to_path_buf()
+}
+
+/// `:emoji: some text for 2h` — the three parts of a status, split out.
+///
+/// Returns `(emoji, text, expires)`, where `expires` is a Unix time or zero
+/// for "until I change it", which is what Slack's `status_expiration` means
+/// by zero as well.
+///
+/// The `for …` suffix is only taken when it is the last thing on the line and
+/// parses as a duration. "back in a bit, ask bob for the key" keeps every
+/// word: guessing wrong here silently truncates somebody's status, and a
+/// status is a thing other people read.
+pub fn parse_status(text: &str, now: i64) -> (String, String, i64) {
+    let text = text.trim();
+    let (emoji, rest) = match text.strip_prefix(':') {
+        Some(r) => match r.split_once(':') {
+            Some((e, rest)) if !e.is_empty() && !e.contains(char::is_whitespace) => {
+                (e.to_string(), rest.trim())
+            }
+            _ => (String::new(), text),
+        },
+        None => (String::new(), text),
+    };
+
+    let mut body = rest.to_string();
+    let mut expires = 0;
+    if let Some((head, tail)) = rest.rsplit_once(" for ") {
+        let minutes = parse_duration(tail);
+        if minutes > 0 {
+            body = head.trim_end().to_string();
+            expires = now + minutes as i64 * 60;
+        }
+    }
+    (emoji, body, expires)
+}
+
+/// `30`, `30m`, `1h`, `2 hours` — minutes, or zero for "not a duration".
+fn parse_duration(s: &str) -> u32 {
+    let s = s.trim().to_lowercase();
+    let (digits, unit): (String, String) = s.chars().partition(|c| c.is_ascii_digit());
+    let Ok(n) = digits.parse::<u32>() else {
+        return 0;
+    };
+    if n == 0 {
+        return 0;
+    }
+    match unit.trim() {
+        "" | "m" | "min" | "mins" | "minute" | "minutes" => n,
+        "h" | "hr" | "hrs" | "hour" | "hours" => n * 60,
+        "d" | "day" | "days" => n * 60 * 24,
+        _ => 0,
+    }
 }
 
 /// `30`, `30m`, `1h`, or nothing for "end it".

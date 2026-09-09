@@ -15,6 +15,7 @@ slk-store = { path = "../slk-store" }
 slk-notify = { path = "../slk-notify" }
 slk-config = { path = "../slk-config" }
 slk-theme = { path = "../slk-theme" }
+slk-idle = { path = "../slk-idle" }
 tokio.workspace = true
 tracing.workspace = true
 jiff.workspace = true

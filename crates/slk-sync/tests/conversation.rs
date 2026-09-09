@@ -205,3 +205,49 @@ async fn the_pinned_list_shows_what_slack_says_is_pinned() {
         messages[0].label
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_can_be_given_an_expiry_in_words() {
+    // Parsed in the engine rather than in the window, because `/status` and
+    // the palette both reach it and only one of them is a text field.
+    let now = 1_725_700_000;
+    let (emoji, text, expires) = slk_sync::parse_status(":rocket: shipping v2.4 for 2h", now);
+    assert_eq!(emoji, "rocket");
+    assert_eq!(text, "shipping v2.4");
+    assert_eq!(expires, now + 2 * 3600);
+
+    // No duration: every word is the status, and it lasts until changed.
+    let (_, text, expires) = slk_sync::parse_status("back in a bit, ask bob for the key", now);
+    assert_eq!(text, "back in a bit, ask bob for the key");
+    assert_eq!(expires, 0, "a `for` that is not a duration is just a word");
+
+    // No emoji, no text: clearing it.
+    let (emoji, text, expires) = slk_sync::parse_status("", now);
+    assert!(emoji.is_empty() && text.is_empty() && expires == 0);
+
+    // A colon that is not a shortcode must not eat the message.
+    let (emoji, text, _) = slk_sync::parse_status("18:00 standup", now);
+    assert!(emoji.is_empty(), "`18:00` is a time, not an emoji");
+    assert_eq!(text, "18:00 standup");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn typing_reaches_the_backend_and_says_nothing_on_screen() {
+    // The one command that must never produce a notice: an indicator that
+    // interrupts is worse than no indicator.
+    let (cmd, mut rx) = engine();
+    let ch = engineering(&mut rx).await;
+    cmd.send(Command::Typing(ch)).await.unwrap();
+    let noise = tokio::time::timeout(
+        Duration::from_millis(400),
+        wait_for(&mut rx, |ev| match ev {
+            Event::Notice(n) => Some(n.clone()),
+            _ => None,
+        }),
+    )
+    .await;
+    assert!(
+        matches!(noise, Err(_) | Ok(None)),
+        "typing said something: {noise:?}"
+    );
+}

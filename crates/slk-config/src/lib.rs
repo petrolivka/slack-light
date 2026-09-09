@@ -38,12 +38,20 @@ pub struct Config {
 pub struct General {
     pub default_workspace: String,
     pub confirm_quit: bool,
+    /// Set yourself away after this many minutes with no input, and active
+    /// again when you come back. Zero turns it off.
+    ///
+    /// Ten, because that is what Slack's own client uses, and because a
+    /// number much smaller than that makes the dot flicker during a long
+    /// read.
+    pub away_after_minutes: u32,
 }
 impl Default for General {
     fn default() -> Self {
         General {
             default_workspace: String::new(),
             confirm_quit: true,
+            away_after_minutes: 10,
         }
     }
 }

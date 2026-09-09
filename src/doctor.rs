@@ -41,6 +41,14 @@ pub fn report(anonymous: bool) -> Result<()> {
         dbus_name_owned("org.freedesktop.Notifications")
     );
     println!("  a11y bus        {}", dbus_name_owned("org.a11y.Bus"));
+    // The three-way answer FR-K7 asks for: watching, told no, or could not
+    // ask. This binds and immediately drops the connection, so it costs a
+    // round trip and leaves nothing behind.
+    {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let support = slk_idle::watch(std::time::Duration::from_secs(600), tx);
+        println!("  idle → away     {}", support.describe());
+    }
 
     println!("\ntheme");
     let (config, _) = slk_config::Config::load();

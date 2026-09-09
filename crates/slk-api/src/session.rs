@@ -55,6 +55,13 @@ pub struct SessionBackend {
     /// 429 slows the whole client down rather than each call discovering the
     /// limit for itself — which is how a rate limit becomes a retry storm.
     paused_until: Arc<Mutex<Option<std::time::Instant>>>,
+    /// The way in to the live socket, for the few things that are sent rather
+    /// than requested. `None` until `connect`, and replaced on every
+    /// reconnect, so a frame written to a dead socket goes nowhere instead of
+    /// waking a task that has already returned.
+    outbound: Arc<Mutex<Option<mpsc::Sender<String>>>>,
+    /// Slack's frames are numbered per connection; so are ours.
+    frame_id: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl SessionBackend {
@@ -78,6 +85,8 @@ impl SessionBackend {
             reconnect_url: Arc::new(Mutex::new(None)),
             gate: Arc::new(tokio::sync::Semaphore::new(4)),
             paused_until: Arc::new(Mutex::new(None)),
+            outbound: Arc::new(Mutex::new(None)),
+            frame_id: Arc::new(std::sync::atomic::AtomicI64::new(1000)),
         };
         let ws = me.whoami().await?;
         me.team = ws.id.clone();
@@ -542,7 +551,7 @@ impl SlackBackend for SessionBackend {
         Ok(())
     }
 
-    async fn set_status(&self, text: &str, emoji: &str) -> Result<()> {
+    async fn set_status(&self, text: &str, emoji: &str, expires: i64) -> Result<()> {
         let emoji = if emoji.is_empty() || emoji.starts_with(':') {
             emoji.to_string()
         } else {
@@ -551,7 +560,7 @@ impl SlackBackend for SessionBackend {
         let profile = serde_json::json!({
             "status_text": text,
             "status_emoji": emoji,
-            "status_expiration": 0,
+            "status_expiration": expires,
         })
         .to_string();
         self.call("users.profile.set", &[("profile", &profile)])
@@ -801,6 +810,22 @@ impl SlackBackend for SessionBackend {
         Ok(())
     }
 
+    async fn typing(&self, ch: &ChannelId) -> Result<()> {
+        // Down the socket the client already has. Dropped silently when there
+        // is no socket, and never retried: by the time a retry landed the
+        // person has either sent the message or stopped typing.
+        if let Some(tx) = self.outbound.lock().await.clone() {
+            let id = self
+                .frame_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = tx.try_send(format!(
+                r#"{{"id":{id},"type":"typing","channel":"{}"}}"#,
+                ch.as_str()
+            ));
+        }
+        Ok(())
+    }
+
     async fn connect(&self, presence: &[UserId]) -> Result<Option<EventStream>> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -836,6 +861,11 @@ impl SlackBackend for SessionBackend {
             .map_err(|e| SlackError::new("ws", ErrorKind::Transport, e.to_string()))?;
 
         let (tx, rx) = mpsc::channel(256);
+        // Frames this client wants to send: typing, and nothing else so far.
+        // Bounded and `try_send`-only, so a stalled socket drops indicators
+        // rather than backing up into whatever is calling.
+        let (otx, mut orx) = mpsc::channel::<String>(8);
+        *self.outbound.lock().await = Some(otx);
         let reconnect_url = self.reconnect_url.clone();
         let mut watch: Vec<String> = presence.iter().map(|u| u.as_str().to_string()).collect();
         watch.push(self.self_id.as_str().to_string());
@@ -861,6 +891,13 @@ impl SlackBackend for SessionBackend {
                             .is_err()
                         {
                             let _ = tx.send(RtEvent::Disconnected("ping failed".into())).await;
+                            return;
+                        }
+                    }
+                    out = orx.recv() => {
+                        let Some(out) = out else { continue };
+                        if sink.send(WsMessage::Text(out.into())).await.is_err() {
+                            let _ = tx.send(RtEvent::Disconnected("send failed".into())).await;
                             return;
                         }
                     }

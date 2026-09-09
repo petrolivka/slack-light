@@ -199,6 +199,10 @@ pub enum Msg {
     ListPick(usize),
     /// Files were dropped on the window.
     Dropped(Vec<std::path::PathBuf>),
+    /// A typing indicator may have aged out.
+    TypingExpired,
+    /// The desktop went idle, or came back.
+    Idle(bool),
     /// Leaving was confirmed in the dialog.
     Leave(ChannelId),
     /// An image in a message was clicked.
@@ -308,6 +312,26 @@ pub struct App {
     forward_link: Option<String>,
     /// `[debug] enabled`: offer "view source".
     debug: bool,
+    /// `[ui] reduced_motion`: nothing changes on its own, typing lines
+    /// included.
+    reduced_motion: bool,
+    /// Whether Slack currently thinks we are away. Read from our own
+    /// `presence_change`, not from what we last asked for, so another client
+    /// setting it is reflected here.
+    me_away: bool,
+    /// Whether *this* client is the reason we are away, as opposed to the
+    /// person having set it themselves. Coming back must not undo a
+    /// deliberate away.
+    away_by_idle: bool,
+    idle: slk_idle::Support,
+    /// Who is typing in the open conversation, and when they last said so.
+    /// Dropped by age rather than by an "stopped typing" event, because Slack
+    /// does not send one — a client waiting for it shows somebody typing
+    /// for ever.
+    typing: Vec<(String, std::time::Instant)>,
+    /// When we last told the conversation that *we* are, so it goes at most
+    /// once every three seconds however fast somebody types.
+    typed_at: Option<std::time::Instant>,
     /// Scrollback: whether a page is in flight, and whether the server has
     /// said there is nothing older left.
     loading_older: bool,
@@ -382,6 +406,19 @@ impl App {
     fn send(&self, cmd: Command) {
         if let Some(w) = self.ws() {
             let tx = w.commands.clone();
+            self.runtime.spawn(async move {
+                let _ = tx.send(cmd).await;
+            });
+        }
+    }
+
+    /// The same command to every workspace. Presence is a property of the
+    /// person, not of one connection: being away in one workspace and at your
+    /// desk in another is not a state anybody meant to be in.
+    fn broadcast(&self, cmd: Command) {
+        for w in &self.workspaces {
+            let tx = w.commands.clone();
+            let cmd = cmd.clone();
             self.runtime.spawn(async move {
                 let _ = tx.send(cmd).await;
             });
@@ -1100,7 +1137,13 @@ impl SimpleComponent for App {
             drafts: HashMap::new(),
             forwarding: None,
             forward_link: None,
+            typing: Vec::new(),
+            typed_at: None,
             debug: config.debug.enabled,
+            reduced_motion: config.ui.reduced_motion,
+            me_away: false,
+            away_by_idle: false,
+            idle: slk_idle::Support::Unknown("not watched".into()),
             loading_older: false,
             at_beginning: false,
             follow_bottom: true,
@@ -1343,8 +1386,33 @@ impl SimpleComponent for App {
             });
         }
 
-        // Keys: the preset's chords as accelerators on application actions.
+        // Away when nobody is at the machine. The watcher runs on its own
+        // Wayland connection and its own thread; this bridges its channel
+        // into the update loop, because everything that changes the model
+        // has to arrive as a message like everything else.
         let mut model = model;
+        if config.general.away_after_minutes > 0 {
+            let (itx, irx) = std::sync::mpsc::channel();
+            let after =
+                std::time::Duration::from_secs(config.general.away_after_minutes as u64 * 60);
+            model.idle = slk_idle::watch(after, itx);
+            bench::report("idle_watch", model.idle.describe());
+            if model.idle == slk_idle::Support::Watching {
+                let s2 = sender.input_sender().clone();
+                std::thread::Builder::new()
+                    .name("slk-idle-bridge".into())
+                    .spawn(move || {
+                        while let Ok(state) = irx.recv() {
+                            if s2.send(Msg::Idle(state == slk_idle::Idle::Away)).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .ok();
+            }
+        }
+
+        // Keys: the preset's chords as accelerators on application actions.
         model.bindings = crate::keys::install(
             &relm4::main_application(),
             &config.keymap.preset,
@@ -1480,7 +1548,10 @@ impl SimpleComponent for App {
                     None => self.act(&act, &sender),
                 }
             }
-            Msg::ComposerChanged => self.refresh_completions(),
+            Msg::ComposerChanged => {
+                self.refresh_completions();
+                self.say_typing();
+            }
             Msg::Focus => self.maybe_mark(false),
             Msg::Settled => {
                 if self.follow_bottom {
@@ -1500,6 +1571,22 @@ impl SimpleComponent for App {
             Msg::ListPick(i) => self.pick(i, &sender),
             Msg::Dropped(paths) => self.upload(paths, &sender),
             Msg::Leave(ch) => self.send(Command::Leave(ch)),
+            Msg::TypingExpired => self.refresh_hint(),
+            Msg::Idle(away) => {
+                bench::report("idle", if away { "away" } else { "back" });
+                if away {
+                    // Already away, by somebody's choice: leave it alone, and
+                    // do not claim it back on return.
+                    if self.me_away {
+                        return;
+                    }
+                    self.away_by_idle = true;
+                    self.broadcast(Command::Presence(false));
+                } else if self.away_by_idle {
+                    self.away_by_idle = false;
+                    self.broadcast(Command::Presence(true));
+                }
+            }
             Msg::ViewImage(file_id) => self.view_image(&file_id),
             // The entry is read when Enter is pressed, not per keystroke: a
             // search that fires on every letter is a request per letter.
@@ -1865,7 +1952,30 @@ impl App {
                     bench::report("notified", &title);
                 }
             }
+            Event::Typing { channel, user } => {
+                // Only for the conversation on screen, and never for
+                // ourselves: Slack echoes our own typing back down the socket.
+                if is_current
+                    && self.open.as_ref() == Some(&channel)
+                    && user.as_str() != self.shared.self_id.borrow().as_str()
+                {
+                    let who = self
+                        .shared
+                        .names
+                        .borrow()
+                        .user(user.as_str())
+                        .unwrap_or(user.as_str())
+                        .to_string();
+                    self.someone_typing(who, sender);
+                }
+            }
             Event::Presence { users, presence } => {
+                if users
+                    .iter()
+                    .any(|u| u.as_str() == self.shared.self_id.borrow().as_str())
+                {
+                    self.me_away = presence != slk_core::Presence::Active;
+                }
                 {
                     let mut d = self.shared.names.borrow_mut();
                     for u in &users {
@@ -2324,6 +2434,29 @@ impl App {
                 self.composer.grab_focus();
             }
             "leave_channel" => self.confirm_leave(sender),
+            "presence" => {
+                // What Slack thinks, not what we last asked for: another
+                // client can have set it, and `presence_change` for our own
+                // id is how we find out.
+                self.send(Command::Presence(self.me_away));
+            }
+            "status" | "dnd" => {
+                self.inserting.set(true);
+                let buf = self.composer_view().buffer();
+                buf.set_text(if name == "status" {
+                    "/status "
+                } else {
+                    "/dnd "
+                });
+                buf.place_cursor(&buf.end_iter());
+                self.inserting.set(false);
+                self.composer.grab_focus();
+                self.say(if name == "status" {
+                    "`:emoji: text`, and `for 2h` to have it expire".into()
+                } else {
+                    "minutes, or nothing to end a snooze".into()
+                });
+            }
             "saved" => self.request_list(Command::ListSaved, "Saved for later"),
             "mentions" => self.request_list(Command::ListMentions, "Mentions"),
             "browse_channels" => self.request_list(Command::BrowseChannels, "Channels to join"),
@@ -3653,6 +3786,13 @@ impl App {
 
     // ---- small things --------------------------------------------------
 
+    /// What is in the composer that has the keyboard.
+    fn composer_text(&self) -> String {
+        let buf = self.composer_view().buffer();
+        buf.text(&buf.start_iter(), &buf.end_iter(), false)
+            .to_string()
+    }
+
     fn composer_view(&self) -> &gtk::TextView {
         match self.active {
             Pane::Thread if self.thread.is_some() => &self.thread_composer,
@@ -3666,7 +3806,65 @@ impl App {
         }
     }
 
+    /// Tell the conversation we are typing, at most once every three seconds.
+    ///
+    /// Slack's own client uses three; more often is traffic that says nothing
+    /// new, and FR-Z1's whole point is that this client's traffic looks like
+    /// one person's.
+    fn say_typing(&mut self) {
+        if self.read_only || self.inserting.get() {
+            return;
+        }
+        let Some(ch) = self.open.clone() else { return };
+        // An empty composer is somebody who has just cleared it, not somebody
+        // typing, and an edit in progress is not a new message either.
+        if self.composer_text().trim().is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .typed_at
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(3))
+        {
+            return;
+        }
+        self.typed_at = Some(now);
+        self.send(Command::Typing(ch));
+    }
+
+    /// Somebody else is typing here. Under `reduced_motion` nobody is: the
+    /// setting means "stop things changing on their own", and a line that
+    /// appears and vanishes under the composer is exactly that.
+    fn someone_typing(&mut self, who: String, sender: &ComponentSender<Self>) {
+        if self.reduced_motion {
+            return;
+        }
+        let now = std::time::Instant::now();
+        match self.typing.iter_mut().find(|(n, _)| *n == who) {
+            Some(e) => e.1 = now,
+            None => self.typing.push((who, now)),
+        }
+        self.refresh_hint();
+        // One timer per event is one too many only if they are free to
+        // create; a five-second glib timeout is cheap and self-cancelling.
+        let s = sender.input_sender().clone();
+        gtk::glib::timeout_add_once(std::time::Duration::from_secs(5), move || {
+            let _ = s.send(Msg::TypingExpired);
+        });
+    }
+
     fn refresh_hint(&mut self) {
+        // Older than five seconds and there has been no further keystroke:
+        // Slack sends no "stopped typing", so age is the only signal there is.
+        let now = std::time::Instant::now();
+        self.typing
+            .retain(|(_, at)| now.duration_since(*at) < std::time::Duration::from_secs(5));
+        let who: Vec<String> = self.typing.iter().map(|(n, _)| n.clone()).collect();
+        let line = crate::logic::typing_line(&who);
+        if !line.is_empty() && self.editing.is_none() {
+            self.hint = line;
+            return;
+        }
         self.hint = if self.read_only {
             "read-only — nothing is sent".into()
         } else if self.editing.is_some() {
