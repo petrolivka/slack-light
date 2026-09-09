@@ -37,7 +37,7 @@ check "the composer is a text field in the tree" "$( echo "$t" | grep -qE '^ *(t
 wtype -M ctrl k -m ctrl; sleep 0.4
 wtype "des"; sleep 0.3
 wtype -k Return; sleep 1.2
-check "ctrl-k, 'des', Enter opens #design" "$( tree | grep -q "label '#design'" && echo 1 || echo 0 )" "$(tree | grep "label '#" | head -2 | tr '\n' ' ')"
+check "ctrl-k, 'des', Enter opens #design" "$( tree | grep -q "label '# design'" && echo 1 || echo 0 )" "$(tree | grep "label '#" | head -2 | tr '\n' ' ')"
 
 # E2: after the jump, focus is back on the composer: typing lands there.
 wtype "keyboard test"; sleep 0.2; wtype -k Return; sleep 2.5
@@ -46,7 +46,7 @@ check "the send was confirmed by the engine" "$( grep -q send_confirmed_ms "$LOG
 
 # E1: alt-Up moves to the previous conversation without the mouse.
 wtype -M alt -k Up -m alt; sleep 1.2
-check "alt-Up moves to the previous conversation" "$( tree | grep -q "label '#leads'" && echo 1 || echo 0 )" "$(tree | grep "label '#" | head -1)"
+check "alt-Up moves to the previous conversation" "$( tree | grep -q "label '🔒 leads'" && echo 1 || echo 0 )" "$(tree | grep -E "label '(#|🔒)" | head -2 | tr '\n' ' ')"
 
 # Escape from anywhere returns to the composer; ctrl-u clears it.
 wtype "abc"; sleep 0.2; wtype -M ctrl u -m ctrl; sleep 0.3; wtype -k Escape; sleep 0.3

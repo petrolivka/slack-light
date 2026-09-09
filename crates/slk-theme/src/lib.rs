@@ -47,6 +47,20 @@ pub struct Palette {
     pub bright_cyan: String,
     pub bright_blue: String,
     pub bright_magenta: String,
+
+    /// Not in `colors.toml`: how message bodies are set. The client fills
+    /// these in from its own configuration after loading a palette.
+    #[serde(skip, default = "mono_family")]
+    pub mono_family: String,
+    #[serde(skip, default = "mono_size")]
+    pub mono_size: u8,
+}
+
+fn mono_family() -> String {
+    "monospace".into()
+}
+fn mono_size() -> u8 {
+    13
 }
 
 fn dark() -> String {
@@ -170,6 +184,9 @@ fn prefers_dark() -> bool {
 #[derive(Debug, Clone)]
 pub struct Semantic {
     pub link: String,
+    /// What to write *on* a filled highlight — the window's own background,
+    /// which is the only colour guaranteed to read against an accent.
+    pub on_fill: String,
     pub mention: String,
     pub mention_self_bg: String,
     pub dim: String,
@@ -181,6 +198,7 @@ impl Palette {
     pub fn semantic(&self) -> Semantic {
         Semantic {
             link: self.blue.clone(),
+            on_fill: self.background.clone(),
             mention: self.accent.clone(),
             mention_self_bg: self.yellow.clone(),
             dim: self.dark_foreground.clone(),
@@ -202,10 +220,23 @@ impl Palette {
     /// so `user.css` can refer to them by name too.
     pub fn css(&self) -> String {
         let p = self;
+        // Eight author colours as classes, because a per-row colour cannot
+        // come from a stylesheet any other way and a provider per row would
+        // cost more than the row.
+        let authors: String = self
+            .semantic()
+            .authors
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                format!(".avatar-{i} {{ background-color: {c}; }}\n.name-{i} {{ color: {c}; }}\n")
+            })
+            .collect();
         format!(
             r#"
 @define-color sl_bg {bg};
 @define-color sl_bg_dark {bgd};
+@define-color sl_bg_darker {bgdd};
 @define-color sl_bg_light {bgl};
 @define-color sl_fg {fg};
 @define-color sl_fg_dim {fgd};
@@ -214,33 +245,123 @@ impl Palette {
 @define-color sl_selection {sel};
 @define-color sl_muted {mut};
 
-window {{ background-color: @sl_bg; color: @sl_fg; }}
+/* Dense, dark, and quiet — the language of an editor rather than a
+   dashboard. Separation by background and whitespace, never by a line. */
+window {{ background-color: @sl_bg; color: @sl_fg; font-size: 13px; }}
+
+/* The workspace rail: an activity bar. One square per workspace, the
+   current one marked by an accent edge rather than a fill. */
+.rail {{ background-color: @sl_bg_darker; }}
+.rail button {{
+    background: none; border: none; box-shadow: none; padding: 0;
+    margin: 4px 6px; min-width: 32px; min-height: 32px;
+    border-left: 2px solid transparent; border-radius: 0;
+}}
+.rail button:hover {{ background: alpha(@sl_fg, 0.06); }}
+.rail button.current {{ border-left-color: @sl_accent; }}
+.rail .tile {{
+    min-width: 26px; min-height: 26px; border-radius: 6px;
+    font-weight: bold; font-size: 12px; color: @sl_bg;
+}}
+
 .sidebar {{ background-color: @sl_bg_dark; }}
-.sidebar row {{ color: @sl_fg; padding: 2px 0; }}
-.sidebar row:selected {{ background-color: @sl_selection; color: @sl_fg_bright; }}
-.sidebar row:hover {{ background-color: alpha(@sl_selection, 0.6); }}
-.badge {{ background-color: {red}; color: @sl_bg; border-radius: 9px; padding: 0 5px; font-weight: bold; }}
-.header {{ background-color: @sl_bg; color: @sl_fg_bright; }}
+.sidebar list {{ background: none; }}
+.sidebar row {{ padding: 0; min-height: 0; }}
+.sidebar row:selected, .sidebar row:selected:hover {{ background: none; }}
+.sidebar .conv {{
+    padding: 3px 10px 3px 8px; border-radius: 5px; margin: 0 6px;
+    color: @sl_fg;
+}}
+.sidebar row:hover .conv {{ background-color: alpha(@sl_fg, 0.05); }}
+.sidebar row:selected .conv {{ background-color: @sl_selection; color: @sl_fg_bright; }}
+.sidebar .unread {{ font-weight: bold; color: @sl_fg_bright; }}
+.sidebar .section {{
+    color: @sl_fg_dim; font-size: 11px; font-weight: bold;
+    padding: 10px 8px 3px 8px; letter-spacing: 0.5px;
+}}
+.sidebar .section:hover {{ color: @sl_fg; }}
+.badge {{
+    background-color: {red}; color: @sl_bg; border-radius: 8px;
+    padding: 0 5px; font-size: 10px; font-weight: bold;
+}}
+.count {{ color: @sl_fg_dim; font-size: 11px; }}
+
+/* The conversation. No line between messages: grouping and whitespace do
+   the separating, the way every chat client that reads well does it. */
+.header {{ background-color: @sl_bg; padding: 6px 12px; }}
+.header .title {{ color: @sl_fg_bright; font-weight: bold; }}
+.header .topic {{ color: @sl_fg_dim; font-size: 12px; }}
+.hairline {{ background-color: alpha(@sl_muted, 0.5); min-height: 1px; }}
+
 .conversation {{ background-color: @sl_bg; }}
-.conversation > row {{ border-bottom: 1px solid alpha(@sl_muted, 0.6); }}
-.conversation > row:hover {{ background-color: alpha(@sl_bg_light, 0.5); }}
-.conversation label {{ color: @sl_fg; }}
-.conversation label:link, .conversation label link {{ color: {blue}; }}
-.blockkit {{ padding: 6px 8px; border-left: 3px solid @sl_accent; background-color: alpha(@sl_bg_light, 0.35); }}
-entry {{ background-color: @sl_bg_light; color: @sl_fg_bright; border: 1px solid @sl_muted; caret-color: @sl_accent; }}
+.conversation > row {{ padding: 0; }}
+.conversation > row:hover {{ background-color: alpha(@sl_fg, 0.03); }}
+.conversation > row:selected {{ background: none; }}
+.avatar {{
+    min-width: 24px; min-height: 24px; border-radius: 5px;
+    color: @sl_bg; font-weight: bold; font-size: 11px;
+}}
+.body {{ font-family: {mono}; font-size: {mono_size}px; color: @sl_fg; }}
+.time {{ color: @sl_fg_dim; font-family: monospace; font-size: 11px; }}
+.meta {{ color: @sl_fg_dim; font-size: 11px; }}
+.daybreak {{ color: @sl_fg_dim; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; }}
+.newbreak {{ color: {red}; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; }}
+.newbreak-rule {{ background-color: alpha({red}, 0.5); min-height: 1px; }}
+.chip {{
+    background-color: alpha(@sl_fg, 0.07); border: 1px solid alpha(@sl_muted, 0.8);
+    border-radius: 10px; padding: 0 7px; font-size: 11px; color: @sl_fg;
+}}
+.chip.mine {{ background-color: alpha(@sl_accent, 0.22); border-color: @sl_accent; }}
+.threadlink {{ color: @sl_accent; font-size: 12px; }}
+.blockkit {{
+    padding: 8px 10px; border-radius: 6px;
+    background-color: alpha(@sl_fg, 0.04);
+    border-left: 2px solid alpha(@sl_accent, 0.7);
+}}
+
+/* The composer: a panel, not a form field. */
+.composer {{
+    background-color: @sl_bg_light; border: 1px solid alpha(@sl_muted, 0.9);
+    border-radius: 8px; margin: 8px 12px 6px 12px;
+}}
+.composer:focus-within {{ border-color: @sl_accent; }}
+.composer textview, .composer textview text {{
+    background: none; color: @sl_fg_bright;
+    font-family: {mono}; font-size: {mono_size}px;
+}}
+.composer .hint {{ color: @sl_fg_dim; font-size: 11px; padding: 0 8px 4px 8px; }}
+entry {{
+    background-color: @sl_bg_light; color: @sl_fg_bright;
+    border: 1px solid alpha(@sl_muted, 0.9); border-radius: 6px;
+    caret-color: @sl_accent;
+}}
 entry:focus {{ border-color: @sl_accent; }}
-entry selection, label selection {{ background-color: @sl_selection; color: @sl_fg_bright; }}
-.status {{ color: @sl_fg_dim; background-color: @sl_bg_dark; }}
-button {{ background-color: @sl_bg_light; color: @sl_fg; border: 1px solid @sl_muted; }}
+entry selection, label selection, textview text selection {{
+    background-color: @sl_selection; color: @sl_fg_bright;
+}}
+
+/* The status bar, in the shape an editor puts it. */
+.status {{
+    background-color: @sl_bg_darker; color: @sl_fg_dim;
+    font-family: monospace; font-size: 11px; padding: 2px 10px;
+}}
+.status .ok {{ color: {green}; }}
+.status .warn {{ color: {yellow}; }}
+
+button {{ background-color: @sl_bg_light; color: @sl_fg; border: 1px solid @sl_muted; border-radius: 6px; }}
 button.suggested-action {{ background-color: @sl_accent; color: @sl_bg; border-color: @sl_accent; }}
 button.destructive-action {{ background-color: {red}; color: @sl_bg; border-color: {red}; }}
 button:disabled {{ color: @sl_fg_dim; }}
-scrollbar slider {{ background-color: @sl_muted; }}
-separator {{ background-color: @sl_muted; }}
-paned > separator {{ background-color: @sl_muted; min-width: 1px; }}
-"#,
+button.flat {{ background: none; border: none; box-shadow: none; }}
+scrollbar {{ background: none; }}
+scrollbar slider {{ background-color: alpha(@sl_muted, 0.8); border-radius: 6px; min-width: 6px; }}
+scrollbar slider:hover {{ background-color: @sl_muted; }}
+separator {{ background-color: alpha(@sl_muted, 0.5); }}
+paned > separator {{ background-color: alpha(@sl_muted, 0.6); min-width: 1px; }}
+{authors}"#,
             bg = p.background,
             bgd = p.dark_background,
+            bgdd = p.darker_background,
             bgl = p.lighter_background,
             fg = p.foreground,
             fgd = p.dark_foreground,
@@ -249,7 +370,11 @@ paned > separator {{ background-color: @sl_muted; min-width: 1px; }}
             sel = p.selection,
             mut = p.muted,
             red = p.red,
-            blue = p.blue,
+            green = p.green,
+            yellow = p.yellow,
+            mono = self.mono_family,
+            mono_size = self.mono_size,
+            authors = authors,
         )
     }
 }

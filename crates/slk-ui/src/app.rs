@@ -39,11 +39,14 @@ impl Names for Directory {
 /// cache, the pictures waiting for a texture, and a way to ask for one.
 pub struct Shared {
     pub names: RefCell<Directory>,
+    /// Also how the sidebar and the rail send their own clicks: they are
+    /// rebuilt from `&mut self`, where the component's sender is not in
+    /// scope, and threading one through every call would be worse.
+    pub sender: relm4::Sender<Msg>,
     pub pal: RefCell<slk_theme::Semantic>,
     pub self_id: RefCell<UserId>,
     pub textures: RefCell<HashMap<String, gtk::gdk::Texture>>,
     pub pending: RefCell<HashMap<String, Vec<gtk::Picture>>>,
-    sender: relm4::Sender<Msg>,
 }
 
 impl Shared {
@@ -90,8 +93,23 @@ pub enum Msg {
         url: String,
     },
     Mapped,
+    StatusExpired,
+    ToggleSection(u8),
     BenchScrollDone,
     IdleDone,
+}
+
+/// The sidebar's groups, in the order the official client shows them.
+const SECTIONS: [(u8, &str); 3] = [(0, "STARRED"), (1, "CHANNELS"), (2, "DIRECT MESSAGES")];
+
+fn section_of(c: &SidebarEntry) -> u8 {
+    if c.is_starred {
+        0
+    } else if c.is_dm() {
+        2
+    } else {
+        1
+    }
 }
 
 struct WorkspaceState {
@@ -115,8 +133,13 @@ pub struct App {
     // Made before the view and referenced into it, because `update` needs a
     // handle to each and relm4 hands widgets to the view, not the model.
     sidebar: gtk::ListBox,
+    /// Row index in the sidebar to conversation index, because the section
+    /// headings are rows too and the two stopped being the same thing.
+    row_map: Vec<Option<usize>>,
+    collapsed: HashSet<u8>,
+    rail: gtk::Box,
     scroller: gtk::ScrolledWindow,
-    composer: gtk::Entry,
+    composer: gtk::TextView,
     jump: gtk::Entry,
     jump_query: Rc<RefCell<String>>,
     bindings: Vec<(String, String, bool)>,
@@ -125,7 +148,9 @@ pub struct App {
     theme_choice: slk_theme::Choice,
     _theme_monitor: Option<gtk::gio::FileMonitor>,
     status: String,
+    status_right: String,
     title: String,
+    topic: String,
     window_title: String,
     loaded_once: bool,
     bench_started: bool,
@@ -156,16 +181,35 @@ impl App {
         if self.open.as_ref() == Some(&id) {
             return;
         }
-        self.title = self
-            .convs()
-            .iter()
-            .find(|c| c.id == id)
+        let found = self.convs().iter().find(|c| c.id == id).cloned();
+        self.title = found
+            .as_ref()
             .map(|c| {
                 if c.is_dm() {
                     c.name.clone()
+                } else if c.is_private() {
+                    format!("🔒 {}", c.name)
                 } else {
-                    format!("#{}", c.name)
+                    format!("# {}", c.name)
                 }
+            })
+            .unwrap_or_default();
+        self.topic = found
+            .as_ref()
+            .map(|c| {
+                let mut bits = Vec::new();
+                if let Some(n) = c.member_count.filter(|_| !c.is_dm()) {
+                    bits.push(format!("{n} members"));
+                }
+                let note = if c.topic.is_empty() {
+                    &c.purpose
+                } else {
+                    &c.topic
+                };
+                if !note.is_empty() {
+                    bits.push(note.replace('\n', " "));
+                }
+                bits.join("  ·  ")
             })
             .unwrap_or_default();
         self.open = Some(id.clone());
@@ -182,6 +226,7 @@ impl App {
         self.list.clear();
         self.window_title = format!("slack-light — {}", self.workspaces[i].name);
         self.rebuild_sidebar();
+        self.rebuild_rail();
         self.land();
     }
 
@@ -201,6 +246,47 @@ impl App {
         }
     }
 
+    /// Turn messages into rows, computing each one's grouping and
+    /// separators from the one before it — including the row already at the
+    /// end of the list, so a page of scrollback joins on correctly.
+    fn make_rows(&self, msgs: Vec<slk_core::Message>, after_existing: bool) -> Vec<Row> {
+        let last_read = self
+            .convs()
+            .iter()
+            .find(|c| Some(&c.id) == self.open.as_ref())
+            .and_then(|c| c.last_read.as_ref())
+            .map(|t| t.secs());
+        let mut prev: Option<(String, i64)> = if after_existing {
+            self.list
+                .len()
+                .checked_sub(1)
+                .and_then(|i| self.list.get(i))
+                .map(|r| {
+                    let m = &r.borrow().msg;
+                    (m.author.id_str().to_string(), m.ts.secs())
+                })
+        } else {
+            None
+        };
+        msgs.into_iter()
+            .map(|m| {
+                let meta = crate::logic::meta(
+                    prev.as_ref().map(|(a, t)| (a.as_str(), *t)),
+                    m.author.id_str(),
+                    m.ts.secs(),
+                    last_read,
+                    day_label,
+                );
+                prev = Some((m.author.id_str().to_string(), m.ts.secs()));
+                Row {
+                    msg: m,
+                    meta,
+                    shared: self.shared.clone(),
+                }
+            })
+            .collect()
+    }
+
     /// Index of the first row matching `f`. relm4 has `find`, behind a
     /// `gnome_43` feature that drags libadwaita in; a linear pass over a
     /// list this size is a few microseconds and needs nothing.
@@ -211,13 +297,17 @@ impl App {
             .map(|i| i as u32)
     }
 
+    /// Pin the conversation to its newest message.
+    ///
+    /// Through the adjustment rather than `ListView::scroll_to`: asking a
+    /// list to scroll to an item that is already fully visible — which is
+    /// every item, when the conversation is shorter than the window —
+    /// leaves the list view retrying on a tick callback. Measured as a
+    /// 60 Hz repaint on an idle window and 45 MB of churn. Moving the
+    /// adjustment is a no-op when there is nothing to move.
     fn scroll_to_end(&self) {
-        let n = self.list.len();
-        if n > 0 {
-            self.list
-                .view
-                .scroll_to(n - 1, gtk::ListScrollFlags::NONE, None);
-        }
+        let adj = self.scroller.vadjustment();
+        adj.set_value(adj.upper() - adj.page_size());
     }
 }
 
@@ -239,97 +329,169 @@ impl SimpleComponent for App {
             },
 
             gtk::Box {
-                set_orientation: gtk::Orientation::Vertical,
+                set_orientation: gtk::Orientation::Horizontal,
 
-                gtk::Paned {
-                    set_orientation: gtk::Orientation::Horizontal,
-                    set_position: model.options.sidebar_width,
-                    set_vexpand: true,
-                    set_shrink_start_child: false,
+                // The workspace rail, an activity bar: one square each, the
+                // current one marked by an accent edge. Hidden when there is
+                // only one workspace, because a switcher with one choice is
+                // furniture.
+                #[local_ref]
+                rail -> gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    add_css_class: "rail",
+                    #[watch]
+                    set_visible: model.workspaces.len() > 1,
+                },
 
-                    #[wrap(Some)]
-                    set_start_child = &gtk::Box {
-                        set_orientation: gtk::Orientation::Vertical,
-                        add_css_class: "sidebar",
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_hexpand: true,
 
-                        #[local_ref]
-                        jump -> gtk::Entry {
-                            set_visible: false,
-                            set_margin_all: 6,
-                            set_placeholder_text: Some("jump to…"),
-                            connect_changed[sender] => move |e| {
-                                sender.input(Msg::JumpChanged(e.text().to_string()));
+                    gtk::Paned {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_position: model.options.sidebar_width,
+                        set_vexpand: true,
+                        set_shrink_start_child: false,
+                        // The extra width goes to the conversation. Without
+                        // this the sidebar grows with the window, which on a
+                        // tiling compositor means it grows constantly.
+                        set_resize_start_child: false,
+                        set_resize_end_child: true,
+
+                        #[wrap(Some)]
+                        set_start_child = &gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            add_css_class: "sidebar",
+
+                            #[local_ref]
+                            jump -> gtk::Entry {
+                                set_visible: false,
+                                set_margin_all: 6,
+                                set_placeholder_text: Some("jump to…"),
+                                connect_changed[sender] => move |e| {
+                                    sender.input(Msg::JumpChanged(e.text().to_string()));
+                                },
+                                connect_activate[sender] => move |_| sender.input(Msg::JumpAccept),
                             },
-                            connect_activate[sender] => move |_| sender.input(Msg::JumpAccept),
+
+                            gtk::ScrolledWindow {
+                                set_hscrollbar_policy: gtk::PolicyType::Never,
+                                set_vexpand: true,
+                                #[local_ref]
+                                sidebar -> gtk::ListBox {
+                                    connect_row_selected[sender] => move |_, row| {
+                                        if let Some(r) = row {
+                                            sender.input(Msg::Open(r.index() as usize));
+                                        }
+                                    },
+                                },
+                            },
                         },
 
-                        gtk::ScrolledWindow {
-                            set_hscrollbar_policy: gtk::PolicyType::Never,
-                            set_vexpand: true,
+                        #[wrap(Some)]
+                        set_end_child = &gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_spacing: 10,
+                                add_css_class: "header",
+                                gtk::Label {
+                                    #[watch]
+                                    set_label: &model.title,
+                                    add_css_class: "title",
+                                },
+                                gtk::Label {
+                                    #[watch]
+                                    set_label: &model.topic,
+                                    #[watch]
+                                    set_visible: !model.topic.is_empty(),
+                                    set_ellipsize: gtk::pango::EllipsizeMode::End,
+                                    set_xalign: 0.0,
+                                    set_hexpand: true,
+                                    add_css_class: "topic",
+                                },
+                            },
+                            gtk::Box { add_css_class: "hairline" },
+
                             #[local_ref]
-                            sidebar -> gtk::ListBox {
-                                add_css_class: "navigation-sidebar",
-                                add_css_class: "sidebar",
-                                connect_row_selected[sender] => move |_, row| {
-                                    if let Some(r) = row {
-                                        sender.input(Msg::Open(r.index() as usize));
-                                    }
+                            scroller -> gtk::ScrolledWindow {
+                                set_vexpand: true,
+                                set_hscrollbar_policy: gtk::PolicyType::Never,
+                                // Always, not Automatic: a conversation whose
+                                // height lands within a few pixels of the
+                                // viewport makes the scrollbar appear, which
+                                // narrows the rows, which rewraps a label,
+                                // which shortens the content, which hides the
+                                // scrollbar. Measured: a 60 Hz repaint on an
+                                // idle window, non-deterministic because it
+                                // depends where the list settles. A scrollbar
+                                // that is always there cannot toggle.
+                                set_vscrollbar_policy: gtk::PolicyType::Always,
+                                #[local_ref]
+                                list_view -> gtk::ListView {
+                                    add_css_class: "conversation",
+                                }
+                            },
+
+                            // A panel, not a form field: several lines, its
+                            // own border, the hint underneath.
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                add_css_class: "composer",
+
+                                gtk::ScrolledWindow {
+                                    // Fixed bounds, not `propagate-natural-height`:
+                                    // a ScrolledWindow that asks its TextView how
+                                    // tall it wants to be, inside a box that then
+                                    // changes the width, never settles — measured
+                                    // as a 60 Hz repaint on an idle window.
+                                    set_min_content_height: 34,
+                                    set_max_content_height: 160,
+                                    set_hscrollbar_policy: gtk::PolicyType::Never,
+                                    #[local_ref]
+                                    composer -> gtk::TextView {
+                                        set_wrap_mode: gtk::WrapMode::WordChar,
+                                        set_top_margin: 5,
+                                        set_bottom_margin: 5,
+                                        set_left_margin: 9,
+                                        set_right_margin: 9,
+                                        set_accepts_tab: false,
+                                        #[watch]
+                                        set_editable: !model.read_only,
+                                    },
+                                },
+                                gtk::Label {
+                                    set_xalign: 0.0,
+                                    add_css_class: "hint",
+                                    #[watch]
+                                    set_label: if model.read_only {
+                                        "read-only — nothing is sent"
+                                    } else {
+                                        "enter sends · shift+enter newline"
+                                    },
                                 },
                             },
                         },
                     },
 
-                    #[wrap(Some)]
-                    set_end_child = &gtk::Box {
-                        set_orientation: gtk::Orientation::Vertical,
-
+                    // The status bar, in the shape an editor puts it.
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        add_css_class: "status",
                         gtk::Label {
                             #[watch]
-                            set_markup: &format!("<b>{}</b>", gtk::glib::markup_escape_text(&model.title)),
+                            set_label: &model.status,
                             set_xalign: 0.0,
-                            set_margin_all: 8,
-                            add_css_class: "header",
+                            set_hexpand: true,
+                            set_ellipsize: gtk::pango::EllipsizeMode::End,
                         },
-                        gtk::Separator {},
-
-                        #[local_ref]
-                        scroller -> gtk::ScrolledWindow {
-                            set_vexpand: true,
-                            set_hscrollbar_policy: gtk::PolicyType::Never,
-                            #[local_ref]
-                            list_view -> gtk::ListView {
-                                add_css_class: "conversation",
-                            }
-                        },
-
-                        #[local_ref]
-                        composer -> gtk::Entry {
-                            set_margin_all: 8,
+                        gtk::Label {
                             #[watch]
-                            set_placeholder_text: Some(if model.read_only { "read-only" } else { "Message…  (Enter sends)" }),
-                            #[watch]
-                            set_sensitive: !model.read_only,
-                            connect_activate[sender] => move |e| {
-                                let text = e.text().to_string();
-                                if !text.trim().is_empty() {
-                                    sender.input(Msg::Send(text));
-                                    e.set_text("");
-                                }
-                            },
+                            set_label: &model.status_right,
+                            set_xalign: 1.0,
                         },
                     },
-                },
-
-                gtk::Label {
-                    #[watch]
-                    set_label: &model.status,
-                    set_xalign: 0.0,
-                    set_margin_start: 8,
-                    set_margin_end: 8,
-                    set_margin_top: 2,
-                    set_margin_bottom: 2,
-                    add_css_class: "dim-label",
-                    add_css_class: "status",
                 },
             }
         }
@@ -409,8 +571,11 @@ impl SimpleComponent for App {
             open: None,
             list: TypedListView::new(),
             sidebar: gtk::ListBox::new(),
+            row_map: Vec::new(),
+            collapsed: HashSet::new(),
+            rail: gtk::Box::new(gtk::Orientation::Vertical, 0),
             scroller: gtk::ScrolledWindow::new(),
-            composer: gtk::Entry::new(),
+            composer: gtk::TextView::new(),
             jump: gtk::Entry::new(),
             jump_query: Rc::new(RefCell::new(String::new())),
             bindings: Vec::new(),
@@ -419,7 +584,9 @@ impl SimpleComponent for App {
             theme_choice,
             _theme_monitor: monitor,
             status: "starting".into(),
+            status_right: String::new(),
             title: String::new(),
+            topic: String::new(),
             window_title: if first_name.is_empty() {
                 "slack-light".into()
             } else {
@@ -431,10 +598,35 @@ impl SimpleComponent for App {
         };
         let list_view = &model.list.view;
         let sidebar = &model.sidebar;
+        let rail = &model.rail;
         let scroller = &model.scroller;
         let composer = &model.composer;
         let jump = &model.jump;
         let widgets = view_output!();
+
+        // Enter sends, shift+Enter is a newline. A TextView has no
+        // `activate`, so the composer needs the key itself.
+        {
+            let k = gtk::EventControllerKey::new();
+            let s2 = sender.input_sender().clone();
+            let view = model.composer.clone();
+            k.connect_key_pressed(move |_, key, _, state| {
+                if key == gtk::gdk::Key::Return
+                    && !state.contains(gtk::gdk::ModifierType::SHIFT_MASK)
+                {
+                    let buf = view.buffer();
+                    let (a, b) = buf.bounds();
+                    let text = buf.text(&a, &b, false).to_string();
+                    if !text.trim().is_empty() {
+                        let _ = s2.send(Msg::Send(text));
+                        buf.set_text("");
+                    }
+                    return gtk::glib::Propagation::Stop;
+                }
+                gtk::glib::Propagation::Proceed
+            });
+            model.composer.add_controller(k);
+        }
 
         // Keys: the preset's chords as accelerators on application actions.
         let mut model = model;
@@ -457,6 +649,11 @@ impl SimpleComponent for App {
                 if q.is_empty() {
                     return true;
                 }
+                // A heading is a row and matches nothing: while a query is
+                // being typed the sidebar is a flat list of what matches.
+                if !row.is_selectable() {
+                    return false;
+                }
                 row.child()
                     .and_then(|b| b.first_child())
                     .and_downcast::<gtk::Label>()
@@ -469,6 +666,7 @@ impl SimpleComponent for App {
     }
 
     fn update(&mut self, msg: Msg, sender: ComponentSender<Self>) {
+        crate::bench::count_update(&msg);
         match msg {
             Msg::ThemeChanged => {
                 let (palette, source) = slk_theme::load(&self.theme_choice);
@@ -493,7 +691,7 @@ impl SimpleComponent for App {
                 // The first row the filter left visible.
                 let mut i = 0;
                 while let Some(row) = self.sidebar.row_at_index(i) {
-                    if row.is_child_visible() {
+                    if row.is_child_visible() && row.is_selectable() {
                         self.sidebar.select_row(Some(&row));
                         break;
                     }
@@ -506,17 +704,27 @@ impl SimpleComponent for App {
                 // Where the keyboard starts: writing. A window that opens
                 // with focus nowhere is one where the first keystroke is lost.
                 self.composer.grab_focus();
+                self.rebuild_rail();
                 bench::report_memory("map");
             }
-            Msg::Open(i) => {
-                if let Some(c) = self.convs().get(i) {
-                    let id = c.id.clone();
-                    self.open_channel(id);
+            Msg::Open(row) => {
+                if let Some(Some(i)) = self.row_map.get(row).copied() {
+                    if let Some(c) = self.convs().get(i) {
+                        let id = c.id.clone();
+                        self.open_channel(id);
+                    }
                 }
+            }
+            Msg::StatusExpired => self.refresh_status(),
+            Msg::ToggleSection(sec) => {
+                if !self.collapsed.remove(&sec) {
+                    self.collapsed.insert(sec);
+                }
+                self.rebuild_sidebar();
             }
             Msg::Send(text) => {
                 if self.read_only {
-                    self.status = "read-only: nothing is sent".into();
+                    self.notice("read-only: nothing is sent".into(), &sender);
                     return;
                 }
                 if let Some(ch) = self.open.clone() {
@@ -557,6 +765,7 @@ impl SimpleComponent for App {
                             );
                             bench::report_memory("idle");
                             bench::frame_summary("idle");
+                            bench::update_summary();
                             let _ = s.send(Msg::IdleDone);
                         },
                     );
@@ -579,19 +788,20 @@ impl App {
             Event::Ready { self_id, .. } => {
                 if is_current {
                     *self.shared.self_id.borrow_mut() = self_id;
-                    self.status = "ready".into();
+                    self.refresh_status();
                 }
             }
             Event::Connected => {
                 self.workspaces[idx].connected = true;
+                self.rebuild_rail();
                 if is_current {
-                    self.status = "✓ connected".into();
+                    self.refresh_status();
                 }
             }
             Event::Disconnected(why) => {
                 self.workspaces[idx].connected = false;
                 if is_current {
-                    self.status = format!("disconnected: {why}");
+                    self.notice(format!("disconnected: {why}"), sender);
                 }
             }
             Event::AuthLost => {
@@ -602,11 +812,11 @@ impl App {
             }
             Event::Notice(t) => {
                 if is_current {
-                    self.status = t;
+                    self.notice(t, sender);
                 }
             }
             Event::RateLimited { seconds } => {
-                self.status = format!("Slack asked us to wait {seconds}s");
+                self.notice(format!("Slack asked us to wait {seconds}s"), sender);
             }
             Event::Users(users) => {
                 let mut d = self.shared.names.borrow_mut();
@@ -639,14 +849,11 @@ impl App {
                 if !append_older {
                     self.list.clear();
                 }
-                let shared = self.shared.clone();
-                self.list
-                    .extend_from_iter(messages.into_iter().map(|m| Row {
-                        msg: m,
-                        shared: shared.clone(),
-                    }));
+                let rows = self.make_rows(messages, append_older);
+                self.list.extend_from_iter(rows);
                 self.scroll_to_end();
-                self.status = format!("{n} messages");
+                let _ = n;
+                self.refresh_status();
                 if !self.loaded_once {
                     self.loaded_once = true;
                     bench::report("first_messages_ms", bench::since_start().as_millis());
@@ -699,10 +906,10 @@ impl App {
                     message.ts.as_str(),
                     replaces.as_ref().map(|t| t.as_str()),
                 );
-                let row = Row {
-                    msg: *message,
-                    shared: self.shared.clone(),
-                };
+                let row = self
+                    .make_rows(vec![*message], true)
+                    .pop()
+                    .expect("one message in, one row out");
                 match place {
                     crate::logic::Placement::Replace(pos) => {
                         self.list.remove(pos as u32);
@@ -742,10 +949,60 @@ impl App {
         }
     }
 
+    /// Put the sidebar's selection on a conversation, by its index.
+    fn select_conv(&self, conv: usize) {
+        if let Some(row_i) = self.row_map.iter().position(|m| *m == Some(conv)) {
+            if let Some(row) = self.sidebar.row_at_index(row_i as i32) {
+                self.sidebar.select_row(Some(&row));
+            }
+        }
+    }
+
     fn close_jump(&mut self) {
         self.jump.set_text("");
         self.jump.set_visible(false);
         self.composer.grab_focus();
+    }
+
+    /// The left-hand end: what the client is, right now. A notice from the
+    /// engine replaces it for a moment and then it comes back, because a
+    /// status bar that keeps the last thing that happened is a log.
+    fn refresh_status(&mut self) {
+        let Some(w) = self.ws() else {
+            self.status = "no workspace".into();
+            return;
+        };
+        self.status = if w.connected {
+            format!("✓ connected · {}", w.name)
+        } else {
+            format!("connecting · {}", w.name)
+        };
+    }
+
+    /// A notice, shown for a few seconds and then replaced by the state.
+    fn notice(&mut self, text: String, sender: &ComponentSender<Self>) {
+        self.status = text;
+        let s = sender.input_sender().clone();
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(6), move || {
+            let _ = s.send(Msg::StatusExpired);
+        });
+    }
+
+    /// The right-hand end of the status bar: what is waiting, and the two
+    /// keys worth knowing.
+    fn refresh_status_right(&mut self) {
+        let mentions: u32 = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.convs.iter())
+            .filter(|c| !c.is_muted)
+            .map(|c| c.mentions)
+            .sum();
+        self.status_right = if mentions > 0 {
+            format!("↑ {mentions} mentions   ctrl-k jump   F1 keys")
+        } else {
+            "ctrl-k jump   F1 keys".to_string()
+        };
     }
 
     fn action(&mut self, name: &str) {
@@ -756,12 +1013,19 @@ impl App {
             }
             "normal" => self.close_jump(),
             "next_conversation" | "prev_conversation" => {
-                let selected = self.sidebar.selected_row().map(|r| r.index() as usize);
-                let len = self.convs().len();
-                if let Some(i) = crate::logic::step(selected, len, name == "next_conversation") {
-                    if let Some(row) = self.sidebar.row_at_index(i as i32) {
-                        self.sidebar.select_row(Some(&row));
-                    }
+                // Over what is on screen, in the order it is on screen: the
+                // sidebar has headings now, so a row index is not a
+                // conversation index, and a folded section has no rows at
+                // all. Stepping over conversation indices walked into both.
+                let shown: Vec<usize> = self.row_map.iter().filter_map(|m| *m).collect();
+                let at = self
+                    .sidebar
+                    .selected_row()
+                    .and_then(|r| self.row_map.get(r.index() as usize).copied().flatten())
+                    .and_then(|c| shown.iter().position(|v| *v == c));
+                if let Some(pos) = crate::logic::step(at, shown.len(), name == "next_conversation")
+                {
+                    self.select_conv(shown[pos]);
                 }
                 self.composer.grab_focus();
             }
@@ -771,7 +1035,7 @@ impl App {
                     self.switch_to((self.current + 1) % n);
                 }
             }
-            "clear_composer" => self.composer.set_text(""),
+            "clear_composer" => self.composer.buffer().set_text(""),
             "help" | "palette" => {
                 self.status = self
                     .bindings
@@ -798,67 +1062,148 @@ impl App {
     }
 
     fn rebuild_sidebar(&mut self) {
-        // A plain ListBox: a dozen rows, not five thousand. Rebuilt wholesale.
         while let Some(child) = self.sidebar.first_child() {
             self.sidebar.remove(&child);
         }
+        self.row_map.clear();
         let convs: Vec<SidebarEntry> = self.convs().to_vec();
-        for c in &convs {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            row.set_margin_start(8);
-            row.set_margin_end(8);
-            row.set_margin_top(4);
-            row.set_margin_bottom(4);
-            let name = gtk::Label::new(None);
-            name.set_xalign(0.0);
-            name.set_hexpand(true);
-            let label = if c.is_dm() {
-                c.name.clone()
-            } else if c.is_private() {
-                format!("🔒 {}", c.name)
-            } else {
-                format!("# {}", c.name)
-            };
-            if c.has_unread() {
-                name.set_markup(&format!("<b>{}</b>", gtk::glib::markup_escape_text(&label)));
-            } else {
+
+        for (sec, title) in SECTIONS {
+            let members: Vec<(usize, &SidebarEntry)> = convs
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| section_of(c) == sec)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let folded = self.collapsed.contains(&sec);
+
+            // A heading that folds, the way an editor's panels do. It is a
+            // row, so it takes an index — hence `row_map`.
+            let head = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            head.add_css_class("section");
+            head.append(&gtk::Label::new(Some(if folded { "▸" } else { "▾" })));
+            head.append(&gtk::Label::new(Some(title)));
+            if folded {
+                let n = gtk::Label::new(Some(&members.len().to_string()));
+                n.add_css_class("count");
+                n.set_margin_start(4);
+                head.append(&n);
+            }
+            let hrow = gtk::ListBoxRow::new();
+            hrow.set_child(Some(&head));
+            hrow.set_selectable(false);
+            hrow.set_activatable(true);
+            let click = gtk::GestureClick::new();
+            let s = self.shared.sender.clone();
+            click.connect_released(move |_, _, _, _| {
+                let _ = s.send(Msg::ToggleSection(sec));
+            });
+            hrow.add_controller(click);
+            self.sidebar.append(&hrow);
+            self.row_map.push(None);
+            if folded {
+                continue;
+            }
+
+            for (i, c) in members {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                row.add_css_class("conv");
+                let name = gtk::Label::new(None);
+                name.set_xalign(0.0);
+                name.set_hexpand(true);
+                name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                let label = if c.is_dm() {
+                    format!("  {}", c.name)
+                } else if c.is_private() {
+                    format!("🔒 {}", c.name)
+                } else {
+                    format!("#  {}", c.name)
+                };
                 name.set_label(&label);
+                if c.has_unread() {
+                    name.add_css_class("unread");
+                }
+                row.append(&name);
+
+                // One accessible name for the row, so a screen reader says
+                // "engineering, 1 mention" rather than reading two labels.
+                // GTK does not take a list item's name from its own label
+                // property — measured — but a Label honours it.
+                let spoken = if c.mentions > 0 {
+                    format!(
+                        "{label}, {} mention{}",
+                        c.mentions,
+                        if c.mentions == 1 { "" } else { "s" }
+                    )
+                } else if c.unread > 0 {
+                    format!("{label}, {} unread", c.unread)
+                } else {
+                    label.clone()
+                };
+                name.update_property(&[gtk::accessible::Property::Label(&spoken)]);
+
+                if c.mentions > 0 {
+                    let b = gtk::Label::new(Some(&c.mentions.to_string()));
+                    b.add_css_class("badge");
+                    row.append(&b);
+                } else if c.unread > 0 {
+                    let b = gtk::Label::new(Some(&c.unread.to_string()));
+                    b.add_css_class("count");
+                    row.append(&b);
+                }
+                self.sidebar.append(&row);
+                self.row_map.push(Some(i));
             }
-            row.append(&name);
-            // One accessible name for the row, so a screen reader says
-            // "engineering, 1 mention" rather than reading two labels.
-            let spoken = if c.mentions > 0 {
-                format!(
-                    "{label}, {} mention{}",
-                    c.mentions,
-                    if c.mentions == 1 { "" } else { "s" }
-                )
-            } else if c.unread > 0 {
-                format!("{label}, {} unread", c.unread)
-            } else {
-                label.clone()
-            };
-            if c.mentions > 0 {
-                let b = gtk::Label::new(Some(&c.mentions.to_string()));
-                b.add_css_class("badge");
-                row.append(&b);
-            } else if c.unread > 0 {
-                row.append(&gtk::Label::new(Some(&c.unread.to_string())));
-            }
-            // GTK does not take a list item's name from its `label` property
-            // (measured: the node stayed nameless), but a Label honours it.
-            // So the name label speaks for the row: "engineering, 1 mention".
-            name.update_property(&[gtk::accessible::Property::Label(&spoken)]);
-            self.sidebar.append(&row);
         }
+
         // Keep the open conversation selected across a rebuild, or the
         // sidebar loses its place every time a badge changes.
         if let Some(open) = &self.open {
-            if let Some(i) = convs.iter().position(|c| &c.id == open) {
-                if let Some(row) = self.sidebar.row_at_index(i as i32) {
-                    self.sidebar.select_row(Some(&row));
+            if let Some(conv_i) = convs.iter().position(|c| &c.id == open) {
+                if let Some(row_i) = self.row_map.iter().position(|m| *m == Some(conv_i)) {
+                    if let Some(row) = self.sidebar.row_at_index(row_i as i32) {
+                        self.sidebar.select_row(Some(&row));
+                    }
                 }
             }
+        }
+        self.refresh_status_right();
+    }
+
+    /// The workspace rail. Rebuilt when a workspace connects or the current
+    /// one changes; there are never more than a handful.
+    fn rebuild_rail(&mut self) {
+        while let Some(child) = self.rail.first_child() {
+            self.rail.remove(&child);
+        }
+        for (i, w) in self.workspaces.iter().enumerate() {
+            let tile = gtk::Label::new(Some(
+                &w.name
+                    .chars()
+                    .find(|c| c.is_alphanumeric())
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "?".into()),
+            ));
+            tile.add_css_class("tile");
+            tile.add_css_class(&format!("avatar-{}", crate::row::colour_slot(&w.name)));
+            let b = gtk::Button::new();
+            b.set_child(Some(&tile));
+            b.set_tooltip_text(Some(&format!(
+                "{}{}",
+                w.name,
+                if w.connected { "" } else { " (connecting…)" }
+            )));
+            b.update_property(&[gtk::accessible::Property::Label(&w.name)]);
+            if i == self.current {
+                b.add_css_class("current");
+            }
+            let s = self.shared.sender.clone();
+            b.connect_clicked(move |_| {
+                let _ = s.send(Msg::Action(format!("workspace_{}", i + 1)));
+            });
+            self.rail.append(&b);
         }
     }
 
@@ -928,5 +1273,23 @@ impl Drop for App {
                 let _ = tx.send(Command::Shutdown).await;
             });
         }
+    }
+}
+
+/// "Today", "Yesterday", a weekday within the week, else the date. The one
+/// place the client formats a day, so the separator and anything else that
+/// needs one agree.
+pub fn day_label(secs: i64) -> String {
+    let Ok(ts) = jiff::Timestamp::from_second(secs) else {
+        return String::new();
+    };
+    let tz = jiff::tz::TimeZone::system();
+    let day = ts.to_zoned(tz.clone()).date();
+    let today = jiff::Zoned::now().with_time_zone(tz).date();
+    match (today - day).get_days() {
+        0 => "TODAY".to_string(),
+        1 => "YESTERDAY".to_string(),
+        d if (2..7).contains(&d) => day.strftime("%A").to_string().to_uppercase(),
+        _ => day.strftime("%A, %-d %B").to_string().to_uppercase(),
     }
 }

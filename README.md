@@ -18,7 +18,7 @@ your desktop.
 Built for Wayland, verified on Hyprland, themed by
 [Omarchy](https://omarchy.org) when it is there.
 
-> **Status: M1 — skeleton.** `slack-light --anonymous` opens a themed window on a demo workspace; with a session it follows a conversation and replies. This is the successor to a
+> **Status: M2a — the look.** `slack-light --anonymous` opens a themed window on a demo workspace; with a session it follows a conversation and replies. This is the successor to a
 > terminal client that reached parity and turned out to be the wrong shape
 > for a medium full of images and threads. The Slack layer — session route,
 > websocket, cache, sync engine — carries over intact and verified. The GTK
@@ -95,7 +95,7 @@ Needs GTK 4.14+ development files (`gtk4` on Arch). No libadwaita.
 | [docs/SLACK-ACCESS-STRATEGY.md](docs/SLACK-ACCESS-STRATEGY.md) | Session token vs official app: coverage, stability, rate limits, risk |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crates, data model, storage, sync engine, the GTK runtime, theming, config |
 | [docs/M0-GUI-SPIKE-PLAN.md](docs/M0-GUI-SPIKE-PLAN.md) | What the GTK client must prove before anything else is built |
-| [docs/M0-GUI-FINDINGS.md](docs/M0-GUI-FINDINGS.md) · [docs/M1-STATUS.md](docs/M1-STATUS.md) | What the GTK spikes measured; what the skeleton delivers |
+| [docs/M0-GUI-FINDINGS.md](docs/M0-GUI-FINDINGS.md) · [docs/M1-STATUS.md](docs/M1-STATUS.md) · [docs/M2-STATUS.md](docs/M2-STATUS.md) | What the GTK spikes measured; what the skeleton delivered; where parity stands |
 | [docs/M0-SPIKE-PLAN.md](docs/M0-SPIKE-PLAN.md) · [docs/M0-FINDINGS.md](docs/M0-FINDINGS.md) | The original spike: what was proved about Slack's API, measured against a live workspace |
 
 ## Licence

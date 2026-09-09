@@ -165,3 +165,48 @@ pub fn frame_summary(prefix: &str) {
         );
     });
 }
+
+thread_local! {
+    static UPDATES: RefCell<std::collections::HashMap<&'static str, u32>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Which messages the window handled, by kind. Only ever used to answer
+/// "what is repainting an idle window", which is a question that comes up
+/// once and is unanswerable by staring at the code.
+pub fn count_update(msg: &crate::app::Msg) {
+    if !ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    use crate::app::Msg::*;
+    let kind = match msg {
+        ThemeChanged => "ThemeChanged",
+        Action(_) => "Action",
+        JumpChanged(_) => "JumpChanged",
+        JumpAccept => "JumpAccept",
+        Engine(_, _) => "Engine",
+        Open(_) => "Open",
+        Send(_) => "Send",
+        NeedImage { .. } => "NeedImage",
+        Mapped => "Mapped",
+        StatusExpired => "StatusExpired",
+        ToggleSection(_) => "ToggleSection",
+        BenchScrollDone => "BenchScrollDone",
+        IdleDone => "IdleDone",
+    };
+    UPDATES.with(|u| *u.borrow_mut().entry(kind).or_default() += 1);
+}
+
+pub fn update_summary() {
+    UPDATES.with(|u| {
+        let mut v: Vec<(&str, u32)> = u.borrow().iter().map(|(k, n)| (*k, *n)).collect();
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        report(
+            "updates",
+            v.iter()
+                .map(|(k, n)| format!("{k}={n}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    });
+}

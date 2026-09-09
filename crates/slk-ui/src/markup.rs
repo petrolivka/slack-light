@@ -76,7 +76,7 @@ pub fn inlines(xs: &[Inline], ctx: &Ctx) -> String {
                     out.push_str(&format!(
                         "<span background=\"{}\" foreground=\"{}\"><b>@{}</b></span>",
                         ctx.pal.mention_self_bg,
-                        ctx.pal.mention,
+                        ctx.pal.on_fill,
                         esc(&name)
                     ));
                 } else {
@@ -116,7 +116,7 @@ pub fn inlines(xs: &[Inline], ctx: &Ctx) -> String {
             Inline::Broadcast(b) => out.push_str(&format!(
                 "<span background=\"{}\" foreground=\"{}\"><b>@{}</b></span>",
                 ctx.pal.mention_self_bg,
-                ctx.pal.mention,
+                ctx.pal.on_fill,
                 b.as_str()
             )),
             Inline::Emoji {

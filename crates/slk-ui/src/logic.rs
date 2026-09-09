@@ -37,6 +37,53 @@ pub fn placement(rows: &[&str], ts: &str, replaces: Option<&str>) -> Placement {
     }
 }
 
+/// What a row shows besides its own message: whether it is grouped under
+/// the one above, and which separators go over it.
+///
+/// Pure, and therefore tested. Grouping is what makes a conversation read
+/// as a conversation rather than as a log, and getting it wrong is
+/// invisible until someone writes twice in a row at midnight.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Meta {
+    /// Same author, close in time, same day: no avatar, no name, no time.
+    pub grouped: bool,
+    /// The day this message starts, when it is not the one above's.
+    pub day_break: Option<String>,
+    /// The first message the user has not read.
+    pub unread_break: bool,
+}
+
+/// Seconds within which two messages from one author are one block. Slack
+/// uses five minutes and it reads well.
+const GROUP_WINDOW: i64 = 300;
+
+pub fn meta(
+    prev: Option<(&str, i64)>,
+    author: &str,
+    ts: i64,
+    last_read: Option<i64>,
+    day_label: impl Fn(i64) -> String,
+) -> Meta {
+    let new_day = match prev {
+        Some((_, pts)) => day_label(pts) != day_label(ts),
+        None => true,
+    };
+    let unread_break = match (last_read, prev) {
+        // The first message after the read mark — and only if there is one
+        // above it, since a conversation that opens entirely unread does not
+        // need a line at the very top.
+        (Some(lr), Some((_, pts))) => pts <= lr && ts > lr,
+        _ => false,
+    };
+    Meta {
+        grouped: !new_day
+            && !unread_break
+            && matches!(prev, Some((pa, pts)) if pa == author && ts - pts < GROUP_WINDOW),
+        day_break: new_day.then(|| day_label(ts)),
+        unread_break,
+    }
+}
+
 /// The next row to select from the keyboard, clamped: alt-Down on the last
 /// conversation stays there rather than wrapping, because wrapping is the
 /// thing that sends a reply to the wrong channel.
@@ -128,6 +175,60 @@ mod tests {
         assert_eq!(step(Some(0), 3, false), Some(0));
         assert_eq!(step(Some(1), 3, false), Some(0));
         assert_eq!(step(Some(0), 0, true), None);
+    }
+
+    fn day(ts: i64) -> String {
+        format!("day{}", ts / 86_400)
+    }
+
+    #[test]
+    fn consecutive_messages_from_one_author_group() {
+        let m = meta(Some(("alice", 1000)), "alice", 1100, None, day);
+        assert!(m.grouped);
+        assert_eq!(m.day_break, None);
+    }
+
+    #[test]
+    fn a_different_author_breaks_the_group() {
+        assert!(!meta(Some(("bob", 1000)), "alice", 1100, None, day).grouped);
+    }
+
+    #[test]
+    fn a_long_gap_breaks_the_group() {
+        assert!(!meta(Some(("alice", 1000)), "alice", 1000 + 301, None, day).grouped);
+        assert!(meta(Some(("alice", 1000)), "alice", 1000 + 299, None, day).grouped);
+    }
+
+    #[test]
+    fn the_first_message_is_never_grouped_and_always_starts_a_day() {
+        let m = meta(None, "alice", 1000, None, day);
+        assert!(!m.grouped);
+        assert!(m.day_break.is_some());
+    }
+
+    #[test]
+    fn a_day_boundary_breaks_the_group_even_for_one_author() {
+        // Same author, one second apart, across midnight.
+        let m = meta(Some(("alice", 86_399)), "alice", 86_400, None, day);
+        assert!(!m.grouped, "a new day starts a new block");
+        assert_eq!(m.day_break.as_deref(), Some("day1"));
+    }
+
+    #[test]
+    fn the_unread_line_lands_on_the_first_unread_message_only() {
+        // last_read at 1000: the message at 1100 is the first unread.
+        assert!(meta(Some(("bob", 900)), "alice", 1100, Some(1000), day).unread_break);
+        // The one after it is not.
+        assert!(!meta(Some(("alice", 1100)), "alice", 1200, Some(1000), day).unread_break);
+        // Nothing unread, no line.
+        assert!(!meta(Some(("bob", 900)), "alice", 950, Some(1000), day).unread_break);
+    }
+
+    #[test]
+    fn the_unread_line_breaks_the_group() {
+        let m = meta(Some(("alice", 900)), "alice", 1100, Some(1000), day);
+        assert!(m.unread_break);
+        assert!(!m.grouped, "the line needs a name under it to make sense");
     }
 
     #[test]
