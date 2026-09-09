@@ -15,7 +15,7 @@ use crate::events::{self, EventStream, RtEvent};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use slk_core::{ChannelId, Conversation, Message, TeamId, Ts, User, UserId, Workspace};
+use slk_core::{ChannelId, Conversation, FileId, Message, TeamId, Ts, User, UserId, Workspace};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -335,6 +335,83 @@ impl SlackBackend for SessionBackend {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    async fn custom_emoji(&self) -> Result<Vec<(String, String)>> {
+        let v = self.call("emoji.list", &[]).await?;
+        let Some(map) = v.get("emoji").and_then(Value::as_object) else {
+            return Ok(Vec::new());
+        };
+        // `alias:other`, and `other` can itself be an alias. Bounded rather
+        // than recursive: a workspace with a cycle in its emoji table would
+        // otherwise hang the boot, and somebody has certainly made one.
+        let resolve = |start: &str| -> Option<String> {
+            let mut name = start.to_string();
+            for _ in 0..8 {
+                let val = map.get(&name)?.as_str()?;
+                match val.strip_prefix("alias:") {
+                    Some(next) => name = next.to_string(),
+                    None => return Some(val.to_string()),
+                }
+            }
+            None
+        };
+        Ok(map
+            .keys()
+            .filter_map(|k| Some((k.clone(), resolve(k)?)))
+            // Slack's own aliases point at unicode rather than at a URL.
+            .filter(|(_, url)| url.starts_with("http"))
+            .collect())
+    }
+
+    async fn search_files(&self, query: &str, count: u16) -> Result<Vec<FileHit>> {
+        let count = count.to_string();
+        let v = self
+            .call(
+                "search.files",
+                &[("query", query), ("count", &count), ("sort", "timestamp")],
+            )
+            .await?;
+        let matches = v
+            .get("files")
+            .and_then(|m| m.get("matches"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(matches
+            .iter()
+            .filter_map(|f| {
+                Some(FileHit {
+                    id: FileId::new(f.get("id")?.as_str()?),
+                    name: f
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .or_else(|| f.get("title").and_then(Value::as_str))
+                        .unwrap_or("(unnamed)")
+                        .to_string(),
+                    mimetype: f
+                        .get("mimetype")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    size: f.get("size").and_then(Value::as_u64).unwrap_or(0),
+                    url_private: f
+                        .get("url_private")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    // `channels` is a list; a file shared in several places
+                    // gets the first, because a row can only go to one.
+                    channel: f
+                        .get("channels")
+                        .and_then(Value::as_array)
+                        .and_then(|a| a.first())
+                        .and_then(Value::as_str)
+                        .map(ChannelId::new),
+                    channel_name: String::new(),
+                    user: f.get("user").and_then(Value::as_str).map(UserId::new),
+                })
+            })
+            .collect())
     }
 
     async fn public_channels(&self, limit: u16) -> Result<Vec<Conversation>> {

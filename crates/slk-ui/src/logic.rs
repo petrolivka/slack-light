@@ -304,6 +304,48 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/pins", "What is pinned here"),
 ];
 
+/// The first `n` lines of a snippet, and whether there are more.
+///
+/// Twelve by default: enough to see what a file is, few enough that three
+/// snippets in a row do not become the whole conversation. Slack has usually
+/// truncated it already, so this is the second cut, not the first.
+pub fn snippet(preview: &str, n: usize) -> (String, usize) {
+    let lines: Vec<&str> = preview.lines().collect();
+    let shown = lines.len().min(n);
+    (lines[..shown].join("\n"), lines.len().saturating_sub(shown))
+}
+
+/// Which of the three searches a query is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Search {
+    /// `search.messages`, with Slack's own modifiers.
+    Slack,
+    /// The local FTS index: instant, offline, and only what has been read.
+    Local,
+    /// `search.files`.
+    Files,
+}
+
+/// Split a leading `local:` or `file:` off a query.
+///
+/// A prefix rather than a mode: the search box is one box, and a toggle you
+/// cannot see the state of in a screenshot is a toggle people get wrong.
+/// `from:bob` and the rest are Slack's and pass straight through — only these
+/// two are ours, and only at the very start.
+pub fn search_kind(query: &str) -> (Search, String) {
+    let q = query.trim_start();
+    for (prefix, kind) in [
+        ("local:", Search::Local),
+        ("file:", Search::Files),
+        ("files:", Search::Files),
+    ] {
+        if let Some(rest) = q.strip_prefix(prefix) {
+            return (kind, rest.trim_start().to_string());
+        }
+    }
+    (Search::Slack, q.to_string())
+}
+
 /// "alice is typing…", for however many people are.
 ///
 /// Names rather than a count, and at most two of them: "3 people are typing"
@@ -543,6 +585,26 @@ pub fn accel(rendered: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_search_prefix_is_ours_only_at_the_start() {
+        use super::{search_kind, Search};
+        assert_eq!(
+            search_kind("local: deploy"),
+            (Search::Local, "deploy".into())
+        );
+        assert_eq!(search_kind("file:report"), (Search::Files, "report".into()));
+        // Slack's own modifiers pass through untouched, including one that
+        // merely contains our word.
+        assert_eq!(
+            search_kind("from:bob has:link local"),
+            (Search::Slack, "from:bob has:link local".into())
+        );
+        assert_eq!(
+            search_kind("who ate the file:"),
+            (Search::Slack, "who ate the file:".into())
+        );
+    }
+
     #[test]
     fn the_typing_line_names_people_rather_than_counting_them() {
         use super::typing_line;

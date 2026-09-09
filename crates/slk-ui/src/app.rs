@@ -79,6 +79,10 @@ pub struct Shared {
     pub pal: RefCell<slk_theme::Semantic>,
     pub self_id: RefCell<UserId>,
     pub textures: RefCell<HashMap<String, gtk::gdk::Texture>>,
+    /// The workspace's own emoji: name to image URL. Empty until boot answers,
+    /// and empty for ever on a backend that cannot ask — in both cases a
+    /// custom shortcode renders as its name, which is what it did before.
+    pub custom: RefCell<HashMap<String, String>>,
     pub pending: RefCell<HashMap<String, Vec<gtk::Picture>>>,
 }
 
@@ -210,6 +214,8 @@ pub enum Msg {
     /// The side pane's search box changed or was submitted.
     SearchChanged(String),
     SearchRun,
+    /// Walk the searches already run: -1 for older, 1 for newer.
+    SearchHistory(i32),
     /// Move within, or accept, the completion list.
     CompleteStep(i32),
     CompleteAccept,
@@ -277,6 +283,11 @@ pub struct App {
     search: gtk::Entry,
     /// Whether the next search asks Slack or the offline index.
     search_local: bool,
+    /// Every search run this session, oldest first, and where ↑ has walked
+    /// back to. In memory only: a search history that outlives the session is
+    /// a record of what somebody was looking for, kept without being asked.
+    searches: Vec<String>,
+    search_at: Option<usize>,
     /// The open thread's parent, and its replies.
     thread: Option<slk_core::Ts>,
     thread_list: TypedListView<Row, gtk::SingleSelection>,
@@ -1092,6 +1103,7 @@ impl SimpleComponent for App {
             pal: RefCell::new(palette.semantic()),
             self_id: RefCell::new(UserId::new("")),
             textures: RefCell::new(HashMap::new()),
+            custom: RefCell::new(HashMap::new()),
             pending: RefCell::new(HashMap::new()),
             sender: sender.input_sender().clone(),
         });
@@ -1151,6 +1163,8 @@ impl SimpleComponent for App {
             side_scroller: gtk::ScrolledWindow::new(),
             search: gtk::Entry::new(),
             search_local: false,
+            searches: Vec::new(),
+            search_at: None,
             thread: None,
             thread_list: TypedListView::new(),
             thread_pane: gtk::Box::new(gtk::Orientation::Vertical, 0),
@@ -1463,6 +1477,26 @@ impl SimpleComponent for App {
             }
         }
 
+        // ↑ and ↓ in the search box walk what has already been run. A plain
+        // key on a focused entry, so it cannot be an accelerator — an
+        // accelerator on Up would fire before the entry ever saw it, which is
+        // the same rule the composer's Return follows.
+        {
+            let s2 = sender.input_sender().clone();
+            let k = gtk::EventControllerKey::new();
+            k.set_propagation_phase(gtk::PropagationPhase::Capture);
+            k.connect_key_pressed(move |_, key, _, _| {
+                let delta = match key {
+                    gtk::gdk::Key::Up => -1,
+                    gtk::gdk::Key::Down => 1,
+                    _ => return gtk::glib::Propagation::Proceed,
+                };
+                let _ = s2.send(Msg::SearchHistory(delta));
+                gtk::glib::Propagation::Stop
+            });
+            model.search.add_controller(k);
+        }
+
         // What the window looked like, written as it closes. The closure owns
         // everything it needs rather than sending a message: a message from
         // `close_request` races the window going away, and an update that is
@@ -1669,16 +1703,50 @@ impl SimpleComponent for App {
             // search that fires on every letter is a request per letter.
             Msg::SearchChanged(_) => {}
             Msg::SearchRun => {
-                let q = self.search.text().to_string();
-                if q.trim().is_empty() {
+                let raw = self.search.text().to_string();
+                if raw.trim().is_empty() {
+                    return;
+                }
+                // Recallable with ↑, newest last, and never the same query
+                // twice in a row: a history full of one repeated search is a
+                // history you have to walk past.
+                if self.searches.last() != Some(&raw) {
+                    self.searches.push(raw.clone());
+                    if self.searches.len() > 50 {
+                        self.searches.remove(0);
+                    }
+                }
+                self.search_at = None;
+
+                let (kind, query) = crate::logic::search_kind(&raw);
+                if query.trim().is_empty() {
+                    self.say("a prefix on its own is not a search".into());
                     return;
                 }
                 self.show_list("Searching…", Vec::new(), "asking…");
                 self.search.set_visible(true);
-                self.send(Command::Search {
-                    query: q,
-                    local: self.search_local,
-                });
+                match kind {
+                    crate::logic::Search::Files => self.send(Command::SearchFiles(query)),
+                    other => self.send(Command::Search {
+                        query,
+                        // The toggle still works; the prefix wins when it is
+                        // there, because it is the one the user can see.
+                        local: other == crate::logic::Search::Local || self.search_local,
+                    }),
+                }
+            }
+            Msg::SearchHistory(delta) => {
+                if self.searches.is_empty() {
+                    return;
+                }
+                let at = crate::logic::cursor(self.search_at, self.searches.len(), delta as isize);
+                self.search_at = at;
+                let text = at
+                    .and_then(|i| self.searches.get(i))
+                    .cloned()
+                    .unwrap_or_default();
+                self.search.set_text(&text);
+                self.search.set_position(-1);
             }
             Msg::CompleteStep(d) => {
                 if d == 0 {
@@ -1910,6 +1978,12 @@ impl App {
                 let mut d = self.shared.names.borrow_mut();
                 for u in users {
                     d.add_user(u.id.as_str().to_string(), u.label);
+                }
+            }
+            Event::CustomEmoji(all) => {
+                let mut d = self.shared.custom.borrow_mut();
+                for (name, url) in all {
+                    d.insert(name, url);
                 }
             }
             Event::UserGroups(groups) => {
@@ -2280,12 +2354,11 @@ impl App {
                     }
                     Err(e) => tracing::warn!("texture {file_id}: {e}"),
                 }
-            }
-            // No catch-all. In M2 `Event::Notify` fell through one of these
-            // and notifications simply never happened — the compiler had
-            // nothing to say, because a catch-all is a promise that every
-            // future variant is uninteresting. Adding an event should break
-            // this match.
+            } // No catch-all. In M2 `Event::Notify` fell through one of these
+              // and notifications simply never happened — the compiler had
+              // nothing to say, because a catch-all is a promise that every
+              // future variant is uninteresting. Adding an event should break
+              // this match.
         }
     }
 
@@ -2892,6 +2965,7 @@ impl App {
                 self.send(Command::JumpToMessage(ch, ts));
             }
             Thread(ch, ts) => self.show_thread(ch, ts),
+            Conversation(ch) => self.open_channel(ch),
             User(id) => self.request_list(Command::ShowProfile(id), "Profile"),
             Join(ch) => self.send(Command::Join(ch)),
             Info => self.notice("that line is here to be read".into(), sender),
@@ -3178,11 +3252,39 @@ impl App {
             // Ranked by position, not by name: `search_with` already put
             // the best first, and re-sorting these by label length offered
             // :rock: ahead of :rocket:.
-            Complete::Emoji => slk_core::emoji::search_with(&c.query, 24, self.skin)
-                .into_iter()
-                .enumerate()
-                .map(|(i, (name, glyph))| (i, format!(":{name}: "), format!("{glyph}  :{name}:")))
-                .collect(),
+            Complete::Emoji => {
+                let mut out: Vec<(usize, String, String)> =
+                    slk_core::emoji::search_with(&c.query, 24, self.skin)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (name, glyph))| {
+                            (i, format!(":{name}: "), format!("{glyph}  :{name}:"))
+                        })
+                        .collect();
+                // The workspace's own, after the unicode ones. A custom
+                // emoji has no glyph to preview in a text list — the picture
+                // is in the chip, not here — so it is labelled as custom
+                // rather than shown as an empty square.
+                let base = out.len();
+                let q = c.query.to_lowercase();
+                let mut mine: Vec<String> = self
+                    .shared
+                    .custom
+                    .borrow()
+                    .keys()
+                    .filter(|n| q.is_empty() || n.to_lowercase().contains(&q))
+                    .cloned()
+                    .collect();
+                mine.sort();
+                for (i, name) in mine.into_iter().take(12).enumerate() {
+                    out.push((
+                        base + i,
+                        format!(":{name}: "),
+                        format!("·  :{name}:  (this workspace)"),
+                    ));
+                }
+                out
+            }
             Complete::Command => crate::logic::COMMANDS
                 .iter()
                 .filter_map(|(cmd, help)| {

@@ -206,6 +206,30 @@ w "deploy"; sleep 0.4; w -k Return; sleep 2.0
 check "alt-/ searches and counts what it found" "$( tree | grep -qE "label '[0-9]+ results? for" && echo 1 || echo 0 )" "$(tree | grep -oE "label '[0-9]+ results?[^']*'" | head -1)"
 check "each hit says which conversation it is in" "$( tree | grep -q '#engineering' && echo 1 || echo 0 )"
 
+# A snippet: Slack sends the first lines, the row shows twelve of them and
+# puts the rest behind a disclosure rather than fetching the file.
+w -k Escape; sleep 0.4
+w -M alt -k Home -m alt; sleep 1.0
+check "a text file is shown inline, not as a paperclip" "$( tree | grep -q 'retry.toml' && echo 1 || echo 0 )" "$(tree | grep -oE "label '📄[^']*'" | head -1)"
+check "with its first lines and a count of the rest" "$( tree | grep -q 'more lines' && echo 1 || echo 0 )"
+
+# A custom emoji is a picture in the chip, and the chip is still named — a
+# reaction whose only accessible name is its count tells a screen reader
+# nothing and cannot be asserted on either.
+check "a workspace emoji renders as a picture with a name" "$( tree | grep -q "button ':shipit: " && echo 1 || echo 0 )" "$(tree | grep -oE "button ':[a-z-]+: [0-9]+'" | head -1)"
+
+# File search, by the prefix rather than by a mode: one box, and a toggle you
+# cannot see the state of in a screenshot is one people get wrong.
+w -M alt -k slash -m alt; sleep 1.0
+w "file:retry"; sleep 0.4; w -k Return; sleep 2.0
+check "file: searches files and says how many" "$( tree | grep -qE "label '[0-9]+ file" && echo 1 || echo 0 )" "$(tree | grep -oE "label '[0-9]+ file[^']*'" | head -1)"
+check "and each hit says how big and where" "$( tree | grep -q 'retry.toml' && echo 1 || echo 0 )"
+# The query is recallable: up-arrow in the box brings it back.
+w -M ctrl u -m ctrl; sleep 0.3
+w -k Up; sleep 0.5
+check "up-arrow recalls the last search" "$( tree | grep -q 'file:retry' && echo 1 || echo 0 )" "$(tree | grep -oE "'file:[^']*'" | head -1)"
+w -k Escape; sleep 0.4
+
 # A profile, from the message under the cursor.
 w -k Escape; sleep 0.4
 w -M alt k -m alt; sleep 0.4; w -M alt i -m alt; sleep 1.5

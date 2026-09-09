@@ -197,6 +197,7 @@ pub fn count_update(msg: &crate::app::Msg) {
         ViewImage(_) => "ViewImage",
         SearchChanged(_) => "SearchChanged",
         SearchRun => "SearchRun",
+        SearchHistory(_) => "SearchHistory",
         CompleteStep(_) => "CompleteStep",
         CompleteAccept => "CompleteAccept",
         Focused(_) => "Focused",

@@ -7,7 +7,7 @@
 
 use crate::error::Result;
 use async_trait::async_trait;
-use slk_core::{ChannelId, Conversation, Message, TeamId, Ts, User, UserId, Workspace};
+use slk_core::{ChannelId, Conversation, FileId, Message, TeamId, Ts, User, UserId, Workspace};
 
 /// What this backend can actually do. A missing capability disables the action
 /// in the interface rather than hiding it, so both backends look the same and
@@ -69,6 +69,24 @@ pub struct SearchHit {
     pub ts: Ts,
     pub user: Option<UserId>,
     pub text: String,
+}
+
+/// One file `search.files` found.
+///
+/// The channel and timestamp are optional because Slack's file search
+/// answers with the file, not with the message it was shared in — a file can
+/// be in several conversations, or in none any more. A hit that cannot say
+/// where it came from is still worth showing; pretending it can is not.
+#[derive(Debug, Clone)]
+pub struct FileHit {
+    pub id: FileId,
+    pub name: String,
+    pub mimetype: String,
+    pub size: u64,
+    pub url_private: Option<String>,
+    pub channel: Option<ChannelId>,
+    pub channel_name: String,
+    pub user: Option<UserId>,
 }
 
 /// One page of history, with the cursor to continue from.
@@ -158,6 +176,22 @@ pub trait SlackBackend: Send + Sync {
     /// are passed through untouched, because they are the reason to use this
     /// rather than the local index.
     async fn search(&self, query: &str, count: u16) -> Result<Vec<SearchHit>>;
+
+    /// The workspace's own emoji: name to image URL.
+    ///
+    /// Aliases are resolved here rather than by the caller — Slack answers
+    /// `alias:other` and chains them, and every consumer would otherwise have
+    /// to know that. A backend that cannot ask has none.
+    async fn custom_emoji(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
+    /// `search.files`. A backend that cannot search files finds none rather
+    /// than failing: the search box is one box, and an error where an empty
+    /// list belongs reads as a broken client.
+    async fn search_files(&self, _query: &str, _count: u16) -> Result<Vec<FileHit>> {
+        Ok(Vec::new())
+    }
 
     /// The workspace's user groups, so `@design-team` can be completed and
     /// resolved. Cheap and small; fetched once at boot.

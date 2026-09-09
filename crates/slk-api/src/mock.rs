@@ -410,7 +410,10 @@ impl MockBackend {
                 v["latest_reply"] = json!("1725702000.000100");
                 v["reactions"] = json!([
                     {"name":"tada","count":3,"users":["U0BOB"]},
-                    {"name":"+1","count":1,"users":["U0SELF"]}
+                    {"name":"+1","count":1,"users":["U0SELF"]},
+                    // One of the workspace's own, so the picture path is
+                    // exercised rather than merely written.
+                    {"name":"shipit","count":2,"users":["U0ALICE","U0CAROL"]}
                 ]);
             }
             if let Some(m) = Message::parse(t, &eng, &self.self_id, &v) {
@@ -433,6 +436,26 @@ impl MockBackend {
             .unwrap()
             .insert(eng.as_str().to_string(), msgs);
 
+        // A snippet, so the inline preview has something to draw and the
+        // suite can assert on it. Shaped the way Slack sends one: a truncated
+        // `preview`, the real line count, and a filetype.
+        let snip = json!({
+            "type": "message", "subtype": "file_share", "user": "U0BOB",
+            "ts": "1725701650.000100", "text": "the retry config, for reference",
+            "files": [{
+                "id": "F0RETRY", "name": "retry.toml", "mimetype": "text/plain",
+                "filetype": "toml", "size": 412, "lines": 21,
+                "preview": "[retry]\nattempts = 5\nbackoff = \"exponential\"\nbase_ms = 250\nmax_ms = 30000\njitter = true\n\n[retry.per_endpoint]\n\"chat.postMessage\" = 3\n\"conversations.history\" = 5\n\"users.list\" = 2\n\"search.messages\" = 2\n\"files.upload\" = 1\n\"reactions.add\" = 4",
+                "url_private": "mock://retry.toml"
+            }],
+        });
+        if let Some(m) = Message::parse(t, &eng, &self.self_id, &snip) {
+            let mut all = self.messages.lock().unwrap();
+            let entry = all.entry(eng.as_str().to_string()).or_default();
+            entry.push(m);
+            entry.sort_by(|a, b| a.ts.cmp(&b.ts));
+        }
+
         let dm = ChannelId::new(format!("D0ALICE{}", &team_id[1..2]));
         let v = json!({"type":"message","user":"U0ALICE","ts":"1725701000.000100",
                        "text":"can you look at the retry logic when you get a moment?"});
@@ -450,6 +473,15 @@ impl Default for MockBackend {
         Self::new()
     }
 }
+
+/// An 8×8 PNG, opaque. Small enough to inline, real enough to decode.
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x08, 0x02, 0x00, 0x00, 0x00, 0x4B, 0x6D, 0x29,
+    0xDC, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0xDA, 0x63, 0xF0, 0x9A, 0xF7, 0x1F,
+    0x2B, 0x62, 0x18, 0x5A, 0x12, 0x00, 0x65, 0x49, 0x79, 0xC1, 0x48, 0x91, 0x8E, 0xD7, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
 
 #[async_trait]
 impl SlackBackend for MockBackend {
@@ -582,6 +614,43 @@ impl SlackBackend for MockBackend {
             .find(|u| u.id == *id)
             .cloned()
             .ok_or_else(|| slk_api_error(id))
+    }
+
+    async fn custom_emoji(&self) -> Result<Vec<(String, String)>> {
+        Ok(vec![
+            ("shipit".into(), "mock://emoji/shipit.png".into()),
+            ("blob-wave".into(), "mock://emoji/blob-wave.png".into()),
+        ])
+    }
+
+    async fn search_files(&self, query: &str, _count: u16) -> Result<Vec<FileHit>> {
+        // Over the files actually attached to the demo's messages, so what
+        // the search finds is what the conversation shows.
+        let q = query.to_lowercase();
+        let all = self.messages.lock().unwrap();
+        let mut out = Vec::new();
+        for (ch, msgs) in all.iter() {
+            for m in msgs {
+                for f in &m.files {
+                    if q.is_empty() || f.name.to_lowercase().contains(&q) {
+                        out.push(FileHit {
+                            id: f.id.clone(),
+                            name: f.name.clone(),
+                            mimetype: f.mimetype.clone(),
+                            size: f.size,
+                            url_private: f.url_private.clone(),
+                            channel: Some(ChannelId::new(ch.clone())),
+                            channel_name: String::new(),
+                            user: match &m.author {
+                                slk_core::Author::User(u) => Some(u.clone()),
+                                _ => None,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn search(&self, query: &str, count: u16) -> Result<Vec<SearchHit>> {
@@ -931,6 +1000,14 @@ impl SlackBackend for MockBackend {
     async fn download(&self, url: &str, to: &std::path::Path) -> Result<u64> {
         if let Some(d) = to.parent() {
             let _ = std::fs::create_dir_all(d);
+        }
+        // The demo's custom emoji: a real PNG, because the path under test
+        // ends in `Texture::from_file`, and a text file with a `.png` name
+        // would make the decode fail rather than the feature work.
+        if url.starts_with("mock://emoji/") {
+            std::fs::write(to, TINY_PNG)
+                .map_err(|e| SlackError::new("download", ErrorKind::Transport, e.to_string()))?;
+            return Ok(TINY_PNG.len() as u64);
         }
         // A file this workspace was given comes back as itself. Handing back a
         // note saying a download happened would make every path that reads the

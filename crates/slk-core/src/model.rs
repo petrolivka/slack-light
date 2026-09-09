@@ -288,11 +288,31 @@ pub struct FileMeta {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub url_private: Option<String>,
+    /// The first lines of a text file, as Slack sends them.
+    ///
+    /// Slack does this for us: a snippet arrives with `preview` already
+    /// truncated, `lines` for the whole file and `lines_more` for the rest.
+    /// Fetching the file to show its first twelve lines would be a download
+    /// per snippet on screen, which is the opposite of what this client is.
+    pub preview: Option<String>,
+    /// How many lines the whole file has, when Slack says.
+    pub lines: Option<u32>,
+    /// Slack's own name for the kind of file: `rust`, `python`, `text`.
+    pub filetype: String,
 }
 
 impl FileMeta {
     pub fn is_image(&self) -> bool {
         self.mimetype.starts_with("image/")
+    }
+
+    /// Whether this is a snippet worth showing inline rather than a paperclip.
+    ///
+    /// Having a preview *is* the test: Slack sends one for the files it
+    /// considers text, and second-guessing that from the mimetype gets
+    /// `application/json` and `application/x-sh` wrong in both directions.
+    pub fn is_snippet(&self) -> bool {
+        self.preview.as_ref().is_some_and(|p| !p.trim().is_empty())
     }
 }
 
@@ -404,6 +424,9 @@ impl Message {
                             .and_then(Value::as_u64)
                             .map(|n| n as u32),
                         url_private: s(f, "url_private").map(str::to_string),
+                        preview: s(f, "preview").map(str::to_string),
+                        lines: f.get("lines").and_then(Value::as_u64).map(|n| n as u32),
+                        filetype: s(f, "filetype").unwrap_or_default().to_string(),
                     })
                 })
                 .collect(),

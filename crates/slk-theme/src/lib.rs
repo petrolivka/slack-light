@@ -323,6 +323,20 @@ window {{ background-color: @sl_bg; color: @sl_fg; font-size: 13px; }}
 .threadlink:hover {{ color: @sl_fg_bright; }}
 .marks {{ color: @sl_fg_dim; font-size: 11px; }}
 
+/* A text file shown inline. Bordered rather than tinted: a snippet has to be
+   distinguishable from the message around it on a light theme and a dark one
+   without either being able to rely on a background. */
+.snippet {{
+    border: 1px solid alpha(@sl_muted, 0.8); border-radius: 6px;
+    padding: 6px 8px; margin-top: 4px;
+}}
+.snippet .code {{
+    font-family: monospace; font-size: 12px; color: @sl_fg;
+    padding-top: 4px;
+}}
+.snippet .note {{ color: @sl_fg_dim; font-size: 11px; }}
+.snippet expander {{ color: @sl_fg_dim; font-size: 11px; }}
+
 /* The hover bar. It floats over the row's top-right corner, so nothing
    reflows when it appears — a bar that moves the text under the pointer is
    a bar you cannot click. */

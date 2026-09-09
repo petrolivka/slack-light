@@ -48,6 +48,76 @@ const MORE: &[(&str, &str)] = &[
     ("View source", "view_source"),
 ];
 
+/// A text file, as its first lines with the rest behind a disclosure.
+///
+/// No syntax colouring. Slack sends `preview_highlight` as a block of HTML
+/// from its own editor, and turning that into Pango means either shipping an
+/// HTML parser or writing a highlighter — and a highlighter that is wrong
+/// about a language is worse than monospace, because it asserts things about
+/// code that are not true. Monospace, the code-block styling this client
+/// already has, and the filetype named in the header instead.
+fn snippet(f: &slk_core::FileMeta, pal: &slk_theme::Semantic) -> gtk::Widget {
+    use gtk::prelude::*;
+    let preview = f.preview.clone().unwrap_or_default();
+    let (head, more) = crate::logic::snippet(&preview, 12);
+
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    outer.add_css_class("snippet");
+
+    let title = gtk::Label::new(None);
+    title.set_use_markup(true);
+    title.set_xalign(0.0);
+    let kind = if f.filetype.is_empty() {
+        String::new()
+    } else {
+        format!("  ·  {}", f.filetype)
+    };
+    let count = match f.lines {
+        Some(n) => format!("  ·  {n} lines"),
+        None => String::new(),
+    };
+    title.set_markup(&format!(
+        "<span foreground=\"{}\">📄 {}</span><span foreground=\"{}\"><small>{}{}  ·  {}</small></span>",
+        pal.link,
+        gtk::glib::markup_escape_text(&f.name),
+        pal.dim,
+        gtk::glib::markup_escape_text(&kind),
+        gtk::glib::markup_escape_text(&count),
+        human_size(f.size),
+    ));
+    outer.append(&title);
+
+    let body = gtk::Label::new(Some(&head));
+    body.set_xalign(0.0);
+    body.set_selectable(true);
+    body.set_wrap(false);
+    body.add_css_class("code");
+    outer.append(&body);
+
+    // The rest of what Slack sent, not the rest of the file: expanding must
+    // not become a download, and saying so is better than pretending the
+    // whole file is here.
+    if more > 0 {
+        let rest = gtk::Label::new(Some(&preview));
+        rest.set_xalign(0.0);
+        rest.set_selectable(true);
+        rest.set_wrap(false);
+        rest.add_css_class("code");
+        let expander = gtk::Expander::new(Some(&format!("{more} more lines")));
+        expander.set_child(Some(&rest));
+        outer.append(&expander);
+    }
+    if f.lines
+        .is_some_and(|n| n as usize > preview.lines().count())
+    {
+        let note = gtk::Label::new(Some("· the rest is in the file"));
+        note.set_xalign(0.0);
+        note.add_css_class("note");
+        outer.append(&note);
+    }
+    outer.upcast()
+}
+
 /// Run an action against one message.
 ///
 /// A pooled button cannot hold a `ComponentSender` — it outlives every model
@@ -491,6 +561,13 @@ impl RelmListItem for Row {
             if f.is_image() {
                 continue;
             }
+            // A text file shows what is in it. A paperclip with a name tells
+            // you nothing about a two-line config change, and the whole point
+            // of pasting a snippet is that people read it without opening it.
+            if f.is_snippet() {
+                w.extras.append(&snippet(f, &pal));
+                continue;
+            }
             let l = gtk::Label::new(None);
             l.set_use_markup(true);
             l.set_xalign(0.0);
@@ -560,13 +637,54 @@ impl RelmListItem for Row {
             w.chips.remove(&c);
         }
         for r in &m.reactions {
-            let glyph = slk_core::emoji::shortcode(&r.name, None)
-                .unwrap_or_else(|| format!(":{}:", r.name));
             let chip = gtk::Button::new();
-            chip.set_child(Some(&gtk::Label::new(Some(&format!(
-                "{glyph} {}",
-                r.count
-            )))));
+            // A workspace's own emoji is an image, and a chip is a widget, so
+            // this is the one place FR-F6 costs nothing: a Box with a Picture
+            // in it. The message *body* is a single Pango label — that is
+            // what makes selection and copy work across a whole message — and
+            // a label cannot hold an image without giving that up, so custom
+            // shortcodes still read as `:name:` there.
+            match self.shared.custom.borrow().get(&r.name) {
+                Some(url) => {
+                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                    let pic = gtk::Picture::new();
+                    pic.set_size_request(16, 16);
+                    pic.set_content_fit(gtk::ContentFit::Contain);
+                    // Without this the chip's only accessible name is its
+                    // count — "2" — which tells a screen reader nothing and
+                    // makes the suite unable to see which reaction it is.
+                    // CONTRIBUTING: a widget that is not in the tree with a
+                    // usable name is a defect twice over.
+                    pic.update_property(&[gtk::accessible::Property::Label(&format!(
+                        ":{}:",
+                        r.name
+                    ))]);
+                    let key = format!("emoji:{}", r.name);
+                    match self.shared.textures.borrow().get(&key) {
+                        Some(t) => pic.set_paintable(Some(t)),
+                        None => {
+                            self.shared
+                                .pending
+                                .borrow_mut()
+                                .entry(key.clone())
+                                .or_default()
+                                .push(pic.clone());
+                            self.shared.need_image(&key, url);
+                        }
+                    }
+                    row.append(&pic);
+                    row.append(&gtk::Label::new(Some(&r.count.to_string())));
+                    chip.set_child(Some(&row));
+                }
+                None => {
+                    let glyph = slk_core::emoji::shortcode(&r.name, None)
+                        .unwrap_or_else(|| format!(":{}:", r.name));
+                    chip.set_child(Some(&gtk::Label::new(Some(&format!(
+                        "{glyph} {}",
+                        r.count
+                    )))));
+                }
+            }
             chip.add_css_class("chip");
             chip.set_can_focus(false);
             if r.by_me {

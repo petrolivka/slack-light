@@ -63,6 +63,9 @@ pub enum Command {
         query: String,
         local: bool,
     },
+    /// `search.files`. Answered as a list, like the other lists, because a
+    /// file result is a row you choose rather than a message you jump to.
+    SearchFiles(String),
     /// Open a conversation positioned on one message, from a search result.
     JumpToMessage(ChannelId, Ts),
     /// Fetch every file on a message to the download directory.
@@ -170,6 +173,8 @@ pub enum Event {
     Users(Vec<slk_store::UserLabel>),
     /// Id to handle, for rendering and completing `@design-team`.
     UserGroups(Vec<(String, String)>),
+    /// The workspace's own emoji: name to image URL.
+    CustomEmoji(Vec<(String, String)>),
     /// A conversation's messages, oldest first. `append` distinguishes a page
     /// of scrollback from a fresh load.
     Messages {
@@ -746,6 +751,7 @@ impl Engine {
         self.push_sidebar().await;
         self.push_users().await;
         self.push_usergroups().await;
+        self.push_custom_emoji().await;
 
         // Where this workspace was left, offered once and only once. Emitted
         // after the sidebar, so the interface has the conversation to open by
@@ -931,6 +937,17 @@ impl Engine {
                 self.emit(Event::Notice(format!("cannot read the cache: {e}")))
                     .await;
             }
+        }
+    }
+
+    /// The workspace's own emoji. One call at boot, and a failure costs a
+    /// picture rather than a client: an unknown shortcode still renders as
+    /// its name, which is what it did before this existed.
+    async fn push_custom_emoji(&mut self) {
+        match self.backend.custom_emoji().await {
+            Ok(all) if !all.is_empty() => self.emit(Event::CustomEmoji(all)).await,
+            Ok(_) => {}
+            Err(e) => debug!("custom emoji: {e}"),
         }
     }
 
@@ -1266,6 +1283,53 @@ impl Engine {
                     items: rows,
                 })
                 .await;
+            }
+
+            Command::SearchFiles(query) => {
+                match self.backend.search_files(&query, 50).await {
+                    Ok(hits) => {
+                        let names = self.store.conversations(&self.team).unwrap_or_default();
+                        let rows: Vec<ListRow> = hits
+                            .into_iter()
+                            .map(|h| {
+                                let where_ = h
+                                    .channel
+                                    .as_ref()
+                                    .and_then(|c| names.iter().find(|n| n.id == *c))
+                                    .map(|c| format!("#{}", c.name))
+                                    // Slack answers with the file, not with
+                                    // the message it was shared in, so "we do
+                                    // not know" is a real answer here.
+                                    .unwrap_or_else(|| "shared elsewhere".into());
+                                ListRow {
+                                    label: h.name,
+                                    note: format!("{}  ·  {where_}", human_size(h.size)),
+                                    target: match h.channel {
+                                        Some(c) => ListTarget::Conversation(c),
+                                        None => ListTarget::Info,
+                                    },
+                                }
+                            })
+                            .collect();
+                        let n = rows.len();
+                        self.emit(Event::List {
+                            title: format!("{n} file(s) for {query:?}"),
+                            items: rows,
+                        })
+                        .await;
+                    }
+                    Err(e) => {
+                        self.emit(Event::List {
+                            title: "files".into(),
+                            items: vec![ListRow {
+                                label: e.user_message(),
+                                note: String::new(),
+                                target: ListTarget::Info,
+                            }],
+                        })
+                        .await
+                    }
+                }
             }
 
             Command::ListPinned(ch) => {
@@ -2030,6 +2094,10 @@ pub enum ListTarget {
     Thread(ChannelId, Ts),
     /// Show the profile.
     User(UserId),
+    /// Just open the conversation. A file result knows where it was shared
+    /// but not which message shared it, and jumping to a message we cannot
+    /// name would land somewhere arbitrary.
+    Conversation(ChannelId),
     /// Join a public channel, then open it.
     Join(ChannelId),
     /// A line that is there to be read, not chosen.
