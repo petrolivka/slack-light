@@ -289,6 +289,26 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/leave", "Leave this conversation"),
 ];
 
+/// A message that is really a slash command, split into the two parts the
+/// engine wants.
+///
+/// Only at the very start, and only a bare word: `/home/petr/notes` is a
+/// path somebody is talking about, and `and/or` is a word. Slack forwards
+/// anything shaped like a command to the workspace, so this does too —
+/// what the workspace does not know comes back, and the interface puts the
+/// text back in the composer rather than losing it.
+pub fn slash(text: &str) -> Option<(String, String)> {
+    let text = text.strip_prefix('/')?;
+    let (word, rest) = match text.find(char::is_whitespace) {
+        Some(i) => (&text[..i], text[i..].trim_start()),
+        None => (text, ""),
+    };
+    if word.is_empty() || !word.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    Some((format!("/{word}"), rest.to_string()))
+}
+
 /// When a conversation is marked read.
 ///
 /// The requirements are blunt about this one: getting it wrong means
@@ -670,6 +690,21 @@ mod tests {
         assert_eq!(MarkRead::parse("on_focus"), MarkRead::OnFocus);
         // Anything unrecognised is the middle setting, not the riskiest one.
         assert_eq!(MarkRead::parse("nonsense"), MarkRead::OnFocus);
+    }
+
+    #[test]
+    fn a_slash_command_is_only_one_at_the_start_of_a_bare_word() {
+        assert_eq!(
+            slash("/topic release week"),
+            Some(("/topic".into(), "release week".into()))
+        );
+        assert_eq!(slash("/shrug"), Some(("/shrug".into(), String::new())));
+        // A path is not a command, and neither is a slash mid-sentence.
+        assert_eq!(slash("/home/petr/notes.md is where"), None);
+        assert_eq!(slash("and/or"), None);
+        assert_eq!(slash("look at /etc/hosts"), None);
+        assert_eq!(slash("/"), None);
+        assert_eq!(slash("plain text"), None);
     }
 
     #[test]

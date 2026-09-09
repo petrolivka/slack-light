@@ -214,6 +214,12 @@ pub enum Event {
     RateLimited {
         seconds: u64,
     },
+    /// A slash command the workspace would not run. Carries what was typed,
+    /// because by the time this arrives the composer has been emptied.
+    SlashRejected {
+        command: String,
+        text: String,
+    },
     /// The session is gone; nothing will work until it is replaced.
     AuthLost,
 }
@@ -476,6 +482,7 @@ impl Engine {
                 .map(|_| None),
         };
 
+        let rejected = result.is_err();
         match result {
             Ok(Some(note)) => self.emit(Event::Notice(note.into())).await,
             Ok(None) => self.open(channel).await,
@@ -491,6 +498,11 @@ impl Engine {
                 self.emit(Event::Notice(format!("{command}: {}", e.user_message())))
                     .await
             }
+        }
+        // A command the workspace refused is text the person typed and has
+        // now lost. The interface puts it back.
+        if rejected {
+            self.emit(Event::SlashRejected { command, text }).await;
         }
     }
 

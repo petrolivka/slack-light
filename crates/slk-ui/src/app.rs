@@ -93,6 +93,14 @@ thread_local! {
     static ROW_SENDER: RefCell<Option<relm4::Sender<Msg>>> = const { RefCell::new(None) };
 }
 
+/// Open an image in a window of its own. Same route as `row_action`.
+pub fn image_clicked(file_id: &str) -> bool {
+    ROW_SENDER.with_borrow(|s| match s {
+        Some(s) => s.send(Msg::ViewImage(file_id.to_string())).is_ok(),
+        None => false,
+    })
+}
+
 /// Follow a link from inside a message. A Slack permalink is a jump, not a
 /// trip to the browser, and only the window knows which.
 pub fn link_clicked(url: &str) -> bool {
@@ -189,6 +197,10 @@ pub enum Msg {
     Link(String),
     /// A row in the side pane's list was chosen.
     ListPick(usize),
+    /// Files were dropped on the window.
+    Dropped(Vec<std::path::PathBuf>),
+    /// An image in a message was clicked.
+    ViewImage(String),
     /// The side pane's search box changed or was submitted.
     SearchChanged(String),
     SearchRun,
@@ -1147,6 +1159,30 @@ impl SimpleComponent for App {
             });
         }
 
+        // Dropping files on the window sends them here, to the conversation
+        // or to the open thread. The whole window is the target, because
+        // aiming at the composer is a thing people do only once.
+        {
+            let drop = gtk::DropTarget::new(
+                gtk::gdk::FileList::static_type(),
+                gtk::gdk::DragAction::COPY,
+            );
+            let s2 = sender.input_sender().clone();
+            drop.connect_drop(move |_, value, _, _| {
+                let Ok(files) = value.get::<gtk::gdk::FileList>() else {
+                    return false;
+                };
+                let paths: Vec<std::path::PathBuf> =
+                    files.files().iter().filter_map(|f| f.path()).collect();
+                if paths.is_empty() {
+                    return false;
+                }
+                let _ = s2.send(Msg::Dropped(paths));
+                true
+            });
+            root.add_controller(drop);
+        }
+
         // Where a pooled row's buttons send what they were clicked for.
         ROW_SENDER.with_borrow_mut(|slot| *slot = Some(sender.input_sender().clone()));
 
@@ -1385,6 +1421,8 @@ impl SimpleComponent for App {
             }
             Msg::Link(url) => self.follow_link(&url, &sender),
             Msg::ListPick(i) => self.pick(i, &sender),
+            Msg::Dropped(paths) => self.upload(paths, &sender),
+            Msg::ViewImage(file_id) => self.view_image(&file_id),
             // The entry is read when Enter is pressed, not per keystroke: a
             // search that fires on every letter is a request per letter.
             Msg::SearchChanged(_) => {}
@@ -1464,6 +1502,20 @@ impl SimpleComponent for App {
                     });
                     self.refresh_hint();
                     return;
+                }
+                // A slash command is not a message. Slack forwards anything
+                // shaped like one to the workspace, so this does too, and
+                // `SlashRejected` puts the text back when nobody owns it.
+                if self.editing.is_none() {
+                    if let Some((command, rest)) = crate::logic::slash(&text) {
+                        self.drafts.remove(&ch);
+                        self.send(Command::Slash {
+                            channel: ch,
+                            command,
+                            text: rest,
+                        });
+                        return;
+                    }
                 }
                 self.sent_at = Some(std::time::Instant::now());
                 self.drafts.remove(&ch);
@@ -1852,6 +1904,20 @@ impl App {
                 let adj = self.thread_scroller.vadjustment();
                 adj.set_value(adj.upper() - adj.page_size());
             }
+            Event::SlashRejected { command, text } => {
+                if is_current {
+                    let back = if text.is_empty() {
+                        command
+                    } else {
+                        format!("{command} {text}")
+                    };
+                    self.inserting.set(true);
+                    self.composer.buffer().set_text(&back);
+                    self.inserting.set(false);
+                    self.composer.grab_focus();
+                    bench::report("slash_returned", &back);
+                }
+            }
             Event::Permalink { url, .. } => {
                 self.to_clipboard(&url);
                 self.notice("link copied".into(), sender);
@@ -2185,6 +2251,13 @@ impl App {
                 ts: m.ts.clone(),
                 on: !m.pinned,
             }),
+            "view_image" => match m.files.iter().find(|f| f.is_image()) {
+                Some(f) => {
+                    let id = f.id.as_str().to_string();
+                    self.view_image(&id)
+                }
+                None => self.notice("no image on this message".into(), sender),
+            },
             "download_files" => self.send(Command::DownloadFiles {
                 channel: ch,
                 ts: m.ts.clone(),
@@ -2207,6 +2280,69 @@ impl App {
             other => self.say(format!("unbound action {other}")),
         }
     }
+    // ---- files ---------------------------------------------------------
+
+    /// Send files, to the thread if one is open and to the conversation
+    /// otherwise — which is where the person was looking when they dropped
+    /// them.
+    fn upload(&mut self, paths: Vec<std::path::PathBuf>, sender: &ComponentSender<Self>) {
+        let Some(ch) = self.open.clone() else { return };
+        if self.read_only {
+            self.notice("read-only: nothing is sent".into(), sender);
+            return;
+        }
+        let thread = self.thread.clone();
+        let n = paths.len();
+        for path in paths {
+            self.send(Command::UploadFile {
+                channel: ch.clone(),
+                thread: thread.clone(),
+                path,
+                comment: None,
+            });
+        }
+        self.notice(
+            format!("sending {n} file{}", if n == 1 { "" } else { "s" }),
+            sender,
+        );
+    }
+
+    /// An image, at the size it actually is.
+    ///
+    /// In a window rather than a browser: the file is already on disk in the
+    /// cache, and handing a Slack URL to a browser means handing it the
+    /// session cookie too.
+    fn view_image(&mut self, file_id: &str) {
+        let Some(texture) = self.shared.textures.borrow().get(file_id).cloned() else {
+            return;
+        };
+        let win = gtk::Window::new();
+        win.set_title(Some("Image"));
+        win.set_transient_for(self.window().as_ref());
+        win.add_css_class("picker");
+        let (w, h) = (texture.width(), texture.height());
+        // Big enough to be worth opening, never bigger than the screen.
+        let scale = (1400.0 / w as f64).min(900.0 / h as f64).min(1.0);
+        win.set_default_size((w as f64 * scale) as i32, (h as f64 * scale) as i32);
+        let picture = gtk::Picture::for_paintable(&texture);
+        picture.set_can_shrink(true);
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        win.set_child(Some(&picture));
+        {
+            let k = gtk::EventControllerKey::new();
+            let w2 = win.clone();
+            k.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    w2.close();
+                    return gtk::glib::Propagation::Stop;
+                }
+                gtk::glib::Propagation::Proceed
+            });
+            win.add_controller(k);
+        }
+        win.present();
+    }
+
     // ---- the side pane's lists -----------------------------------------
 
     /// Ask for a list and show the pane with a heading, so the pane opens

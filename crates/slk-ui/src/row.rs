@@ -39,6 +39,7 @@ const MORE: &[(&str, &str)] = &[
     ("Open first link", "open_link"),
     ("Save for later", "save"),
     ("Pin to conversation", "pin"),
+    ("View image", "view_image"),
     ("Download files", "download_files"),
 ];
 
@@ -69,6 +70,8 @@ pub struct Widgets {
     /// one; they read this instead.
     actions: gtk::Box,
     at: Rc<RefCell<String>>,
+    /// The image on this row, for the click that opens it.
+    file_of: Rc<RefCell<Option<String>>>,
     marks: gtk::Label,
     /// Avatar and the name/time line, hidden entirely when grouped.
     head: gtk::Box,
@@ -204,6 +207,9 @@ impl RelmListItem for Row {
             }
         }
         let at = Rc::new(RefCell::new(String::new()));
+        // Which image this pooled row is currently showing, for the click
+        // handler — the same problem `at` solves for the action bar.
+        let file_of: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         // The hover bar. An overlay rather than a row of its own, so nothing
         // moves when it appears: a bar that reflows the message under the
@@ -311,6 +317,23 @@ impl RelmListItem for Row {
             root.add_controller(motion);
         }
 
+        // An image opens at its own size. A click, not a button: the picture
+        // is the affordance, which is what every other client has taught
+        // people to expect.
+        {
+            let click = gtk::GestureClick::new();
+            let at = at.clone();
+            let shared_file = file_of.clone();
+            click.connect_released(move |_, _, _, _| {
+                let _ = &at;
+                if let Some(id) = shared_file.borrow().as_ref() {
+                    crate::app::image_clicked(id);
+                }
+            });
+            picture.add_controller(click);
+            picture.set_cursor_from_name(Some("zoom-in"));
+        }
+
         // Links in the body are the window's to route: a Slack permalink is
         // a jump inside the client, and everything else goes to the browser.
         body.connect_activate_link(|_, url| {
@@ -337,6 +360,7 @@ impl RelmListItem for Row {
                 breaks,
                 actions,
                 at,
+                file_of,
                 head,
                 avatar,
                 author,
@@ -476,6 +500,7 @@ impl RelmListItem for Row {
         // now, the texture when it arrives. The row asks for the fetch; the
         // engine does the I/O.
         w.file_id = None;
+        *w.file_of.borrow_mut() = None;
         w.picture.set_paintable(None::<&gtk::gdk::Paintable>);
         w.picture.set_visible(false);
         if let Some(f) = m.files.iter().find(|f| f.is_image()) {
@@ -513,6 +538,7 @@ impl RelmListItem for Row {
                     self.shared.need_image(&id, url);
                 }
             }
+            *w.file_of.borrow_mut() = Some(id.clone());
             w.file_id = Some(id);
         }
 

@@ -91,6 +91,7 @@ actions! {
     CopyLink       => "copy_link",       "Copy a link to the message",           "messages";
     OpenLink       => "open_link",       "Open the first link",                  "messages";
     DownloadFiles  => "download_files",  "Save this message's files",            "messages";
+    ViewImage      => "view_image",      "Open the image at its own size",       "messages";
     UploadFile     => "upload_file",     "Send a file",                          "messages";
     React          => "react",           "Add a reaction",                       "messages";
     ReactQuick1    => "react_1",         "React with the first quick emoji",     "messages";

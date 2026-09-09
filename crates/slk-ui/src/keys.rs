@@ -72,6 +72,7 @@ const DEFAULTS: &[(Action, &str)] = &[
     (Action::ReactQuick4, "<Alt>4"),
     (Action::ReactQuick5, "<Alt>5"),
     (Action::CloseThread, "<Alt>w"),
+    (Action::ViewImage, "<Alt>v"),
     (Action::ToggleSidebar, "<Control><Alt>b"),
     // The preset asks for these on alt+SHIFT+letter, which never arrives —
     // see `logic::bindable`. Control chords do, so that is what gets

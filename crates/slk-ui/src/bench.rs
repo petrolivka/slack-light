@@ -190,6 +190,8 @@ pub fn count_update(msg: &crate::app::Msg) {
         Scrolled { .. } => "Scrolled",
         Link(_) => "Link",
         ListPick(_) => "ListPick",
+        Dropped(_) => "Dropped",
+        ViewImage(_) => "ViewImage",
         SearchChanged(_) => "SearchChanged",
         SearchRun => "SearchRun",
         CompleteStep(_) => "CompleteStep",

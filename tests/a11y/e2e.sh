@@ -113,6 +113,20 @@ wtype -M ctrl k -m ctrl; sleep 0.4; wtype "engi"; sleep 0.3; wtype -k Return; sl
 wtype -M alt -k Home -m alt; sleep 1.0; wtype -M alt e -m alt; sleep 0.6
 check "editing somebody else's message is refused in words" "$( tree | grep -q 'only edit your own' && echo 1 || echo 0 )" "status=$(tree | grep -oE "label '[^']*'" | tail -2 | head -1)"
 
+# A slash command the workspace does not know must not eat what was typed.
+wtype "/nonsense here"; sleep 0.3; wtype -k Return; sleep 2.0
+check "an unknown slash command says so" "$( tree | grep -q 'not a command this workspace knows' && echo 1 || echo 0 )"
+check "and the text comes back to the composer" "$( grep -q '^slash_returned=/nonsense here$' "$LOG" && echo 1 || echo 0 )" "$(grep '^slash_returned=' "$LOG" | head -1)"
+wtype -M ctrl u -m ctrl; sleep 0.3
+
+# The image viewer, from the keyboard so the suite can see it. The demo's
+# second-newest message in #engineering is the screenshot.
+wtype -M alt g -m alt; sleep 0.5; wtype -M alt k -m alt; sleep 0.5
+wtype -M alt v -m alt; sleep 1.2
+check "alt-v opens the image at its own size" "$( tree | grep -q "window 'Image'" && echo 1 || echo 0 )" "$(tree | grep -oE "window '[^']*'" | tr '\n' ' ')"
+wtype -k Escape; sleep 0.5
+check "escape closes it" "$( tree | grep -q "window 'Image'" && echo 0 || echo 1 )"
+
 # The side pane's lists. One pane shows a thread, a search, a member list
 # or a profile, and each answers with the same five row shapes.
 wtype -M ctrl t -m ctrl; sleep 1.5

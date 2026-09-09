@@ -369,8 +369,38 @@ is on, filterable, arrows to move while the entry keeps the keyboard. It is
 why `keys::install` registers an action whether or not it got an
 accelerator: the two that GTK owns are still reachable by name.
 
+## 9. M2b, sixth block: files and slash commands
+
+**A slash command is not a message.** Anything shaped like `/word` at the
+start goes to the workspace, which is what Slack does — and what Slack also
+does is keep the text in the box when the command turns out not to exist.
+The engine now says so with `Event::SlashRejected`, carrying what was
+typed, and the window puts it back in the composer. A path is not a
+command: `/home/petr/notes.md is where` is a sentence, and so is `and/or`.
+
+**Files dropped on the window** are sent to the conversation, or to the
+thread if one is open — which is where the person was looking when they
+dropped them. The whole window is the drop target, because aiming at the
+composer is a thing people do only once.
+
+**An image opens at its own size**, in a window rather than a browser: the
+file is already on disk in the cache, and handing a Slack URL to a browser
+means handing it the session cookie too. Clicking the picture works, and so
+does alt-v — which is the point, because of what the harness cannot do.
+
+### What the test suite cannot see
+
+Hyprland has a dispatcher to move the pointer and none to click it, and
+`wtype` is a keyboard. **No pointer path is asserted by the suite**: the
+hover bar's buttons, the reaction chips, the thread link, the image. Two
+things keep that from being a hole. Every one of them goes through the same
+`Msg::RowAction` the keyboard uses, so the code under the pointer is the
+code under test; and where there was no keyboard equivalent — the image —
+one was added rather than left unreachable.
+
+Drag-and-drop has neither, and is verified by eye alone. It is written down
+here rather than implied by a green suite.
+
 ### What is left in M2b
 
 - **The idle repaint** (§2), and the memory budget decision
-- Files: drag-and-drop, and an in-window image viewer
-- Slash commands as commands rather than text
