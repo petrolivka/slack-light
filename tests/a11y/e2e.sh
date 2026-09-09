@@ -113,6 +113,29 @@ wtype -M ctrl k -m ctrl; sleep 0.4; wtype "engi"; sleep 0.3; wtype -k Return; sl
 wtype -M alt -k Home -m alt; sleep 1.0; wtype -M alt e -m alt; sleep 0.6
 check "editing somebody else's message is refused in words" "$( tree | grep -q 'only edit your own' && echo 1 || echo 0 )" "status=$(tree | grep -oE "label '[^']*'" | tail -2 | head -1)"
 
+# The side pane's lists. One pane shows a thread, a search, a member list
+# or a profile, and each answers with the same five row shapes.
+wtype -M ctrl t -m ctrl; sleep 1.5
+check "ctrl-t lists the threads with replies" "$( tree | grep -q '2 replies' && echo 1 || echo 0 )"
+wtype -M alt m -m alt; sleep 1.5
+check "alt-m lists who is in the conversation" "$( tree | grep -q "label 'alice'" && echo 1 || echo 0 )"
+wtype -M alt c -m alt; sleep 1.5
+check "alt-c offers the channels one could join" "$( tree | grep -q '#random' && echo 1 || echo 0 )"
+
+# Search: the query goes in the pane, so the results stay readable next to
+# the conversation they came from.
+wtype -M alt -k slash -m alt; sleep 1.0
+wtype "deploy"; sleep 0.4; wtype -k Return; sleep 2.0
+check "alt-/ searches and counts what it found" "$( tree | grep -qE "label '[0-9]+ results? for" && echo 1 || echo 0 )" "$(tree | grep -oE "label '[0-9]+ results?[^']*'" | head -1)"
+check "each hit says which conversation it is in" "$( tree | grep -q '#engineering' && echo 1 || echo 0 )"
+
+# A profile, from the message under the cursor.
+wtype -k Escape; sleep 0.4
+wtype -M alt k -m alt; sleep 0.4; wtype -M alt i -m alt; sleep 1.5
+check "alt-i shows who wrote it" "$( tree | grep -qE "label '(time zone|presence)'" && echo 1 || echo 0 )"
+wtype -k Escape; sleep 0.5
+check "escape closes the pane" "$( tree | grep -q "label 'presence'" && echo 0 || echo 1 )"
+
 # F1 is the shortcuts window, generated from the live keymap: an action with
 # no key has to say so rather than be missing.
 wtype -k F1; sleep 0.8

@@ -2415,6 +2415,7 @@ dependencies = [
  "relm4",
  "slk-config",
  "slk-core",
+ "slk-store",
  "slk-sync",
  "slk-theme",
  "tokio",

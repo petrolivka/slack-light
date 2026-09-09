@@ -140,6 +140,16 @@ pub struct Init {
     pub options: Options,
 }
 
+/// What the right-hand pane is showing. One pane rather than several,
+/// because a thread, a search result and a member list are all "the thing
+/// beside the conversation", and two of them would compete for the same width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Closed,
+    Thread,
+    List,
+}
+
 /// Which list the message cursor is in. Every message action reads it, so
 /// "react" in a thread cannot land on the conversation behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +182,11 @@ pub enum Msg {
     },
     /// A link inside a message was clicked.
     Link(String),
+    /// A row in the side pane's list was chosen.
+    ListPick(usize),
+    /// The side pane's search box changed or was submitted.
+    SearchChanged(String),
+    SearchRun,
     /// Move within, or accept, the completion list.
     CompleteStep(i32),
     CompleteAccept,
@@ -225,6 +240,15 @@ pub struct App {
     current: usize,
     open: Option<ChannelId>,
     list: TypedListView<Row, gtk::SingleSelection>,
+    /// What the side pane is showing.
+    side: Side,
+    /// The rows of the list it is showing, and what picking one does.
+    side_rows: Vec<slk_sync::ListTarget>,
+    side_list: gtk::ListBox,
+    side_scroller: gtk::ScrolledWindow,
+    search: gtk::Entry,
+    /// Whether the next search asks Slack or the offline index.
+    search_local: bool,
     /// The open thread's parent, and its replies.
     thread: Option<slk_core::Ts>,
     thread_list: TypedListView<Row, gtk::SingleSelection>,
@@ -777,6 +801,8 @@ impl SimpleComponent for App {
                                 },
                                 #[local_ref]
                                 follow -> gtk::ToggleButton {
+                                    #[watch]
+                                    set_visible: model.side == Side::Thread,
                                     set_can_focus: false,
                                     add_css_class: "flat",
                                     set_tooltip_text: Some("Follow this thread"),
@@ -796,8 +822,39 @@ impl SimpleComponent for App {
                             },
                             gtk::Box { add_css_class: "hairline" },
 
+                            // Search lives in the pane rather than in a
+                            // window of its own: results you can read while
+                            // still looking at the conversation are the
+                            // point of having a pane at all.
+                            #[local_ref]
+                            search -> gtk::Entry {
+                                set_visible: false,
+                                set_margin_all: 6,
+                                set_placeholder_text: Some("search…"),
+                                connect_changed[sender] => move |e| {
+                                    sender.input(Msg::SearchChanged(e.text().to_string()));
+                                },
+                                connect_activate[sender] => move |_| sender.input(Msg::SearchRun),
+                            },
+
+                            #[local_ref]
+                            side_scroller -> gtk::ScrolledWindow {
+                                set_vexpand: true,
+                                set_visible: false,
+                                set_hscrollbar_policy: gtk::PolicyType::Never,
+                                #[local_ref]
+                                side_list -> gtk::ListBox {
+                                    add_css_class: "sidelist",
+                                    connect_row_activated[sender] => move |_, row| {
+                                        sender.input(Msg::ListPick(row.index() as usize));
+                                    },
+                                },
+                            },
+
                             #[local_ref]
                             thread_scroller -> gtk::ScrolledWindow {
+                                #[watch]
+                                set_visible: model.side == Side::Thread,
                                 set_vexpand: true,
                                 set_hscrollbar_policy: gtk::PolicyType::Never,
                                 set_vscrollbar_policy: gtk::PolicyType::Always,
@@ -810,6 +867,8 @@ impl SimpleComponent for App {
                             gtk::Box {
                                 set_orientation: gtk::Orientation::Vertical,
                                 add_css_class: "composer",
+                                #[watch]
+                                set_visible: model.side == Side::Thread,
 
                                 gtk::ScrolledWindow {
                                     set_min_content_height: 34,
@@ -932,6 +991,12 @@ impl SimpleComponent for App {
             current: 0,
             open: None,
             list: TypedListView::new(),
+            side: Side::Closed,
+            side_rows: Vec::new(),
+            side_list: gtk::ListBox::new(),
+            side_scroller: gtk::ScrolledWindow::new(),
+            search: gtk::Entry::new(),
+            search_local: false,
             thread: None,
             thread_list: TypedListView::new(),
             thread_pane: gtk::Box::new(gtk::Orientation::Vertical, 0),
@@ -997,6 +1062,9 @@ impl SimpleComponent for App {
         let thread_scroller = &model.thread_scroller;
         let thread_composer = &model.thread_composer;
         let follow = &model.follow;
+        let side_list = &model.side_list;
+        let side_scroller = &model.side_scroller;
+        let search = &model.search;
         let broadcast = &model.broadcast;
         let conv_paned = &model.conv_paned;
         let sidebar = &model.sidebar;
@@ -1287,6 +1355,22 @@ impl SimpleComponent for App {
                 }
             }
             Msg::Link(url) => self.follow_link(&url, &sender),
+            Msg::ListPick(i) => self.pick(i, &sender),
+            // The entry is read when Enter is pressed, not per keystroke: a
+            // search that fires on every letter is a request per letter.
+            Msg::SearchChanged(_) => {}
+            Msg::SearchRun => {
+                let q = self.search.text().to_string();
+                if q.trim().is_empty() {
+                    return;
+                }
+                self.show_list("Searching…", Vec::new(), "asking…");
+                self.search.set_visible(true);
+                self.send(Command::Search {
+                    query: q,
+                    local: self.search_local,
+                });
+            }
             Msg::CompleteStep(d) => {
                 if d == 0 {
                     self.close_completions();
@@ -1592,6 +1676,59 @@ impl App {
                     }
                 }
             }
+            Event::List { title, items } => {
+                if is_current {
+                    self.show_list(&title, items, "nothing here");
+                }
+            }
+            Event::Profile(u) => {
+                if is_current {
+                    self.show_profile(&u);
+                }
+            }
+            Event::SearchResults { query, local, hits } => {
+                if !is_current {
+                    return;
+                }
+                let rows: Vec<slk_sync::ListRow> = hits
+                    .into_iter()
+                    .map(|h| {
+                        let who = h
+                            .user
+                            .as_ref()
+                            .and_then(|u| {
+                                self.shared
+                                    .names
+                                    .borrow()
+                                    .user(u.as_str())
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_default();
+                        slk_sync::ListRow {
+                            label: h.text.replace('\n', " "),
+                            note: format!("#{}  ·  {who}", h.channel_name),
+                            target: slk_sync::ListTarget::Message(h.channel, h.ts),
+                        }
+                    })
+                    .collect();
+                let title = format!(
+                    "{} {} for “{query}”",
+                    rows.len(),
+                    if rows.len() == 1 { "result" } else { "results" },
+                );
+                let title = if local {
+                    format!("{title}, offline")
+                } else {
+                    title
+                };
+                self.show_list(&title, rows, "nothing matched");
+                self.search.set_visible(true);
+            }
+            Event::OpenChannel(ch) => {
+                if is_current {
+                    self.open_channel(ch);
+                }
+            }
             Event::MessagesAround {
                 channel,
                 messages,
@@ -1841,7 +1978,13 @@ impl App {
             }
 
             "open_thread" => self.open_thread(sender),
-            "close_thread" => self.close_thread(),
+            "close_thread" => {
+                if self.thread.is_some() {
+                    self.close_thread();
+                } else {
+                    self.close_side();
+                }
+            }
             "follow_thread" => {
                 if let (Some(ch), Some(parent)) = (self.open.clone(), self.thread.clone()) {
                     self.send(Command::FollowThread {
@@ -1862,12 +2005,43 @@ impl App {
                 }
             }
             "upload_file" => self.pick_file(sender),
-            "search" | "search_local" | "threads" | "saved" | "mentions" | "members"
-            | "profile" | "browse_channels" | "editor" => {
-                // Named, bound, and listed in the shortcuts window — but not
-                // built yet. Saying so beats a key that does nothing, which
-                // reads as a broken client rather than an unfinished one.
-                self.say(format!("{name}: not in this build yet"));
+            "search" | "search_local" => {
+                self.search_local = name == "search_local";
+                self.show_list(
+                    if self.search_local {
+                        "Search what is downloaded"
+                    } else {
+                        "Search Slack"
+                    },
+                    Vec::new(),
+                    "type, then press enter",
+                );
+                self.search.set_visible(true);
+                self.search.grab_focus();
+            }
+            "threads" => self.request_list(Command::ListThreads, "Threads"),
+            "saved" => self.request_list(Command::ListSaved, "Saved for later"),
+            "mentions" => self.request_list(Command::ListMentions, "Mentions"),
+            "browse_channels" => self.request_list(Command::BrowseChannels, "Channels to join"),
+            "members" => {
+                if let Some(ch) = self.open.clone() {
+                    self.request_list(Command::ListMembers(ch), "Members");
+                }
+            }
+            "profile" => {
+                let who = self.cursor_message().and_then(|(_, m)| match m.author {
+                    slk_core::Author::User(id) => Some(id),
+                    _ => None,
+                });
+                match who {
+                    Some(id) => self.request_list(Command::ShowProfile(id), "Profile"),
+                    None => self.notice("no message selected — alt-Up picks one".into(), sender),
+                }
+            }
+            "editor" => {
+                // The one action with no meaning in a window: $EDITOR is a
+                // terminal escape hatch, and the composer already is one.
+                self.say("the composer is the editor here".into());
             }
 
             _ => self.message_action(name, sender),
@@ -1963,6 +2137,153 @@ impl App {
             other => self.say(format!("unbound action {other}")),
         }
     }
+    // ---- the side pane's lists -----------------------------------------
+
+    /// Ask for a list and show the pane with a heading, so the pane opens
+    /// now and fills when the answer arrives rather than appearing late.
+    fn request_list(&mut self, cmd: Command, title: &str) {
+        self.show_list(title, Vec::new(), "asking…");
+        self.send(cmd);
+    }
+
+    /// Put rows in the side pane. An empty list is a sentence, not a blank:
+    /// "nothing here" and "still loading" look identical otherwise.
+    fn show_list(&mut self, title: &str, mut rows: Vec<slk_sync::ListRow>, empty: &str) {
+        if rows.is_empty() {
+            rows.push(slk_sync::ListRow {
+                label: empty.to_string(),
+                note: String::new(),
+                target: slk_sync::ListTarget::Info,
+            });
+        }
+        if self.thread.is_some() {
+            self.close_thread();
+        }
+        self.side = Side::List;
+        self.thread_title.set_label(title);
+        self.side_scroller.set_visible(true);
+        self.thread_pane.set_visible(true);
+        let w = self.conv_paned.width();
+        if w > 320 {
+            self.conv_paned.set_position(w - 380.min(w / 2));
+        }
+
+        while let Some(child) = self.side_list.first_child() {
+            self.side_list.remove(&child);
+        }
+        self.side_rows = rows.iter().map(|r| r.target.clone()).collect();
+        for r in &rows {
+            let b = gtk::Box::new(gtk::Orientation::Vertical, 1);
+            b.set_margin_start(10);
+            b.set_margin_end(10);
+            b.set_margin_top(4);
+            b.set_margin_bottom(4);
+            let l = gtk::Label::new(Some(&r.label));
+            l.set_xalign(0.0);
+            l.set_wrap(true);
+            l.set_max_width_chars(44);
+            b.append(&l);
+            if !r.note.is_empty() {
+                let n = gtk::Label::new(Some(&r.note));
+                n.set_xalign(0.0);
+                n.add_css_class("note");
+                b.append(&n);
+            }
+            let row = gtk::ListBoxRow::new();
+            row.set_child(Some(&b));
+            row.set_selectable(!matches!(r.target, slk_sync::ListTarget::Info));
+            row.set_activatable(row.is_selectable());
+            self.side_list.append(&row);
+        }
+    }
+
+    /// What choosing a row does. Every list answers with the same five
+    /// shapes, so this is the only place that has to know.
+    fn pick(&mut self, i: usize, sender: &ComponentSender<Self>) {
+        use slk_sync::ListTarget::*;
+        let Some(target) = self.side_rows.get(i).cloned() else {
+            return;
+        };
+        match target {
+            Message(ch, ts) => {
+                self.open_channel(ch.clone());
+                self.send(Command::JumpToMessage(ch, ts));
+            }
+            Thread(ch, ts) => {
+                self.open_channel(ch.clone());
+                self.thread = Some(ts.clone());
+                self.thread_list.clear();
+                self.side = Side::Thread;
+                self.side_scroller.set_visible(false);
+                self.search.set_visible(false);
+                self.thread_title.set_label("Thread");
+                self.active = Pane::Thread;
+                self.send(Command::OpenThread(ch, ts));
+            }
+            User(id) => self.request_list(Command::ShowProfile(id), "Profile"),
+            Join(ch) => self.send(Command::Join(ch)),
+            Info => self.notice("that line is here to be read".into(), sender),
+        }
+    }
+
+    /// A profile, as the same list of readable lines every other answer is.
+    fn show_profile(&mut self, u: &slk_store::StoredUser) {
+        let row = |label: String| slk_sync::ListRow {
+            label,
+            note: String::new(),
+            target: slk_sync::ListTarget::Info,
+        };
+        let mut rows = vec![row(if u.real_name.is_empty() {
+            u.display_name.clone()
+        } else {
+            u.real_name.clone()
+        })];
+        for (what, value) in [
+            ("", u.display_name.clone()),
+            ("", u.title.clone()),
+            (
+                "status",
+                format!(
+                    "{} {}",
+                    slk_core::emoji::shortcode(u.status_emoji.trim_matches(':'), None)
+                        .unwrap_or_default(),
+                    u.status_text
+                )
+                .trim()
+                .to_string(),
+            ),
+            ("time zone", u.tz.clone().unwrap_or_default()),
+            ("presence", u.presence.clone()),
+        ] {
+            if value.is_empty() {
+                continue;
+            }
+            rows.push(slk_sync::ListRow {
+                label: value,
+                note: what.to_string(),
+                target: slk_sync::ListTarget::Info,
+            });
+        }
+        if u.is_bot {
+            rows.push(row("an app, not a person".into()));
+        }
+        if u.is_deleted {
+            rows.push(row("this account is deactivated".into()));
+        }
+        self.show_list("Profile", rows, "nobody");
+    }
+
+    /// Close whatever the side pane is showing.
+    fn close_side(&mut self) {
+        self.side = Side::Closed;
+        self.side_rows.clear();
+        self.search.set_text("");
+        self.search.set_visible(false);
+        self.side_scroller.set_visible(false);
+        self.thread_pane.set_visible(false);
+        self.composer.grab_focus();
+    }
+
     // ---- history -------------------------------------------------------
 
     /// Ask for the page before the oldest message on screen.
@@ -2337,6 +2658,9 @@ impl App {
         let parent = m.thread_ts.clone().unwrap_or_else(|| m.ts.clone());
         self.thread = Some(parent.clone());
         self.thread_list.clear();
+        self.side = Side::Thread;
+        self.side_scroller.set_visible(false);
+        self.search.set_visible(false);
         self.thread_title.set_label("Thread");
         self.follow.set_active(m.subscribed);
         self.refresh_follow_label();
@@ -2357,9 +2681,10 @@ impl App {
     fn close_thread(&mut self) {
         self.thread = None;
         self.thread_list.clear();
-        self.thread_pane.set_visible(false);
         self.active = Pane::Conv;
-        self.composer.grab_focus();
+        if self.side == Side::Thread {
+            self.close_side();
+        }
     }
 
     fn refresh_follow_label(&self) {
@@ -2384,6 +2709,8 @@ impl App {
             self.refresh_hint();
         } else if self.thread.is_some() {
             self.close_thread();
+        } else if self.side != Side::Closed {
+            self.close_side();
         } else {
             self.list
                 .selection_model

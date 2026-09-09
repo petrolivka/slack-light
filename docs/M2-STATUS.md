@@ -297,12 +297,39 @@ first page on screen 133–135 ms (it was 253–263 ms for all 5 007), frames
 over 20 ms while scrolling 2.2–2.9 %, private memory 57.5 MB, resident
 189–190 MB.
 
+## 7. M2b, fourth block: the lists
+
+The right-hand pane stopped being the thread pane and became **the** pane:
+a thread, a search, a member list and a profile are all "the thing beside
+the conversation", and two panes would compete for the same width.
+
+| Key | What the pane shows |
+|---|---|
+| alt-t / the `↳` link | the thread, with its own composer |
+| ctrl-t | threads with replies |
+| ctrl-d | saved for later |
+| alt-@ | messages that name you |
+| alt-m | who is in this conversation |
+| alt-i | who wrote the message under the cursor |
+| alt-c | public channels to join |
+| alt-/ , ctrl-f | search, Slack's own and the offline index |
+
+Every list answers with the same five row shapes — a message, a thread, a
+person, a channel to join, and a line that is only there to be read — so
+one function knows what choosing a row does and the engine decides
+nothing about presentation. An empty answer is a sentence ("nothing here",
+"nothing matched", "asking…"), because a blank pane cannot tell the reader
+whether it is empty or still loading.
+
+Search puts its query in the pane rather than in a window of its own: a
+result you can read while still looking at the conversation it came from
+is the whole reason to have a pane.
+
+`editor` — the terminal client's "edit this draft in $EDITOR" — is the one
+action that does not survive the pivot, and says so.
+
 ### What is left in M2b
 
-- **The lists**: search (both halves), threads, saved, mentions, members,
-  profiles, presence, browse-and-join. Each is bound, named in the
-  shortcuts window, and answers "not in this build yet" rather than doing
-  nothing
 - **Notifications**: the full policy, mark-read policies, gap fill
 - **The command palette**, which today shows the shortcuts window
 - **The idle repaint** (§2), and the memory budget decision

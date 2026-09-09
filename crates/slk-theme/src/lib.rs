@@ -347,6 +347,13 @@ window {{ background-color: @sl_bg; color: @sl_fg; font-size: 13px; }}
 .threadpane .composer {{ background-color: @sl_bg; }}
 .threadpane checkbutton {{ color: @sl_fg_dim; font-size: 11px; padding: 0 6px 4px 6px; }}
 
+/* The side pane's lists: search results, threads, saved, members. */
+.sidelist {{ background-color: @sl_bg_light; }}
+.sidelist row {{ border-radius: 5px; margin: 0 4px; }}
+.sidelist row:selected {{ background-color: alpha(@sl_accent, 0.22); }}
+.sidelist label {{ color: @sl_fg; font-size: 12px; }}
+.sidelist .note {{ color: @sl_fg_dim; font-size: 11px; }}
+
 /* Scrollback's own line, above the conversation. */
 .loading {{
     color: @sl_fg_dim; font-size: 11px; padding: 4px 12px;
