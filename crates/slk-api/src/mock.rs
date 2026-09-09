@@ -53,6 +53,8 @@ pub struct MockBackend {
     me_snoozed: Mutex<u32>,
     /// Conversations we have said we are typing in.
     typed: Mutex<Vec<ChannelId>>,
+    /// When set, every send fails as a transport error. For the outbox.
+    unreachable: std::sync::atomic::AtomicBool,
 }
 
 impl MockBackend {
@@ -91,6 +93,7 @@ impl MockBackend {
             me_status: Mutex::new((String::new(), String::new(), 0)),
             me_snoozed: Mutex::new(0),
             typed: Mutex::new(Vec::new()),
+            unreachable: std::sync::atomic::AtomicBool::new(false),
             users: Vec::new(),
             messages: Mutex::new(HashMap::new()),
             uploaded: Mutex::new(HashMap::new()),
@@ -102,6 +105,12 @@ impl MockBackend {
     }
 
     /// Emit a scripted message every `secs` seconds, for `--demo`.
+    /// Make sends fail as if the network were down, or stop.
+    pub fn set_unreachable(&self, on: bool) {
+        self.unreachable
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn with_live_stream(mut self, secs: u64) -> Self {
         self.live_every = secs;
         self
@@ -616,6 +625,33 @@ impl SlackBackend for MockBackend {
         _client_msg_id: &str,
         _broadcast: bool,
     ) -> Result<Ts> {
+        // Pretend the network is down. There is no other way to exercise the
+        // outbox: a real transport failure cannot be arranged in a test, and
+        // a queue that has never been drained is a queue nobody has tested.
+        if self.unreachable.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(SlackError::new(
+                "chat.postMessage",
+                ErrorKind::Transport,
+                "the demo workspace is pretending to be unreachable",
+            ));
+        }
+        // A channel this workspace does not have is a refusal, the way Slack
+        // answers `channel_not_found`. Accepting it would make the demo
+        // workspace more forgiving than the real one, which is the wrong
+        // direction for a mock to be wrong in.
+        if !self
+            .convs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.id.as_str() == ch.as_str())
+        {
+            return Err(SlackError::new(
+                "chat.postMessage",
+                ErrorKind::NotFound,
+                "channel_not_found",
+            ));
+        }
         // A plausible timestamp, monotonic within the run so ordering holds.
         let ts = Ts::new(format!(
             "{}.000100",

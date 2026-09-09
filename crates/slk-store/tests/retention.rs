@@ -139,3 +139,40 @@ fn stats_counts_what_is_there() {
     assert_eq!(st.messages, 2);
     assert!(st.oldest.is_some());
 }
+
+/// A draft in a thread is not the same draft as one in its channel.
+///
+/// Restoring the wrong one into the wrong composer is how a reply meant for
+/// three people lands in `#general`, so the key is (channel, thread) and the
+/// empty thread is a real value rather than a missing one.
+#[test]
+fn drafts_are_kept_per_thread_as_well_as_per_conversation() {
+    let store = slk_store::Store::open(None).expect("in-memory");
+    let team = slk_core::TeamId::new("T1");
+    let ch = slk_core::ChannelId::new("C1");
+    let parent = slk_core::Ts::new("1725701900.000100");
+
+    store
+        .set_draft(&team, &ch, None, "for the channel")
+        .unwrap();
+    store
+        .set_draft(&team, &ch, Some(&parent), "for the thread")
+        .unwrap();
+
+    assert_eq!(
+        store.draft(&team, &ch, None).unwrap().as_deref(),
+        Some("for the channel")
+    );
+    assert_eq!(
+        store.draft(&team, &ch, Some(&parent)).unwrap().as_deref(),
+        Some("for the thread")
+    );
+
+    // Sending clears one and leaves the other.
+    store.set_draft(&team, &ch, None, "   ").unwrap();
+    assert_eq!(store.draft(&team, &ch, None).unwrap(), None);
+    assert_eq!(
+        store.draft(&team, &ch, Some(&parent)).unwrap().as_deref(),
+        Some("for the thread")
+    );
+}

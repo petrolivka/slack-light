@@ -6,7 +6,7 @@
 //! undocumented shape, the fix is a migration over data we already hold rather
 //! than a re-fetch of everyone's history.
 
-pub const VERSION: i64 = 2;
+pub const VERSION: i64 = 3;
 
 /// Steps from an older store to the current one, applied in order.
 ///
@@ -15,7 +15,16 @@ pub const VERSION: i64 = 2;
 /// and the result was a client that started, connected, and showed "no
 /// conversations" with the reason only in a log nobody had enabled. Adding the
 /// step is cheaper than diagnosing that twice.
-pub const MIGRATIONS: &[(i64, &str)] = &[(2, "ALTER TABLE conversation ADD COLUMN peer TEXT;")];
+pub const MIGRATIONS: &[(i64, &str)] = &[
+    (2, "ALTER TABLE conversation ADD COLUMN peer TEXT;"),
+    (
+        3,
+        "CREATE TABLE IF NOT EXISTS outbox (team TEXT, local_id TEXT, channel TEXT,
+                                            thread_ts TEXT NOT NULL DEFAULT '',
+                                            text TEXT, broadcast INTEGER, queued_at INTEGER,
+                                            PRIMARY KEY (team, local_id));",
+    ),
+];
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE workspace (team TEXT PRIMARY KEY, name TEXT, domain TEXT, self_id TEXT,
@@ -55,6 +64,16 @@ CREATE TABLE draft (team TEXT, channel TEXT, thread_ts TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (team, channel, thread_ts));
 
 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+
+-- Messages typed while the connection was down. Held on disk rather than in
+-- memory: the point of queuing is that the message is not lost, and a client
+-- that loses it to a crash has kept the promise only in the easy case.
+-- `queued_at` is the whole order guarantee — FR-H9 says "in order", and out
+-- of order is worse than late in a conversation.
+CREATE TABLE outbox (team TEXT, local_id TEXT, channel TEXT,
+                     thread_ts TEXT NOT NULL DEFAULT '',
+                     text TEXT, broadcast INTEGER, queued_at INTEGER,
+                     PRIMARY KEY (team, local_id));
 
 CREATE VIRTUAL TABLE message_fts USING fts5(text, content='message', content_rowid='rowid',
                                             tokenize='unicode61 remove_diacritics 2');

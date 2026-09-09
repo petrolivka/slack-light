@@ -251,6 +251,11 @@ struct WorkspaceState {
     commands: mpsc::Sender<Command>,
     convs: Vec<SidebarEntry>,
     connected: bool,
+    /// Whether this workspace has ever been connected. "Connecting" and
+    /// "offline" are different states and mean different things to the
+    /// person reading them: one is "wait", the other is "what you can see is
+    /// what is cached".
+    was_connected: bool,
 }
 
 pub struct App {
@@ -282,6 +287,10 @@ pub struct App {
     follow: gtk::ToggleButton,
     broadcast: gtk::CheckButton,
     conv_paned: gtk::Paned,
+    main_paned: gtk::Paned,
+    /// What the window looked like, kept up to date as it changes so that
+    /// closing it is a write rather than a survey.
+    session: Rc<RefCell<slk_config::session::Session>>,
     active: Pane,
     /// The message being edited, if the composer is holding one.
     editing: Option<slk_core::Ts>,
@@ -495,6 +504,10 @@ impl App {
             })
             .unwrap_or_default();
         self.open = Some(id.clone());
+        // Where to come back to next time. Best effort by design — failing to
+        // remember is not worth a message, and the next start simply opens
+        // the first conversation as it always did.
+        self.send(Command::Remember(id.as_str().to_string()));
         self.list.clear();
         // A thread belongs to the conversation it is in.
         if self.thread.is_some() {
@@ -515,6 +528,7 @@ impl App {
         }
         self.stash_draft();
         self.current = i;
+        self.session.borrow_mut().workspace = self.workspaces[i].name.clone();
         self.open = None;
         self.list.clear();
         self.window_title = format!("slack-light — {}", self.workspaces[i].name);
@@ -718,7 +732,8 @@ impl SimpleComponent for App {
                     set_orientation: gtk::Orientation::Vertical,
                     set_hexpand: true,
 
-                    gtk::Paned {
+                    #[local_ref]
+                    main_paned -> gtk::Paned {
                         set_orientation: gtk::Orientation::Horizontal,
                         set_position: model.options.sidebar_width,
                         set_vexpand: true,
@@ -1085,13 +1100,31 @@ impl SimpleComponent for App {
             .first()
             .map(|w| w.name.clone())
             .unwrap_or_default();
+        // Read once, here, before the window exists: a file read on the main
+        // loop would be rule 3, a file read before there is a loop is not.
+        let session = slk_config::session::Session::load();
         let model = App {
             runtime,
             media_dir,
             options: Options {
-                width: config.window.width,
-                height: config.window.height,
-                sidebar_width: config.window.sidebar_width,
+                // `[window]` in the config is the default; the session file is
+                // where the window was actually left. A size the person chose
+                // by dragging beats one they set once and forgot.
+                width: if session.width > 200 {
+                    session.width
+                } else {
+                    config.window.width
+                },
+                height: if session.height > 200 {
+                    session.height
+                } else {
+                    config.window.height
+                },
+                sidebar_width: if session.sidebar_width > 80 {
+                    session.sidebar_width
+                } else {
+                    config.window.sidebar_width
+                },
                 ..options
             },
             read_only,
@@ -1104,8 +1137,11 @@ impl SimpleComponent for App {
                     commands: w.commands,
                     convs: Vec::new(),
                     connected: false,
+                    was_connected: false,
                 })
                 .collect(),
+            // The workspace that was open last time, by name: an index would
+            // point at a different workspace the moment one is added.
             current: 0,
             open: None,
             list: TypedListView::new(),
@@ -1124,6 +1160,8 @@ impl SimpleComponent for App {
             follow: gtk::ToggleButton::new(),
             broadcast: gtk::CheckButton::new(),
             conv_paned: gtk::Paned::new(gtk::Orientation::Horizontal),
+            main_paned: gtk::Paned::new(gtk::Orientation::Horizontal),
+            session: Rc::new(RefCell::new(session)),
             active: Pane::Conv,
             editing: None,
             history: Vec::new(),
@@ -1205,6 +1243,7 @@ impl SimpleComponent for App {
         let search = &model.search;
         let broadcast = &model.broadcast;
         let conv_paned = &model.conv_paned;
+        let main_paned = &model.main_paned;
         let sidebar = &model.sidebar;
         let sidebar_box = &model.sidebar_box;
         let rail = &model.rail;
@@ -1410,6 +1449,44 @@ impl SimpleComponent for App {
                     })
                     .ok();
             }
+        }
+
+        // The workspace that was open last time. Set after the model exists
+        // rather than in the initialiser, because it is a lookup over the
+        // list the initialiser is building.
+        let mut model = model;
+        if !model.session.borrow().workspace.is_empty() {
+            let want = model.session.borrow().workspace.clone();
+            if let Some(i) = model.workspaces.iter().position(|w| w.name == want) {
+                model.current = i;
+                model.window_title = format!("slack-light — {}", model.workspaces[i].name);
+            }
+        }
+
+        // What the window looked like, written as it closes. The closure owns
+        // everything it needs rather than sending a message: a message from
+        // `close_request` races the window going away, and an update that is
+        // never delivered writes nothing.
+        {
+            let keep = model.session.clone();
+            let sidebar = model.main_paned.clone();
+            let side = model.conv_paned.clone();
+            let w = root.clone();
+            root.connect_close_request(move |_| {
+                let mut s = keep.borrow_mut();
+                s.width = w.width().max(0);
+                s.height = w.height().max(0);
+                s.sidebar_width = sidebar.position();
+                // Zero when no side pane was open, which `load` reads as "use
+                // the default" rather than as a pane of no width.
+                s.thread_width = if side.end_child().is_some_and(|c| c.is_visible()) {
+                    side.position()
+                } else {
+                    0
+                };
+                s.save();
+                gtk::glib::Propagation::Proceed
+            });
         }
 
         // Keys: the preset's chords as accelerators on application actions.
@@ -1755,6 +1832,7 @@ impl App {
             }
             Event::Connected => {
                 self.workspaces[idx].connected = true;
+                self.workspaces[idx].was_connected = true;
                 self.rebuild_rail();
                 if is_current {
                     self.refresh_status();
@@ -1771,6 +1849,54 @@ impl App {
                     "{}: session expired — run `slack-light auth add`",
                     self.workspaces[idx].name
                 ));
+            }
+            Event::Draft {
+                channel,
+                thread,
+                text,
+            } => {
+                // Only into an empty composer, and only if that conversation
+                // is still the one on screen. A draft that arrives a moment
+                // after somebody starts typing must not overwrite them.
+                if !is_current || self.open.as_ref() != Some(&channel) {
+                    return;
+                }
+                let view = match &thread {
+                    Some(t) if self.thread.as_ref() == Some(t) => &self.thread_composer,
+                    Some(_) => return,
+                    None => &self.composer,
+                };
+                let buf = view.buffer();
+                let (a, b) = buf.bounds();
+                if !buf.text(&a, &b, false).trim().is_empty() {
+                    return;
+                }
+                self.inserting.set(true);
+                buf.set_text(&text);
+                buf.place_cursor(&buf.end_iter());
+                self.inserting.set(false);
+                if thread.is_none() {
+                    self.drafts.insert(channel, text);
+                }
+            }
+            Event::Restore(channel) => {
+                // Offered once, at boot, and only taken if nothing has been
+                // opened yet: a restore that fires after the user has clicked
+                // somewhere is a client that will not stay where it is put.
+                if !is_current || self.open.is_some() {
+                    return;
+                }
+                // Read before opening: opening a conversation closes whatever
+                // thread was open, and closing one forgets it.
+                let want = self.session.borrow().thread.clone();
+                if let Some(i) = self.convs().iter().position(|c| c.id == channel) {
+                    self.select_conv(i);
+                }
+                if let Some((ch, ts)) = want.split_once('/') {
+                    if ch == channel.as_str() {
+                        self.show_thread(channel, slk_core::Ts::new(ts));
+                    }
+                }
             }
             Event::Notice(t) => {
                 if is_current {
@@ -2155,7 +2281,11 @@ impl App {
                     Err(e) => tracing::warn!("texture {file_id}: {e}"),
                 }
             }
-            _ => {}
+            // No catch-all. In M2 `Event::Notify` fell through one of these
+            // and notifications simply never happened — the compiler had
+            // nothing to say, because a catch-all is a promise that every
+            // future variant is uninteresting. Adding an event should break
+            // this match.
         }
     }
 
@@ -2189,8 +2319,13 @@ impl App {
             self.status = "no workspace".into();
             return;
         };
+        // FR-H9: a conversation that is readable from the cache has to say
+        // so, or somebody replies to a thread that ended an hour ago and
+        // wonders why nothing sends.
         self.status = if w.connected {
             format!("✓ connected · {}", w.name)
+        } else if w.was_connected {
+            format!("(offline) · {} · showing what is cached", w.name)
         } else {
             format!("connecting · {}", w.name)
         };
@@ -2756,17 +2891,7 @@ impl App {
                 self.open_channel(ch.clone());
                 self.send(Command::JumpToMessage(ch, ts));
             }
-            Thread(ch, ts) => {
-                self.open_channel(ch.clone());
-                self.thread = Some(ts.clone());
-                self.thread_list.clear();
-                self.side = Side::Thread;
-                self.side_scroller.set_visible(false);
-                self.search.set_visible(false);
-                self.thread_title.set_label("Thread");
-                self.active = Pane::Thread;
-                self.send(Command::OpenThread(ch, ts));
-            }
+            Thread(ch, ts) => self.show_thread(ch, ts),
             User(id) => self.request_list(Command::ShowProfile(id), "Profile"),
             Join(ch) => self.send(Command::Join(ch)),
             Info => self.notice("that line is here to be read".into(), sender),
@@ -3071,6 +3196,12 @@ impl App {
     }
 
     /// Keep what was typed and not sent, per conversation.
+    /// Keep the composer's contents, in memory and on disk.
+    ///
+    /// On disk through the engine, because the store is the engine's and the
+    /// main thread does no I/O (CONTRIBUTING rule 3). Called when the
+    /// conversation changes and when the window closes — not per keystroke,
+    /// which would be a write per character.
     fn stash_draft(&mut self) {
         let Some(ch) = self.open.clone() else { return };
         let buf = self.composer.buffer();
@@ -3079,7 +3210,24 @@ impl App {
         if text.trim().is_empty() {
             self.drafts.remove(&ch);
         } else {
-            self.drafts.insert(ch, text);
+            self.drafts.insert(ch.clone(), text.clone());
+        }
+        self.send(Command::SetDraft {
+            channel: ch,
+            thread: None,
+            text,
+        });
+        // The thread pane has a composer of its own, and its draft is a
+        // different draft: restoring one into the other is how a reply meant
+        // for three people lands in a channel.
+        if let (Some(ch), Some(parent)) = (self.open.clone(), self.thread.clone()) {
+            let buf = self.thread_composer.buffer();
+            let (a, b) = buf.bounds();
+            self.send(Command::SetDraft {
+                channel: ch,
+                thread: Some(parent),
+                text: buf.text(&a, &b, false).to_string(),
+            });
         }
     }
 
@@ -3227,6 +3375,7 @@ impl App {
         // A reply opens its own parent's thread, not a thread of its own.
         let parent = m.thread_ts.clone().unwrap_or_else(|| m.ts.clone());
         self.thread = Some(parent.clone());
+        self.session.borrow_mut().thread = format!("{}/{}", ch.as_str(), parent.as_str());
         self.thread_list.clear();
         self.side = Side::Thread;
         self.side_scroller.set_visible(false);
@@ -3247,14 +3396,37 @@ impl App {
     /// `GtkPaned` position is expressed.
     fn split(&self) {
         let w = self.conv_paned.width();
-        if w >= 560 {
+        // Where it was left, if that still fits this window. A remembered
+        // width from a maximised session must not push the conversation off
+        // a half-screen tile — the M2 defect, in a different disguise.
+        let kept = self.session.borrow().thread_width;
+        if kept > 200 && kept < w - 260 {
+            self.conv_paned.set_position(kept);
+        } else if w >= 560 {
             self.conv_paned.set_position(w - 380.min(w - 300));
         } else if w > 160 {
             self.conv_paned.set_position(w / 2);
         }
     }
 
+    /// Open a thread named from somewhere other than the message cursor — a
+    /// list row, or the one that was open when the client last closed.
+    fn show_thread(&mut self, ch: ChannelId, ts: slk_core::Ts) {
+        self.open_channel(ch.clone());
+        self.thread = Some(ts.clone());
+        self.session.borrow_mut().thread = format!("{}/{}", ch.as_str(), ts.as_str());
+        self.thread_list.clear();
+        self.side = Side::Thread;
+        self.side_scroller.set_visible(false);
+        self.search.set_visible(false);
+        self.thread_title.set_label("Thread");
+        self.active = Pane::Thread;
+        self.split();
+        self.send(Command::OpenThread(ch, ts));
+    }
+
     fn close_thread(&mut self) {
+        self.session.borrow_mut().thread.clear();
         self.thread = None;
         self.thread_list.clear();
         self.active = Pane::Conv;

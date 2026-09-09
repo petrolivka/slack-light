@@ -2,6 +2,7 @@
 
 pub mod action;
 pub mod keys;
+pub mod session;
 
 pub use action::Action;
 pub use keys::{Chord, Keymap, Mode};

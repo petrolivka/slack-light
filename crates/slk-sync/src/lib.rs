@@ -113,6 +113,13 @@ pub enum Command {
     Typing(ChannelId),
     /// Set our own presence: `true` active, `false` away.
     Presence(bool),
+    /// Keep what is in a composer, so a restart does not lose it. Sent when
+    /// the composer loses its conversation, not on every keystroke.
+    SetDraft {
+        channel: ChannelId,
+        thread: Option<Ts>,
+        text: String,
+    },
     /// Star this conversation, or unstar it.
     Star {
         channel: ChannelId,
@@ -223,6 +230,12 @@ pub enum Event {
     OpenChannel(ChannelId),
     /// Where this workspace was left last time, if anywhere.
     Restore(ChannelId),
+    /// What was in this composer when the client last closed.
+    Draft {
+        channel: ChannelId,
+        thread: Option<Ts>,
+        text: String,
+    },
     /// A link, ready to put on the clipboard.
     Permalink {
         channel: ChannelId,
@@ -362,6 +375,7 @@ impl Engine {
         let mut rt = match self.backend.connect(&watch).await {
             Ok(stream) => {
                 self.emit(Event::Connected).await;
+                self.flush_outbox().await;
                 stream
             }
             Err(e) => {
@@ -375,9 +389,20 @@ impl Engine {
         // network — so this is a routine path, not an error path.
         let mut backoff = Duration::from_secs(1);
         let mut retry_at: Option<Instant> = None;
+        // The outbox needs a heartbeat as well as a reconnect. A send can
+        // fail on the network while the websocket stays up — a proxy hiccup,
+        // a laptop switching to a different network — and then nothing ever
+        // reconnects, so nothing ever retries, and a message waits for ever
+        // in a client that looks perfectly connected. Found by a test that
+        // made sends fail without dropping the socket.
+        let mut retry_queued = tokio::time::interval(Duration::from_secs(20));
+        retry_queued.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
+                _ = retry_queued.tick() => {
+                    self.flush_outbox().await;
+                }
                 cmd = cmds.recv() => {
                     let Some(cmd) = cmd else { return Ok(()) };
                     if matches!(cmd, Command::Shutdown) {
@@ -429,6 +454,10 @@ impl Engine {
                             rt = stream;
                             backoff = Duration::from_secs(1);
                             self.emit(Event::Connected).await;
+                            // Before the gap fill, so what the user typed
+                            // while offline goes ahead of what arrived while
+                            // they were.
+                            self.flush_outbox().await;
                             // Whatever arrived while the socket was down did
                             // not arrive as an event, so it has to be fetched.
                             self.fill_gaps().await;
@@ -808,6 +837,88 @@ impl Engine {
                     .find(|u| u.label.to_lowercase().starts_with(&want.to_lowercase()))
             })
             .map(|u| u.id.clone())
+    }
+
+    /// Send everything that was typed while the connection was down, oldest
+    /// first, stopping at the first one that fails.
+    ///
+    /// Stopping matters: FR-H9 promises order, and skipping past a message
+    /// that will not go and sending the next one delivers a conversation in
+    /// the wrong sequence. Better to wait than to reorder somebody's words.
+    async fn flush_outbox(&mut self) {
+        let waiting = self.store.outbox(&self.team).unwrap_or_default();
+        if waiting.is_empty() {
+            return;
+        }
+        let total = waiting.len();
+        let mut sent = 0;
+        for q in waiting {
+            match self
+                .backend
+                .post(
+                    &q.channel,
+                    q.thread.as_ref(),
+                    &q.text,
+                    &q.local_id,
+                    q.broadcast,
+                )
+                .await
+            {
+                Ok(ts) => {
+                    let _ = self.store.dequeue(&self.team, &q.local_id);
+                    sent += 1;
+                    let raw = serde_json::json!({
+                        "type": "message",
+                        "user": self.self_id.as_str(),
+                        "ts": ts.as_str(),
+                        "text": q.text,
+                    });
+                    if let Some(mut m) = Message::parse(&self.team, &q.channel, &self.self_id, &raw)
+                    {
+                        m.thread_ts = q.thread.clone();
+                        self.store_page(std::slice::from_ref(&m));
+                        self.emit(Event::Upserted {
+                            channel: q.channel.clone(),
+                            message: Box::new(m),
+                            replaces: Some(Ts::new(format!("local:{}", q.local_id))),
+                        })
+                        .await;
+                    }
+                }
+                // Slack refused this one for a reason that will not change
+                // by waiting: drop it from the queue and mark the row failed,
+                // rather than blocking every message behind it for ever.
+                Err(e) if e.kind != slk_api::ErrorKind::Transport => {
+                    let _ = self.store.dequeue(&self.team, &q.local_id);
+                    let raw = serde_json::json!({
+                        "type": "message",
+                        "user": self.self_id.as_str(),
+                        "ts": format!("local:{}", q.local_id),
+                        "text": q.text,
+                    });
+                    if let Some(mut m) = Message::parse(&self.team, &q.channel, &self.self_id, &raw)
+                    {
+                        m.thread_ts = q.thread.clone();
+                        m.delivery = Delivery::Failed(e.user_message());
+                        self.emit(Event::Upserted {
+                            channel: q.channel.clone(),
+                            message: Box::new(m),
+                            replaces: Some(Ts::new(format!("local:{}", q.local_id))),
+                        })
+                        .await;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if sent > 0 {
+            self.emit(Event::Notice(if sent == total {
+                format!("sent {sent} queued message(s)")
+            } else {
+                format!("sent {sent} of {total} queued; the rest are still waiting")
+            }))
+            .await;
+        }
     }
 
     async fn push_sidebar(&mut self) {
@@ -1207,6 +1318,19 @@ impl Engine {
                 Err(e) => self.emit(Event::Notice(e.user_message())).await,
             },
 
+            Command::SetDraft {
+                channel,
+                thread,
+                text,
+            } => {
+                if let Err(e) = self
+                    .store
+                    .set_draft(&self.team, &channel, thread.as_ref(), &text)
+                {
+                    warn!("keeping a draft: {e:#}");
+                }
+            }
+
             Command::Typing(ch) => {
                 // Never worth a notice and never worth a retry: an indicator
                 // that arrives late is worse than one that does not arrive.
@@ -1508,6 +1632,16 @@ impl Engine {
 
     async fn open(&mut self, ch: ChannelId) {
         self.focused = Some(ch.clone());
+        // Before the messages, so the composer is filled by the time the
+        // conversation is on screen rather than a beat after it.
+        if let Ok(Some(text)) = self.store.draft(&self.team, &ch, None) {
+            self.emit(Event::Draft {
+                channel: ch.clone(),
+                thread: None,
+                text,
+            })
+            .await;
+        }
         // Cached first: the pane fills before any request is made.
         if let Ok(cached) =
             self.store
@@ -1569,6 +1703,14 @@ impl Engine {
     }
 
     async fn open_thread(&mut self, ch: ChannelId, parent: Ts) {
+        if let Ok(Some(text)) = self.store.draft(&self.team, &ch, Some(&parent)) {
+            self.emit(Event::Draft {
+                channel: ch.clone(),
+                thread: Some(parent.clone()),
+                text,
+            })
+            .await;
+        }
         if let Ok(cached) = self.store.thread(&self.team, &ch, &self.self_id, &parent) {
             if !cached.is_empty() {
                 self.emit(Event::Thread {
@@ -1650,6 +1792,23 @@ impl Engine {
                 }
             }
             Err(e) => {
+                // A network failure is not a refusal. Slack saying no —
+                // archived channel, no permission, rate limit — must be shown
+                // as failed and never retried; a connection that is not there
+                // is worth waiting out, and FR-H9 says the message waits in
+                // order rather than being lost.
+                let queued = e.kind == slk_api::ErrorKind::Transport
+                    && self
+                        .store
+                        .enqueue(
+                            &self.team,
+                            &local_id,
+                            &channel,
+                            thread.as_ref(),
+                            &text,
+                            broadcast,
+                        )
+                        .is_ok();
                 let raw = serde_json::json!({
                     "type": "message",
                     "user": self.self_id.as_str(),
@@ -1657,7 +1816,15 @@ impl Engine {
                     "text": text,
                 });
                 if let Some(mut m) = Message::parse(&self.team, &channel, &self.self_id, &raw) {
-                    m.delivery = Delivery::Failed(e.user_message());
+                    m.thread_ts = thread;
+                    m.delivery = if queued {
+                        // Still pending, because it still will be sent. A row
+                        // marked failed that then arrives is worse than one
+                        // that says it is waiting.
+                        Delivery::Pending(local_id.clone())
+                    } else {
+                        Delivery::Failed(e.user_message())
+                    };
                     self.emit(Event::Upserted {
                         channel,
                         message: Box::new(m),
@@ -1665,8 +1832,12 @@ impl Engine {
                     })
                     .await;
                 }
-                self.emit(Event::Notice(format!("not sent: {}", e.user_message())))
-                    .await;
+                self.emit(Event::Notice(if queued {
+                    "offline — queued, and sent when the connection is back".into()
+                } else {
+                    format!("not sent: {}", e.user_message())
+                }))
+                .await;
             }
         }
     }

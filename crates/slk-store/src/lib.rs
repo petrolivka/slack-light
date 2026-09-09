@@ -538,6 +538,65 @@ impl Store {
         Ok(missing)
     }
 
+    // ---- the outbox ----------------------------------------------------
+
+    /// Hold a message that could not be sent. Idempotent on `local_id`, so a
+    /// retry that fails again does not queue it twice.
+    pub fn enqueue(
+        &self,
+        team: &TeamId,
+        local_id: &str,
+        ch: &ChannelId,
+        thread: Option<&Ts>,
+        text: &str,
+        broadcast: bool,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO outbox (team, local_id, channel, thread_ts, text, broadcast, queued_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(team, local_id) DO NOTHING",
+            params![
+                team.as_str(),
+                local_id,
+                ch.as_str(),
+                thread.map(Ts::as_str).unwrap_or(""),
+                text,
+                broadcast,
+                now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Everything waiting, oldest first. Order is the promise.
+    pub fn outbox(&self, team: &TeamId) -> Result<Vec<Queued>> {
+        let mut st = self.db.prepare(
+            "SELECT local_id, channel, thread_ts, text, broadcast FROM outbox
+             WHERE team = ?1 ORDER BY queued_at, rowid",
+        )?;
+        let rows = st
+            .query_map(params![team.as_str()], |r| {
+                let thread: String = r.get(2)?;
+                Ok(Queued {
+                    local_id: r.get(0)?,
+                    channel: ChannelId::new(r.get::<_, String>(1)?),
+                    thread: (!thread.is_empty()).then(|| Ts::new(thread)),
+                    text: r.get(3)?,
+                    broadcast: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn dequeue(&self, team: &TeamId, local_id: &str) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM outbox WHERE team = ?1 AND local_id = ?2",
+            params![team.as_str(), local_id],
+        )?;
+        Ok(())
+    }
+
     // ---- conversation flags --------------------------------------------
 
     pub fn set_starred(&self, team: &TeamId, ch: &ChannelId, on: bool) -> Result<()> {
@@ -678,30 +737,49 @@ impl Store {
 
     // ---- drafts and session state --------------------------------------
 
-    pub fn set_draft(&self, team: &TeamId, ch: &ChannelId, text: &str) -> Result<()> {
-        if text.is_empty() {
+    /// Keep what somebody typed and did not send.
+    ///
+    /// Per conversation *and* per thread: a reply half-written in a thread is
+    /// not the same draft as one half-written in the channel, and restoring
+    /// the wrong one into the wrong composer is how a thread reply ends up in
+    /// `#general`.
+    pub fn set_draft(
+        &self,
+        team: &TeamId,
+        ch: &ChannelId,
+        thread: Option<&Ts>,
+        text: &str,
+    ) -> Result<()> {
+        let thread = thread.map(Ts::as_str).unwrap_or("");
+        if text.trim().is_empty() {
             self.db.execute(
-                "DELETE FROM draft WHERE team = ?1 AND channel = ?2 AND thread_ts = ''",
-                params![team.as_str(), ch.as_str()],
+                "DELETE FROM draft WHERE team = ?1 AND channel = ?2 AND thread_ts = ?3",
+                params![team.as_str(), ch.as_str(), thread],
             )?;
-        } else {
-            self.db.execute(
-                "INSERT INTO draft (team, channel, thread_ts, text, updated_at)
-                 VALUES (?1, ?2, '', ?3, ?4)
-                 ON CONFLICT(team, channel, thread_ts)
-                 DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at",
-                params![team.as_str(), ch.as_str(), text, now()],
-            )?;
+            return Ok(());
         }
+        self.db.execute(
+            "INSERT INTO draft (team, channel, thread_ts, text, updated_at)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(team, channel, thread_ts) DO UPDATE SET
+               text = excluded.text, updated_at = excluded.updated_at",
+            params![team.as_str(), ch.as_str(), thread, text, now()],
+        )?;
         Ok(())
     }
 
-    pub fn draft(&self, team: &TeamId, ch: &ChannelId) -> Result<Option<String>> {
+    pub fn draft(
+        &self,
+        team: &TeamId,
+        ch: &ChannelId,
+        thread: Option<&Ts>,
+    ) -> Result<Option<String>> {
+        let thread = thread.map(Ts::as_str).unwrap_or("");
         Ok(self
             .db
             .query_row(
-                "SELECT text FROM draft WHERE team = ?1 AND channel = ?2 AND thread_ts = ''",
-                params![team.as_str(), ch.as_str()],
+                "SELECT text FROM draft WHERE team = ?1 AND channel = ?2 AND thread_ts = ?3",
+                params![team.as_str(), ch.as_str(), thread],
                 |r| r.get(0),
             )
             .optional()?)
@@ -867,6 +945,16 @@ pub struct CountUpdate {
     pub latest: Option<Ts>,
     pub unread: u32,
     pub mentions: u32,
+}
+
+/// One message waiting for the connection to come back.
+#[derive(Debug, Clone)]
+pub struct Queued {
+    pub local_id: String,
+    pub channel: ChannelId,
+    pub thread: Option<Ts>,
+    pub text: String,
+    pub broadcast: bool,
 }
 
 /// What the sidebar needs, without paying to rebuild whole `Conversation`s.
