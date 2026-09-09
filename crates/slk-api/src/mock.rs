@@ -515,6 +515,7 @@ impl SlackBackend for MockBackend {
             conversations,
             users: self.users.clone(),
             muted,
+            notify: Vec::new(),
         })
     }
 

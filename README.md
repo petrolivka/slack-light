@@ -80,6 +80,33 @@ in the OS keyring when one exists, otherwise in a file only you can read.
 retention limits now, `cache purge` deletes it, and `--no-cache` never
 writes one.
 
+## In your status bar
+
+There is no tray on a Wayland desktop, so the unread count lives wherever you
+put it. `slack-light unread --json` answers in waybar's shape, from the
+running client when there is one and from the cache when there is not — and
+says which, because a module that prints nothing looks broken and one that
+prints a stale number without saying so is worse.
+
+```jsonc
+// ~/.config/waybar/config
+"custom/slack": {
+    "exec": "slack-light unread --json",
+    "return-type": "json",
+    "interval": 5,
+    "on-click": "slack-light",
+    "format": "󰒱 {}"
+}
+```
+
+```css
+/* stale is the class it sets when the client is not running */
+#custom-slack.stale { opacity: 0.5; }
+```
+
+`slack-light status` is the one-line version, and `slack-light send #general
+"back in ten"` posts through the running client without touching the window.
+
 ## Building
 
 ```bash

@@ -132,10 +132,24 @@ impl Store {
     }
 
     /// Every conversation we know about, newest activity first, for the sidebar.
+    /// Every workspace the cache knows about.
+    ///
+    /// For reading counts without connecting: `slack-light unread` runs from
+    /// a status bar every few seconds and must not need credentials, a
+    /// network, or a window.
+    pub fn teams(&self) -> Result<Vec<TeamId>> {
+        let mut st = self.db.prepare("SELECT team FROM workspace")?;
+        let rows = st
+            .query_map([], |r| Ok(TeamId::new(r.get::<_, String>(0)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn conversations(&self, team: &TeamId) -> Result<Vec<StoredConversation>> {
         let mut st = self.db.prepare(
             "SELECT id, kind, name, topic, is_member, is_muted, last_read, latest, unread,
-                    mentions, peer, is_starred, team, coalesce(purpose, ''), member_count
+                    mentions, peer, is_starred, team, coalesce(purpose, ''), member_count,
+                    coalesce(notify, '')
              FROM conversation WHERE team = ?1 AND is_archived = 0
              ORDER BY (latest IS NULL), latest DESC, name",
         )?;
@@ -157,6 +171,16 @@ impl Store {
                     team: TeamId::new(r.get::<_, String>(12)?),
                     purpose: r.get::<_, String>(13)?,
                     member_count: r.get::<_, Option<u32>>(14)?,
+                    // Stored as the enum's own `Debug` name, which is what
+                    // `upsert_conversations` writes. An unknown string is
+                    // `Default`, not an error: the column predates the
+                    // preference being read at all.
+                    notify: match r.get::<_, String>(15)?.as_str() {
+                        "All" => slk_core::NotifyPref::All,
+                        "Mentions" => slk_core::NotifyPref::Mentions,
+                        "Nothing" => slk_core::NotifyPref::Nothing,
+                        _ => slk_core::NotifyPref::Default,
+                    },
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -979,6 +1003,9 @@ pub struct StoredConversation {
     pub team: TeamId,
     pub purpose: String,
     pub member_count: Option<u32>,
+    /// What the person told Slack about this conversation. FR-U4: the client
+    /// follows it rather than its own rule.
+    pub notify: slk_core::NotifyPref,
 }
 
 impl StoredConversation {

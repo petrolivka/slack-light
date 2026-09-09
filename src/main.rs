@@ -100,6 +100,24 @@ enum Cmd {
         #[command(subcommand)]
         what: CacheCmd,
     },
+    /// How much is unread, for a status bar. Answers from the running client
+    /// when there is one and from the cache when there is not, and says
+    /// which — a module that prints nothing looks broken, and one that
+    /// prints a stale number without saying so is worse.
+    Unread {
+        /// Waybar's shape: text, tooltip, class.
+        #[arg(long)]
+        json: bool,
+    },
+    /// One line about the running client.
+    Status,
+    /// Send a message through the running client.
+    Send {
+        /// `#channel` or `@person`.
+        target: String,
+        /// The message. Everything after the target.
+        text: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -161,6 +179,14 @@ fn main() -> Result<()> {
     }
     match &cli.command {
         Some(Cmd::Cache { what }) => return cache_cmd(what),
+        Some(Cmd::Unread { json }) => return slack_light::ipc::unread(*json, cli.anonymous),
+        Some(Cmd::Status) => return slack_light::ipc::status(cli.anonymous),
+        Some(Cmd::Send { target, text }) => {
+            if text.is_empty() {
+                anyhow::bail!("nothing to send");
+            }
+            return slack_light::ipc::send(target, &text.join(" "), cli.anonymous);
+        }
         Some(Cmd::Auth { what }) => {
             return match what {
                 AuthCmd::Add {
@@ -346,8 +372,21 @@ fn main() -> Result<()> {
         .user_css
         .then(|| slk_config::config_dir().join("user.css"));
 
+    // The control socket. Started before the window so a status bar polling
+    // every two seconds gets an answer from the first frame rather than a
+    // "not running" until the sidebar has loaded. `--anonymous` serves too,
+    // on a socket of its own — the path has to be exercised, and the demo's
+    // counts must never reach a status bar somebody reads as their real one.
+    let snapshot = std::sync::Arc::new(std::sync::Mutex::new(slk_sync::Snapshot::default()));
+    slack_light::ipc::serve(
+        snapshot.clone(),
+        workspaces.iter().map(|w| w.commands.clone()).collect(),
+        cli.anonymous,
+    );
+
     slk_ui::run(slk_ui::Init {
         workspaces,
+        snapshot,
         events: Some(ev_rx),
         runtime: runtime.handle().clone(),
         media_dir: media_dir.clone(),

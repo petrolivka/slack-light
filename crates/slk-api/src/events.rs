@@ -66,6 +66,20 @@ pub enum RtEvent {
     /// these unprompted every few minutes, and that reusing an old URL also
     /// works — but this is the intended path.
     ReconnectUrl(String),
+    /// Slack's own decision that this is worth interrupting for.
+    ///
+    /// FR-U4: when the backend sends these, they beat the client's own rule —
+    /// they already account for keywords, per-channel settings, DND and
+    /// whatever else Slack has added since. The `ts` is what lets the message
+    /// that arrives alongside be skipped rather than notified twice.
+    DesktopNotification {
+        channel: ChannelId,
+        ts: Ts,
+        title: String,
+        text: String,
+        /// Slack's own word for it, so "mentioned you" stays true.
+        is_mention: bool,
+    },
     /// Recognised as a type, not modelled. Logged at debug and dropped.
     Unhandled(String),
     /// The socket closed. The engine reconnects; it does not treat this as an
@@ -159,6 +173,21 @@ pub fn parse(v: &Value) -> Option<RtEvent> {
                 ),
             }
         }
+
+        "desktop_notification" => RtEvent::DesktopNotification {
+            channel: channel(),
+            ts: Ts::new(s(v, "ts").or_else(|| s(v, "msg")).unwrap_or_default()),
+            // `title` is the conversation, `subtitle` the workspace, and
+            // `content` the message — Slack's own names, which do not read
+            // like anybody else's.
+            title: s(v, "title").unwrap_or_default().to_string(),
+            text: s(v, "content").unwrap_or_default().to_string(),
+            is_mention: v
+                .get("is_channel_invite")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || s(v, "content").is_some_and(|c| c.contains('@')),
+        },
 
         "user_typing" => RtEvent::Typing {
             channel: channel(),

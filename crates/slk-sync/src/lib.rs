@@ -116,6 +116,13 @@ pub enum Command {
     Typing(ChannelId),
     /// Set our own presence: `true` active, `false` away.
     Presence(bool),
+    /// Post to a conversation named the way a person would name it —
+    /// `#general`, `@alice` — from outside the window. The engine resolves
+    /// it, because the engine is the side that holds the directory.
+    SendTo {
+        target: String,
+        text: String,
+    },
     /// Keep what is in a composer, so a restart does not lose it. Sent when
     /// the composer loses its conversation, not on every keystroke.
     SetDraft {
@@ -306,6 +313,10 @@ pub struct Engine {
     focused: Option<ChannelId>,
     /// Highlight words, lower-cased once here rather than per message.
     keywords: Vec<String>,
+    /// Messages Slack itself asked us to notify about, so the copy that
+    /// arrives over the same socket a moment later is not notified twice.
+    /// Bounded: this is a dedupe window, not a record.
+    notified: std::collections::VecDeque<Ts>,
     /// How many messages a page of history holds. Configurable because it
     /// is the one number that trades first paint against how far back a
     /// conversation reads before it has to ask again.
@@ -339,6 +350,7 @@ impl Engine {
                     .map(|k| k.trim().to_lowercase())
                     .filter(|k| !k.is_empty())
                     .collect(),
+                notified: std::collections::VecDeque::new(),
                 page: page.clamp(10, 1000),
             };
             if let Err(e) = engine.run(cmd_rx).await {
@@ -694,6 +706,11 @@ impl Engine {
                 for c in convs.iter_mut() {
                     if boot.muted.contains(&c.id) {
                         c.is_muted = true;
+                    }
+                    // FR-U4: what the person told Slack about this channel
+                    // beats what this client would otherwise decide.
+                    if let Some((_, want)) = boot.notify.iter().find(|(id, _)| *id == c.id) {
+                        c.notify = *want;
                     }
                 }
                 if let Err(e) = self.store.upsert_conversations(&convs) {
@@ -1395,6 +1412,38 @@ impl Engine {
                 }
             }
 
+            Command::SendTo { target, text } => {
+                let want = target.trim();
+                let convs = self.store.conversations(&self.team).unwrap_or_default();
+                let found = match want.strip_prefix('@') {
+                    // A direct message is a conversation whose other side is
+                    // that person, not a channel called by their name.
+                    Some(who) => self.resolve_user(who).and_then(|id| {
+                        convs
+                            .iter()
+                            .find(|c| c.peer.as_ref() == Some(&id))
+                            .map(|c| c.id.clone())
+                    }),
+                    None => {
+                        let name = want.trim_start_matches('#');
+                        convs
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(name))
+                            .map(|c| c.id.clone())
+                    }
+                };
+                match found {
+                    Some(ch) => {
+                        let local_id = format!("cli-{}", now_secs());
+                        Box::pin(self.send(ch, None, text, local_id, false)).await;
+                    }
+                    None => {
+                        self.emit(Event::Notice(format!("no conversation called {want}")))
+                            .await
+                    }
+                }
+            }
+
             Command::Typing(ch) => {
                 // Never worth a notice and never worth a retry: an indicator
                 // that arrives late is worse than one that does not arrive.
@@ -1913,6 +1962,12 @@ impl Engine {
     /// keep running and one they turn off by the second afternoon. A muted
     /// conversation is never worth it, whatever is in it.
     async fn consider_notifying(&mut self, channel: &ChannelId, m: &Message) {
+        // Slack already said so for this one, over `desktop_notification`.
+        // Two notifications for one message is the complaint that gets a
+        // client uninstalled.
+        if self.notified.iter().any(|t| t == &m.ts) {
+            return;
+        }
         let Ok(convs) = self.store.conversations(&self.team) else {
             return;
         };
@@ -1926,8 +1981,16 @@ impl Engine {
         // for, and a notification that does not say why it happened is worse
         // than none.
         let mention = m.mentions(&self.self_id) || keyword_matches(&self.keywords, &m.body.plain());
-        if !conv.is_dm() && !mention {
-            return;
+        // The per-channel preference, where Slack gave us one. "Never" is the
+        // person having already answered this question, and a mention is not
+        // an exception to it — that is what "never" means.
+        match conv.notify {
+            slk_core::NotifyPref::Nothing => return,
+            // "Everything" is the whole point of the setting: an
+            // announcements channel somebody chose to follow closely.
+            slk_core::NotifyPref::All => {}
+            _ if !conv.is_dm() && !mention => return,
+            _ => {}
         }
 
         let who = match &m.author {
@@ -2050,6 +2113,48 @@ impl Engine {
                 let tag = format!("{presence:?}");
                 let _ = self.store.set_presence(&self.team, &users, &tag);
                 self.emit(Event::Presence { users, presence }).await;
+            }
+
+            RtEvent::DesktopNotification {
+                channel,
+                ts,
+                title,
+                text,
+                is_mention,
+            } => {
+                // Slack has already applied every rule it knows — keywords,
+                // per-channel settings, DND, whether another device has seen
+                // it. Deciding again here would only ever be more wrong. The
+                // ts is remembered so the message arriving alongside is not
+                // notified a second time.
+                if !ts.as_str().is_empty() {
+                    self.notified.push_back(ts.clone());
+                    while self.notified.len() > 64 {
+                        self.notified.pop_front();
+                    }
+                }
+                let conversation = self
+                    .store
+                    .conversations(&self.team)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|c| c.id == channel)
+                    .map(|c| {
+                        if c.is_dm() {
+                            c.name.clone()
+                        } else {
+                            format!("#{}", c.name)
+                        }
+                    })
+                    .unwrap_or_else(|| title.clone());
+                self.emit(Event::Notify {
+                    channel,
+                    conversation,
+                    who: title,
+                    text,
+                    mention: is_mention,
+                })
+                .await;
             }
 
             RtEvent::Typing { channel, user } => {
@@ -2205,6 +2310,13 @@ fn parse_minutes(s: &str) -> u32 {
     }
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn human_size(n: u64) -> String {
     const U: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = n as f64;
@@ -2218,6 +2330,37 @@ fn human_size(n: u64) -> String {
     } else {
         format!("{v:.1} {}", U[i])
     }
+}
+
+/// What a status bar wants to know, kept current by the window.
+///
+/// Lives here rather than in the binary because the window has to publish it
+/// and the window must not depend on the binary. A plain struct behind a
+/// mutex: a waybar module polls every few seconds, and anything cleverer
+/// would cost more than it saves.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Snapshot {
+    pub unread: u32,
+    pub mentions: u32,
+    /// Whether every connected workspace has a live socket. A count that is
+    /// silently an hour old is worse than one that admits it.
+    pub connected: bool,
+    pub workspaces: Vec<WorkspaceCount>,
+    /// The conversation on screen, so `status` can say where you are.
+    pub open: String,
+    /// Every conversation, named the way a person would type it — `#general`,
+    /// `@alice`. So that `slack-light send` can answer "no conversation
+    /// called that" truthfully instead of reporting success and letting the
+    /// window discover the mistake where nobody is looking.
+    pub names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct WorkspaceCount {
+    pub name: String,
+    pub unread: u32,
+    pub mentions: u32,
+    pub connected: bool,
 }
 
 /// What the sidebar draws. Re-exported so the binary need not depend on the

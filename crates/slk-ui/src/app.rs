@@ -153,6 +153,9 @@ pub struct Init {
     pub user_css: Option<std::path::PathBuf>,
     pub read_only: bool,
     pub options: Options,
+    /// Kept current for whoever is asking over the control socket — a status
+    /// bar, usually. The window writes; the socket's thread reads.
+    pub snapshot: std::sync::Arc<std::sync::Mutex<slk_sync::Snapshot>>,
 }
 
 /// What the right-hand pane is showing. One pane rather than several,
@@ -239,7 +242,17 @@ pub enum Msg {
 }
 
 /// The sidebar's groups, in the order the official client shows them.
-const SECTIONS: [(u8, &str); 3] = [(0, "STARRED"), (1, "CHANNELS"), (2, "DIRECT MESSAGES")];
+/// The sections a conversation can be in, by their config names.
+///
+/// `recent` is not a section a conversation *belongs* to — it is a view of
+/// the ones most recently opened, and those rows also appear below in their
+/// own section, the way the official client does it.
+const SECTIONS: [(u8, &str, &str); 4] = [
+    (3, "recent", "RECENT"),
+    (0, "starred", "STARRED"),
+    (1, "channels", "CHANNELS"),
+    (2, "dms", "DIRECT MESSAGES"),
+];
 
 fn section_of(c: &SidebarEntry) -> u8 {
     if c.is_starred {
@@ -249,6 +262,27 @@ fn section_of(c: &SidebarEntry) -> u8 {
     } else {
         1
     }
+}
+
+/// The sections to draw, in the order the config asks for.
+///
+/// An unknown name is ignored and a missing one is appended: a typo in
+/// `order` should cost one section's position, not the sidebar.
+fn sections_in_order(order: &[String]) -> Vec<(u8, &'static str)> {
+    let mut out: Vec<(u8, &'static str)> = Vec::new();
+    for want in order {
+        if let Some((id, _, title)) = SECTIONS.iter().find(|(_, name, _)| name == want) {
+            if !out.iter().any(|(i, _)| i == id) {
+                out.push((*id, title));
+            }
+        }
+    }
+    for (id, _, title) in SECTIONS {
+        if !out.iter().any(|(i, _)| *i == id) {
+            out.push((id, title));
+        }
+    }
+    out
 }
 
 struct WorkspaceState {
@@ -335,6 +369,13 @@ pub struct App {
     /// `[ui] reduced_motion`: nothing changes on its own, typing lines
     /// included.
     reduced_motion: bool,
+    snapshot: std::sync::Arc<std::sync::Mutex<slk_sync::Snapshot>>,
+    /// `[sidebar]`, held rather than re-read: two of them are also actions,
+    /// so what is in force is not always what is in the file.
+    unread_first: bool,
+    hide_read: bool,
+    recents: u8,
+    sidebar_order: Vec<String>,
     /// Whether Slack currently thinks we are away. Read from our own
     /// `presence_change`, not from what we last asked for, so another client
     /// setting it is reflected here.
@@ -1058,6 +1099,7 @@ impl SimpleComponent for App {
             user_css,
             read_only,
             options,
+            snapshot,
         } = init;
 
         // `[ui] reduced_motion` means "stop anything from changing on its
@@ -1193,6 +1235,11 @@ impl SimpleComponent for App {
             typed_at: None,
             debug: config.debug.enabled,
             reduced_motion: config.ui.reduced_motion,
+            snapshot,
+            unread_first: config.sidebar.unread_first,
+            hide_read: config.sidebar.hide_read,
+            recents: config.sidebar.recents,
+            sidebar_order: config.sidebar.order.clone(),
             me_away: false,
             away_by_idle: false,
             idle: slk_idle::Support::Unknown("not watched".into()),
@@ -2388,6 +2435,7 @@ impl App {
     /// engine replaces it for a moment and then it comes back, because a
     /// status bar that keeps the last thing that happened is a log.
     fn refresh_status(&mut self) {
+        self.publish();
         let Some(w) = self.ws() else {
             self.status = "no workspace".into();
             return;
@@ -2422,7 +2470,53 @@ impl App {
 
     /// The right-hand end of the status bar: what is waiting, and the two
     /// keys worth knowing.
+    /// Publish what a status bar wants, for the control socket to hand out.
+    ///
+    /// Called from the same places that redraw the counters, so it cannot
+    /// drift from what is on screen — a socket that answers with a number the
+    /// window is not showing is worse than no socket.
+    fn publish(&self) {
+        let mut snap = slk_sync::Snapshot {
+            open: self.title.clone(),
+            connected: self.workspaces.iter().all(|w| w.connected),
+            ..Default::default()
+        };
+        for w in &self.workspaces {
+            let unread: u32 = w
+                .convs
+                .iter()
+                .filter(|c| !c.is_muted)
+                .map(|c| c.unread)
+                .sum();
+            let mentions: u32 = w
+                .convs
+                .iter()
+                .filter(|c| !c.is_muted)
+                .map(|c| c.mentions)
+                .sum();
+            snap.unread += unread;
+            snap.mentions += mentions;
+            for c in &w.convs {
+                snap.names.push(if c.is_dm() {
+                    format!("@{}", c.name)
+                } else {
+                    format!("#{}", c.name)
+                });
+            }
+            snap.workspaces.push(slk_sync::WorkspaceCount {
+                name: w.name.clone(),
+                unread,
+                mentions,
+                connected: w.connected,
+            });
+        }
+        if let Ok(mut held) = self.snapshot.lock() {
+            *held = snap;
+        }
+    }
+
     fn refresh_status_right(&mut self) {
+        self.publish();
         let mentions: u32 = self
             .workspaces
             .iter()
@@ -2642,6 +2736,20 @@ impl App {
                 self.composer.grab_focus();
             }
             "leave_channel" => self.confirm_leave(sender),
+            // Both are `[sidebar]` settings and both are worth changing for a
+            // minute — "show me only what is unread" is a way of working
+            // through a morning, not a preference.
+            "unread_first" | "hide_read" => {
+                let on = if name == "unread_first" {
+                    self.unread_first = !self.unread_first;
+                    self.unread_first
+                } else {
+                    self.hide_read = !self.hide_read;
+                    self.hide_read
+                };
+                self.rebuild_sidebar();
+                self.say(format!("{name}: {}", if on { "on" } else { "off" }));
+            }
             "presence" => {
                 // What Slack thinks, not what we last asked for: another
                 // client can have set it, and `presence_change` for our own
@@ -4175,11 +4283,44 @@ impl App {
         self.row_map.clear();
         let convs: Vec<SidebarEntry> = self.convs().to_vec();
 
-        for (sec, title) in SECTIONS {
-            let members: Vec<(usize, &SidebarEntry)> = convs
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| section_of(c) == sec)
+        for (sec, title) in sections_in_order(&self.sidebar_order) {
+            // RECENT is the conversations most recently opened, in that
+            // order, rather than a section rows belong to. It is off unless
+            // `[sidebar] recents` asks for it.
+            let picked: Vec<usize> = if sec == 3 {
+                if self.recents == 0 {
+                    continue;
+                }
+                self.history
+                    .iter()
+                    .rev()
+                    .filter_map(|id| convs.iter().position(|c| &c.id == id))
+                    .fold(Vec::new(), |mut acc, i| {
+                        if !acc.contains(&i) && acc.len() < self.recents as usize {
+                            acc.push(i);
+                        }
+                        acc
+                    })
+            } else {
+                crate::logic::arrange(
+                    convs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| section_of(c) == sec)
+                        .map(|(i, c)| {
+                            (
+                                i,
+                                c.unread > 0 || c.mentions > 0,
+                                self.open.as_ref() == Some(&c.id),
+                            )
+                        }),
+                    self.unread_first,
+                    self.hide_read,
+                )
+            };
+            let members: Vec<(usize, &SidebarEntry)> = picked
+                .into_iter()
+                .filter_map(|i| Some((i, convs.get(i)?)))
                 .collect();
             if members.is_empty() {
                 continue;

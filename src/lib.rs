@@ -5,5 +5,6 @@
 //! reach the credential store through the same path the binary does.
 
 pub mod doctor;
+pub mod ipc;
 
 pub use slk_auth as auth;

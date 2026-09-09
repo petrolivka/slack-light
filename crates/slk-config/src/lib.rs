@@ -61,8 +61,17 @@ impl Default for General {
 #[serde(default)]
 pub struct Sidebar {
     pub width: u16,
+    /// Within each section, conversations with something unread come first.
     pub unread_first: bool,
+    /// Hide conversations with nothing unread. Never the one you are looking
+    /// at, whatever this says.
     pub hide_read: bool,
+    /// A "RECENT" section at the top, holding this many of the conversations
+    /// most recently opened. Zero turns it off.
+    pub recents: u8,
+    /// Which sections, in which order. Unknown names are ignored and missing
+    /// ones are appended, so a typo costs one section rather than the sidebar.
+    pub order: Vec<String>,
 }
 impl Default for Sidebar {
     fn default() -> Self {
@@ -70,6 +79,13 @@ impl Default for Sidebar {
             width: 22,
             unread_first: false,
             hide_read: false,
+            recents: 0,
+            order: vec![
+                "recent".into(),
+                "starred".into(),
+                "channels".into(),
+                "dms".into(),
+            ],
         }
     }
 }

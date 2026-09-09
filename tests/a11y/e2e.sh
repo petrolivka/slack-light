@@ -237,6 +237,34 @@ check "alt-i shows who wrote it" "$( tree | grep -qE "label '(time zone|presence
 w -k Escape; sleep 0.5
 check "escape closes the pane" "$( tree | grep -q "label 'presence'" && echo 0 || echo 1 )"
 
+# The control socket, which is how a Hyprland desktop shows an unread count:
+# there is no tray, so a waybar module runs a command every few seconds. The
+# demo serves on a socket of its own, so this can be tested without the
+# demo's counts ever reaching a bar somebody reads as their real one.
+u=$("$BIN" --anonymous unread --json 2>/dev/null)
+check "unread --json answers from the running client" "$( echo "$u" | grep -q '"connected":true' && echo 1 || echo 0 )" "$u"
+check "and its counts are the ones on screen" "$( echo "$u" | grep -qE '"unread":[1-9]' && echo 1 || echo 0 )"
+check "status says where you are" "$( "$BIN" --anonymous status 2>/dev/null | grep -q 'in ' && echo 1 || echo 0 )" "$("$BIN" --anonymous status 2>/dev/null)"
+# A name nobody has must fail, and fail with a status a script can see.
+"$BIN" --anonymous send '#nope' x >/dev/null 2>&1; rc=$?
+check "send refuses a conversation that does not exist" "$( [ "$rc" -ne 0 ] && echo 1 || echo 0 )" "exit=$rc"
+"$BIN" --anonymous send '#engineering' 'sent from the shell' >/dev/null 2>&1
+sleep 2
+check "send from the shell reaches the conversation" "$( tree | grep -q 'sent from the shell' && echo 1 || echo 0 )"
+# And the real socket is untouched by any of it.
+check "the demo never answers on the real socket" "$( "$BIN" unread 2>/dev/null | grep -q 'not running' && echo 1 || echo 0 )" "$("$BIN" unread 2>/dev/null)"
+
+# Sidebar options. `hide_read` must never hide what is on screen — a sidebar
+# that drops the row you are reading loses your place while you watch.
+before=$(tree | grep -c 'list item')
+w -M ctrl p -m ctrl; sleep 0.6
+w "hide_read"; sleep 0.5; w -k Return; sleep 1.2
+after=$(tree | grep -c 'list item')
+check "hide_read hides the conversations with nothing unread" "$( [ "$after" -lt "$before" ] && echo 1 || echo 0 )" "before=$before after=$after"
+check "and the open conversation is still there" "$( tree | grep -q 'engineering' && echo 1 || echo 0 )"
+w -M ctrl p -m ctrl; sleep 0.6
+w "hide_read"; sleep 0.5; w -k Return; sleep 1.2
+
 # F1 is the shortcuts window, generated from the live keymap: an action with
 # no key has to say so rather than be missing.
 w -k F1; sleep 0.8

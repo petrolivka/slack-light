@@ -73,6 +73,8 @@ actions! {
     Pin            => "pin",             "Pin this to the conversation",         "messages";
     SearchLocal    => "search_local",    "Search what is already downloaded",    "global";
     Pinned         => "pinned",          "What is pinned in this conversation",  "global";
+    UnreadFirst    => "unread_first",    "Put unread conversations at the top",  "navigation";
+    HideRead       => "hide_read",       "Show only what has something unread",  "navigation";
 
     TogglePresence => "presence",        "Set yourself away, or active again",   "you";
     SetStatus      => "status",          "Set your status",                      "you";

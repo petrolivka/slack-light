@@ -304,6 +304,31 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/pins", "What is pinned here"),
 ];
 
+/// How the sidebar's options rearrange one section's conversations.
+///
+/// Takes what each row is — its index, whether it has unread, whether it is
+/// the one on screen — rather than the rows themselves, so it can be tested
+/// without a sidebar.
+///
+/// `hide_read` never hides the open conversation. A sidebar that drops the
+/// row you are reading the moment it is marked read is a sidebar that loses
+/// your place while you watch.
+pub fn arrange(
+    rows: impl Iterator<Item = (usize, bool, bool)>,
+    unread_first: bool,
+    hide_read: bool,
+) -> Vec<usize> {
+    let mut kept: Vec<(usize, bool, bool)> = rows
+        .filter(|(_, unread, open)| !hide_read || *unread || *open)
+        .collect();
+    if unread_first {
+        // Stable, so within "unread" and within "read" the sidebar's own
+        // order — most recent activity — still decides.
+        kept.sort_by_key(|(_, unread, _)| !*unread);
+    }
+    kept.into_iter().map(|(i, _, _)| i).collect()
+}
+
 /// The first `n` lines of a snippet, and whether there are more.
 ///
 /// Twelve by default: enough to see what a file is, few enough that three
@@ -585,6 +610,21 @@ pub fn accel(rendered: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hiding_read_conversations_never_hides_the_one_on_screen() {
+        use super::arrange;
+        // (index, has unread, is open)
+        let rows = || [(0, false, false), (1, true, false), (2, false, true)].into_iter();
+        assert_eq!(arrange(rows(), false, false), vec![0, 1, 2]);
+        assert_eq!(
+            arrange(rows(), false, true),
+            vec![1, 2],
+            "the open conversation stays even with nothing unread"
+        );
+        // Unread first, and stable within each group.
+        assert_eq!(arrange(rows(), true, false), vec![1, 0, 2]);
+    }
+
     #[test]
     fn a_search_prefix_is_ours_only_at_the_start() {
         use super::{search_kind, Search};

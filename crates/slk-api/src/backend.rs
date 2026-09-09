@@ -131,6 +131,12 @@ pub struct Boot {
     /// Channel ids the user has muted. Not on the channel object; it lives in
     /// prefs, and muted conversations must never raise a badge.
     pub muted: Vec<ChannelId>,
+    /// Per-conversation notification preferences, where the backend can read
+    /// them. Also prefs, also not on the channel object. FR-U4: a channel the
+    /// person set to "everything" should interrupt for everything, and one set
+    /// to "never" should not interrupt at all — following our own rule
+    /// instead is a client that ignores what they told Slack.
+    pub notify: Vec<(ChannelId, slk_core::NotifyPref)>,
 }
 
 /// Per-conversation unread state, cheap enough to refresh often.

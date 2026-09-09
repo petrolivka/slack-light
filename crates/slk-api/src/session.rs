@@ -230,10 +230,40 @@ impl SlackBackend for SessionBackend {
             })
             .unwrap_or_default();
 
+        // `all_notifications_prefs` is a JSON *string* inside the prefs
+        // object — Slack nests one document in another rather than sending
+        // one. Everything about it is undocumented, so every step is an
+        // `Option` and an unreadable value costs the preference, not the boot.
+        let notify = v
+            .get("prefs")
+            .and_then(|p| p.get("all_notifications_prefs"))
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .and_then(|doc| {
+                let channels = doc.get("channels")?.as_object()?.clone();
+                Some(
+                    channels
+                        .into_iter()
+                        .filter_map(|(id, p)| {
+                            let want = match p.get("desktop")?.as_str()? {
+                                "everything" => slk_core::NotifyPref::All,
+                                "mentions" => slk_core::NotifyPref::Mentions,
+                                "never" => slk_core::NotifyPref::Nothing,
+                                // "default" and anything Slack adds later.
+                                _ => return None,
+                            };
+                            Some((ChannelId::new(id), want))
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
+
         Ok(Boot {
             conversations,
             users: Vec::new(),
             muted,
+            notify,
         })
     }
 
