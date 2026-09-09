@@ -309,6 +309,50 @@ pub fn slash(text: &str) -> Option<(String, String)> {
     Some((format!("/{word}"), rest.to_string()))
 }
 
+/// Render `:shortcode:` as the glyph, for the one-line summaries the side
+/// pane shows.
+///
+/// The lists carry Slack's raw text — that is what search returns and what
+/// the store holds — so without this a result reads
+/// "Deploy finished :white_check_mark:". The message body goes through the
+/// full renderer instead; this is for a label.
+pub fn readable(text: &str) -> String {
+    if !text.contains(':') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(':') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find(':') {
+            Some(end)
+                if end > 0
+                    && after[..end]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+') =>
+            {
+                match slk_core::emoji::shortcode(&after[..end], None) {
+                    Some(glyph) => out.push_str(&glyph),
+                    // A custom emoji has no glyph anywhere; leave the name.
+                    None => {
+                        out.push(':');
+                        out.push_str(&after[..end]);
+                        out.push(':');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            _ => {
+                out.push(':');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// When a conversation is marked read.
 ///
 /// The requirements are blunt about this one: getting it wrong means
@@ -705,6 +749,19 @@ mod tests {
         assert_eq!(slash("look at /etc/hosts"), None);
         assert_eq!(slash("/"), None);
         assert_eq!(slash("plain text"), None);
+    }
+
+    #[test]
+    fn a_summary_shows_emoji_rather_than_their_names() {
+        assert_eq!(readable("shipped :rocket:"), "shipped 🚀");
+        assert_eq!(readable("no colons here"), "no colons here");
+        // A time is not a shortcode, and neither is an unclosed one.
+        assert_eq!(readable("at 11:30 sharp"), "at 11:30 sharp");
+        assert_eq!(readable("ratio 3:1"), "ratio 3:1");
+        assert_eq!(readable(":rocket"), ":rocket");
+        // A workspace's own emoji has no glyph; the name stays.
+        assert_eq!(readable("ship :partyparrot:"), "ship :partyparrot:");
+        assert_eq!(readable(":+1: and :tada:"), "👍 and 🎉");
     }
 
     #[test]

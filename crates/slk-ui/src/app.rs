@@ -1919,7 +1919,8 @@ impl App {
                 self.thread_title.set_label(&match head {
                     Some(m) => {
                         let names = self.shared.names.borrow();
-                        let one = m.body.plain_with(&*names).replace('\n', " ");
+                        let one =
+                            crate::logic::readable(&m.body.plain_with(&*names)).replace('\n', " ");
                         format!("Thread · {}", one.chars().take(48).collect::<String>())
                     }
                     None => "Thread".into(),
@@ -2414,7 +2415,7 @@ impl App {
             b.set_margin_end(10);
             b.set_margin_top(4);
             b.set_margin_bottom(4);
-            let l = gtk::Label::new(Some(&r.label));
+            let l = gtk::Label::new(Some(&crate::logic::readable(&r.label)));
             l.set_xalign(0.0);
             l.set_wrap(true);
             l.set_max_width_chars(44);
