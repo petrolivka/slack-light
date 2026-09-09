@@ -23,7 +23,7 @@ shot() { local g; g=$(hyprctl clients -j | jq -r ".[] | select(.class==\"$CLASS\
 # A stray window from an earlier run confuses tree.py, which reads the first
 # slack-light on the a11y bus. Start clean.
 pkill -x slack-light 2>/dev/null && sleep 1
-LOG=$(mktemp)
+LOG=$(mktemp); LOG2=$(mktemp)
 "$BIN" --anonymous --demo-rows 30 --metrics >"$LOG" 2>&1 &
 PID=$!
 sleep 3
@@ -124,6 +124,24 @@ wtype -k Escape; sleep 0.4
 shot "$OUT/e2e_keys.png" && echo "  shot $OUT/e2e_keys.png"
 
 kill $PID 2>/dev/null; wait $PID 2>/dev/null
+sleep 1
+
+# A second run, with more messages than one page holds, for the two things
+# that cannot be seen in a short conversation: where it opens, and what
+# happens at the top. The mock pages at fifty, the way Slack does.
+"$BIN" --anonymous --no-cache --demo-rows 120 --metrics >"$LOG2" 2>&1 &
+PID2=$!
+sleep 4
+focus
+check "a long conversation opens on its newest message" "$( tree | grep -q 'Deploy of v2.4 finished' && echo 1 || echo 0 )" "$(tree | grep -oE "'plain sentence number [0-9]+" | head -1)"
+check "and only a page of it is loaded" "$( [ "$(grep -c '^rows=50$' "$LOG2")" -ge 1 ] && echo 1 || echo 0 )" "$(grep '^rows=' "$LOG2" | head -1)"
+
+for _ in 1 2 3 4; do wtype -M alt -k Home -m alt; sleep 1.8; done
+check "scrollback walks back to the start of the conversation" "$( tree | grep -q 'the beginning of the conversation' && echo 1 || echo 0 )"
+check "and it got there a page at a time" "$( [ "$(grep -c '^scrollback_asked=' "$LOG2")" -ge 3 ] && echo 1 || echo 0 )" "$(grep -c '^scrollback_asked=' "$LOG2") pages"
+check "the oldest message is now on screen" "$( tree | grep -q 'plain sentence number 0,' && echo 1 || echo 0 )"
+
+kill $PID2 2>/dev/null; wait $PID2 2>/dev/null
 # Shift on a character key is delivered as the plain keyval and matches no
 # accelerator (see logic::bindable). A binding like that is dead on arrival,
 # so none may be installed — and every action must have a key or say why not.
@@ -134,5 +152,5 @@ check "every action but the two GTK owns has a key" "$( [ "$unbound" -le 2 ] && 
 
 echo "--- bindings installed ---"; grep '^binding=' "$LOG" | sed 's/^binding=/  /'
 echo; echo "$pass passed, $fail failed"
-rm -f "$LOG"
+rm -f "$LOG" "$LOG2"
 [ "$fail" = 0 ]

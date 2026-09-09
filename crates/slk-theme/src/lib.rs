@@ -347,6 +347,12 @@ window {{ background-color: @sl_bg; color: @sl_fg; font-size: 13px; }}
 .threadpane .composer {{ background-color: @sl_bg; }}
 .threadpane checkbutton {{ color: @sl_fg_dim; font-size: 11px; padding: 0 6px 4px 6px; }}
 
+/* Scrollback's own line, above the conversation. */
+.loading {{
+    color: @sl_fg_dim; font-size: 11px; padding: 4px 12px;
+    background-color: @sl_bg;
+}}
+
 /* The completion popup: a list under the word being typed. */
 .completions {{ background-color: @sl_bg_light; }}
 .completions list {{ background-color: @sl_bg_light; }}

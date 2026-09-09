@@ -90,6 +90,15 @@ thread_local! {
     static ROW_SENDER: RefCell<Option<relm4::Sender<Msg>>> = const { RefCell::new(None) };
 }
 
+/// Follow a link from inside a message. A Slack permalink is a jump, not a
+/// trip to the browser, and only the window knows which.
+pub fn link_clicked(url: &str) -> bool {
+    ROW_SENDER.with_borrow(|s| match s {
+        Some(s) => s.send(Msg::Link(url.to_string())).is_ok(),
+        None => false,
+    })
+}
+
 /// Run an action against one message, from a widget. See `ROW_SENDER`.
 pub fn row_action(at: &str, act: &str) {
     ROW_SENDER.with_borrow(|s| {
@@ -154,6 +163,15 @@ pub enum Msg {
     Picked(String),
     /// The composer's text changed; re-read what is being completed.
     ComposerChanged,
+    /// The conversation's content changed size and has now been measured.
+    Settled,
+    /// The conversation moved, and where it is now.
+    Scrolled {
+        at_top: bool,
+        at_bottom: bool,
+    },
+    /// A link inside a message was clicked.
+    Link(String),
     /// Move within, or accept, the completion list.
     CompleteStep(i32),
     CompleteAccept,
@@ -240,6 +258,21 @@ pub struct App {
     /// What was typed and not sent, per conversation. A draft lost by
     /// glancing at another channel is the thing people never forgive.
     drafts: HashMap<ChannelId, String>,
+    /// Scrollback: whether a page is in flight, and whether the server has
+    /// said there is nothing older left.
+    loading_older: bool,
+    at_beginning: bool,
+    /// Whether the conversation is pinned to its newest message.
+    ///
+    /// Setting the adjustment once, when the messages arrive, does nothing:
+    /// the rows have not been measured yet, so `upper` is still zero and
+    /// "scroll to the bottom" clamps to the top. Every conversation longer
+    /// than the window has opened at its *oldest* message since M1, which
+    /// was invisible for as long as the demo fitted on one screen. The flag
+    /// is what makes it stick — the bottom is re-taken every time the
+    /// content grows, until the reader scrolls away from it.
+    follow_bottom: bool,
+    loading: gtk::Label,
     /// Slack's skin tone, applied to what the picker shows and to what is
     /// sent, so the two cannot disagree.
     skin: Option<u8>,
@@ -523,9 +556,20 @@ impl App {
     /// leaves the list view retrying on a tick callback. Measured as a
     /// 60 Hz repaint on an idle window and 45 MB of churn. Moving the
     /// adjustment is a no-op when there is nothing to move.
-    fn scroll_to_end(&self) {
+    fn scroll_to_end(&mut self) {
+        self.follow_bottom = true;
+        self.pin_to_bottom();
+    }
+
+    /// Take the bottom, if we are not already on it. The guard matters: an
+    /// unconditional `set_value` inside a `changed` handler is a repaint
+    /// loop.
+    fn pin_to_bottom(&self) {
         let adj = self.scroller.vadjustment();
-        adj.set_value(adj.upper() - adj.page_size());
+        let want = (adj.upper() - adj.page_size()).max(0.0);
+        if (adj.value() - want).abs() > 0.5 {
+            adj.set_value(want);
+        }
     }
 }
 
@@ -643,6 +687,15 @@ impl SimpleComponent for App {
                                 },
                             },
                             gtk::Box { add_css_class: "hairline" },
+
+                            // Scrollback's own line. A conversation that
+                            // silently stops at fifty messages reads as a
+                            // conversation that only has fifty.
+                            #[local_ref]
+                            loading -> gtk::Label {
+                                set_visible: false,
+                                add_css_class: "loading",
+                            },
 
                             #[local_ref]
                             scroller -> gtk::ScrolledWindow {
@@ -899,6 +952,10 @@ impl SimpleComponent for App {
             candidates: Vec::new(),
             inserting: Rc::new(std::cell::Cell::new(false)),
             drafts: HashMap::new(),
+            loading_older: false,
+            at_beginning: false,
+            follow_bottom: true,
+            loading: gtk::Label::new(None),
             skin: (config.emoji.skin_tone > 0).then_some(config.emoji.skin_tone),
             sidebar: gtk::ListBox::new(),
             sidebar_box: gtk::Box::new(gtk::Orientation::Vertical, 0),
@@ -946,6 +1003,7 @@ impl SimpleComponent for App {
         let sidebar_box = &model.sidebar_box;
         let rail = &model.rail;
         let scroller = &model.scroller;
+        let loading = &model.loading;
         let composer = &model.composer;
         let jump = &model.jump;
         let widgets = view_output!();
@@ -969,6 +1027,31 @@ impl SimpleComponent for App {
                 gtk::glib::Propagation::Proceed
             });
             root.add_controller(k);
+        }
+
+        // Two things hang off the conversation's scrollbar.
+        //
+        // `changed` fires when the *content* changes size, which is when a
+        // page of messages has finally been measured: that is the only
+        // moment at which "scroll to the bottom" can mean anything.
+        //
+        // `value-changed` fires when the view moves, from the reader or from
+        // us. Near the top it asks for the page before this one; near the
+        // bottom it re-arms the follow, which is how scrolling back up and
+        // then down again behaves the way people expect.
+        {
+            let adj = model.scroller.vadjustment();
+            let s2 = sender.input_sender().clone();
+            adj.connect_changed(move |_| {
+                let _ = s2.send(Msg::Settled);
+            });
+            let s3 = sender.input_sender().clone();
+            adj.connect_value_changed(move |a| {
+                let _ = s3.send(Msg::Scrolled {
+                    at_top: a.value() < 400.0 && a.upper() > a.page_size(),
+                    at_bottom: a.upper() - (a.value() + a.page_size()) < 40.0,
+                });
+            });
         }
 
         // Where a pooled row's buttons send what they were clicked for.
@@ -1192,6 +1275,18 @@ impl SimpleComponent for App {
                 }
             }
             Msg::ComposerChanged => self.refresh_completions(),
+            Msg::Settled => {
+                if self.follow_bottom {
+                    self.pin_to_bottom();
+                }
+            }
+            Msg::Scrolled { at_top, at_bottom } => {
+                self.follow_bottom = at_bottom;
+                if at_top {
+                    self.load_older();
+                }
+            }
+            Msg::Link(url) => self.follow_link(&url, &sender),
             Msg::CompleteStep(d) => {
                 if d == 0 {
                     self.close_completions();
@@ -1381,14 +1476,19 @@ impl App {
                 if !is_current || self.open.as_ref() != Some(&channel) {
                     return;
                 }
-                let n = messages.len();
-                if !append_older {
-                    self.list.clear();
+                if append_older {
+                    self.loading_older = false;
+                    self.prepend_rows(messages);
+                    self.loading.set_visible(self.at_beginning);
+                    return;
                 }
-                let rows = self.make_rows(messages, append_older);
+                self.list.clear();
+                self.at_beginning = false;
+                self.loading_older = false;
+                self.loading.set_visible(false);
+                let rows = self.make_rows(messages, false);
                 self.list.extend_from_iter(rows);
                 self.scroll_to_end();
-                let _ = n;
                 self.refresh_status();
                 if !self.loaded_once {
                     self.loaded_once = true;
@@ -1490,6 +1590,28 @@ impl App {
                         self.list.append(row);
                         self.scroll_to_end();
                     }
+                }
+            }
+            Event::MessagesAround {
+                channel,
+                messages,
+                focus,
+            } => {
+                if !is_current || self.open.as_ref() != Some(&channel) {
+                    return;
+                }
+                self.list.clear();
+                self.at_beginning = false;
+                let rows = self.make_rows(messages, false);
+                self.list.extend_from_iter(rows);
+                // The point of jumping is to see the message in what was
+                // said around it, so it is put on the cursor, not merely
+                // scrolled to.
+                self.active = Pane::Conv;
+                if let Some(pos) = self.position(|r| r.msg.ts == focus) {
+                    self.set_cursor(Some(pos as usize));
+                } else {
+                    self.notice("that message is no longer here".into(), sender);
                 }
             }
             Event::Thread {
@@ -1703,10 +1825,19 @@ impl App {
             "cursor_down" => self.move_cursor(1),
             "page_up" => self.move_cursor(-10),
             "page_down" => self.move_cursor(10),
-            "goto_oldest" => self.set_cursor(Some(0)),
+            // The two ends move the scrollbar as well as the cursor.
+            // `ListView::scroll_to` reaches a neighbouring row reliably and
+            // the far end of five thousand not at all — measured: alt-Home
+            // selected the oldest message and left the view where it was.
+            "goto_oldest" => {
+                self.set_cursor(Some(0));
+                self.follow_bottom = false;
+                self.scroller.vadjustment().set_value(0.0);
+            }
             "goto_newest" => {
                 let len = self.list_of(self.active).len();
                 self.set_cursor(len.checked_sub(1).map(|i| i as usize));
+                self.scroll_to_end();
             }
 
             "open_thread" => self.open_thread(sender),
@@ -1832,6 +1963,82 @@ impl App {
             other => self.say(format!("unbound action {other}")),
         }
     }
+    // ---- history -------------------------------------------------------
+
+    /// Ask for the page before the oldest message on screen.
+    fn load_older(&mut self) {
+        if self.loading_older || self.at_beginning || self.list.is_empty() {
+            return;
+        }
+        let (Some(ch), Some(first)) = (self.open.clone(), self.list.get(0)) else {
+            return;
+        };
+        let before = first.borrow().msg.ts.clone();
+        self.loading_older = true;
+        bench::report("scrollback_asked", before.as_str());
+        self.loading.set_label("loading earlier messages…");
+        self.loading.set_visible(true);
+        self.send(Command::LoadOlder(ch, before));
+    }
+
+    /// A page of scrollback goes **in front of** what is already there, and
+    /// the view must not move under the reader's eyes.
+    ///
+    /// Two things are easy to get wrong here and both were: appending a page
+    /// of older messages to the end (which is what "append_older" invited),
+    /// and leaving the row that used to be first grouped as though it still
+    /// had nothing above it.
+    fn prepend_rows(&mut self, msgs: Vec<slk_core::Message>) {
+        if msgs.is_empty() {
+            self.at_beginning = true;
+            self.loading.set_label("the beginning of the conversation");
+            return;
+        }
+        // Reading upwards is exactly the case where the bottom must not be
+        // taken back.
+        self.follow_bottom = false;
+        let adj = self.scroller.vadjustment();
+        let anchor = adj.upper() - adj.value();
+
+        let n = msgs.len() as u32;
+        let old_first = self.list.get(0).map(|r| r.borrow().msg.clone());
+        for (i, row) in self.make_rows(msgs, false).into_iter().enumerate() {
+            self.list.insert(i as u32, row);
+        }
+        // The message that used to be first now has a predecessor, so its
+        // day break and its grouping have to be worked out again.
+        if let Some(m) = old_first {
+            self.replace_row(Pane::Conv, n, m);
+        }
+
+        // Hold the reading position: after the insert the content is taller,
+        // so the same distance from the bottom is a different value. An idle
+        // callback, because the new rows have not been measured yet.
+        let scroller = self.scroller.clone();
+        gtk::glib::idle_add_local_once(move || {
+            let adj = scroller.vadjustment();
+            adj.set_value(adj.upper() - anchor);
+        });
+    }
+
+    /// A link in a message. A Slack permalink jumps inside the client; every
+    /// other link goes to the browser.
+    fn follow_link(&mut self, url: &str, sender: &ComponentSender<Self>) {
+        if let Some(link) = slk_core::permalink::parse(url) {
+            let known = self.convs().iter().any(|c| c.id == link.channel);
+            if known {
+                self.open_channel(link.channel.clone());
+                self.send(Command::JumpToMessage(link.channel, link.ts));
+                return;
+            }
+        }
+        if let Err(e) =
+            gtk::gio::AppInfo::launch_default_for_uri(url, None::<&gtk::gio::AppLaunchContext>)
+        {
+            self.notice(format!("could not open: {e}"), sender);
+        }
+    }
+
     // ---- composing -----------------------------------------------------
 
     /// What the user typed, as Slack wants it on the wire.

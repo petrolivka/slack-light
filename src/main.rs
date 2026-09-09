@@ -299,7 +299,12 @@ fn main() -> Result<()> {
         for (name, backend) in backends {
             let team = backend.team().clone();
             let store = Store::open(store_path.as_deref()).context("opening the message cache")?;
-            let (cmd_tx, mut rx) = Engine::spawn(backend, store, config.notify.keywords.clone());
+            let (cmd_tx, mut rx) = Engine::spawn(
+                backend,
+                store,
+                config.notify.keywords.clone(),
+                config.message.history_page,
+            );
             workspaces.push(slk_ui::Workspace {
                 team: team.clone(),
                 name,

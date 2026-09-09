@@ -311,6 +311,16 @@ impl RelmListItem for Row {
             root.add_controller(motion);
         }
 
+        // Links in the body are the window's to route: a Slack permalink is
+        // a jump inside the client, and everything else goes to the browser.
+        body.connect_activate_link(|_, url| {
+            if crate::app::link_clicked(url) {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
+
         // The thread summary is a link: clicking it opens the thread, which
         // is what everyone tries first.
         {

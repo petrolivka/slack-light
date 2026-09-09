@@ -252,10 +252,53 @@ Two defects, both from driving it:
   which runs *after* the flag is down again. It is read inside the signal
   handler now, where it is still up.
 
+## 6. M2b, third block: history
+
+| | |
+|---|---|
+| Scrollback | near the top, the page before this one is asked for, with a line saying so and another saying when there is nothing older. The reading position is held: the new page goes in front and the view is put back where the eye was |
+| Page size | `[message] history_page`, now actually read by the engine. 50 by default, clamped to 10–1000, which is Slack's own ceiling |
+| Jump to a message | `Event::MessagesAround` fills the conversation around one message and puts the cursor on it. A Slack permalink clicked inside a message jumps there instead of opening a browser |
+| The mock | pages the way Slack does — the newest `limit` of what matched, with `has_more`. It used to hand over the whole channel at once, which meant scrollback could not be exercised against it at all |
+
+### Two defects, one of them since M1
+
+**Every conversation longer than the window has been opening at its
+*oldest* message.** `scroll_to_end` set the adjustment once, when the
+messages arrived — before the rows had been measured, so `upper` was still
+zero and "scroll to the bottom" clamped to the top. It was invisible for as
+long as the demo fitted on one screen. The bottom is now *followed*: taken
+again every time the content grows, until the reader scrolls away from it,
+and re-armed when they scroll back down.
+
+**`ListView::scroll_to` does not reach the far end of a long list.**
+Measured: alt-Home selected the oldest message and left the view exactly
+where it was. It is reliable for a neighbouring row, which is what the
+cursor keys need; the two ends move the scrollbar directly now.
+
+### What paging did to the idle repaint
+
+The client no longer puts five thousand rows in a list unless somebody
+scrolls back a hundred pages, and that turns out to matter:
+
+| Rows in the list | Idle CPU over five seconds |
+|---|---|
+| 50 (the default page) | 0.53–0.72 % |
+| 1 000 (`history_page = 1000`) | 0.60–0.64 % |
+| 5 007 (before paging) | 2.00–2.35 % |
+
+So §2's defect is **not fixed** — 0.6 % is not "~0 %" — but the condition
+that made it worst is no longer one the client creates by itself. The jump
+between 1 000 and 5 000 rows is the lead worth following.
+
+The rest of the numbers, three samples, `--anonymous --no-cache
+--demo-rows 5000 --metrics --bench --idle 5`: window mapped 97–101 ms,
+first page on screen 133–135 ms (it was 253–263 ms for all 5 007), frames
+over 20 ms while scrolling 2.2–2.9 %, private memory 57.5 MB, resident
+189–190 MB.
+
 ### What is left in M2b
 
-- **History**: scrollback upward with its loading state, jump to a message
-  in context — `back`/`forward` are wired, the rest is not
 - **The lists**: search (both halves), threads, saved, mentions, members,
   profiles, presence, browse-and-join. Each is bound, named in the
   shortcuts window, and answers "not in this build yet" rather than doing

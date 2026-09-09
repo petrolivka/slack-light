@@ -482,7 +482,7 @@ impl SlackBackend for MockBackend {
             .get(ch.as_str())
             .cloned()
             .unwrap_or_default();
-        let messages: Vec<Message> = all
+        let mut messages: Vec<Message> = all
             .into_iter()
             .filter(|m| !m.is_reply())
             .filter(|m| match &q.latest {
@@ -490,9 +490,23 @@ impl SlackBackend for MockBackend {
                 Some(l) => m.ts < *l,
                 None => true,
             })
+            .filter(|m| match &q.oldest {
+                Some(o) if q.inclusive => m.ts >= *o,
+                Some(o) => m.ts > *o,
+                None => true,
+            })
             .collect();
+        // A page, the way Slack sends one: the *newest* `limit` of what
+        // matched, oldest first, and `has_more` when something was cut. The
+        // mock used to hand over the whole channel at once, which meant
+        // scrollback could not be exercised against it at all.
+        let limit = q.limit.max(1) as usize;
+        let has_more = messages.len() > limit;
+        if has_more {
+            messages.drain(..messages.len() - limit);
+        }
         Ok(Page {
-            has_more: false,
+            has_more,
             cursor: None,
             messages,
         })

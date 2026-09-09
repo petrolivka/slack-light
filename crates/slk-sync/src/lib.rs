@@ -250,6 +250,10 @@ pub struct Engine {
     focused: Option<ChannelId>,
     /// Highlight words, lower-cased once here rather than per message.
     keywords: Vec<String>,
+    /// How many messages a page of history holds. Configurable because it
+    /// is the one number that trades first paint against how far back a
+    /// conversation reads before it has to ask again.
+    page: u16,
 }
 
 impl Engine {
@@ -259,6 +263,7 @@ impl Engine {
         backend: Arc<dyn SlackBackend>,
         store: Store,
         keywords: Vec<String>,
+        page: u16,
     ) -> (mpsc::Sender<Command>, mpsc::Receiver<Event>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (ev_tx, ev_rx) = mpsc::channel(256);
@@ -278,6 +283,7 @@ impl Engine {
                     .map(|k| k.trim().to_lowercase())
                     .filter(|k| !k.is_empty())
                     .collect(),
+                page: page.clamp(10, 1000),
             };
             if let Err(e) = engine.run(cmd_rx).await {
                 warn!("engine stopped: {e:#}");
@@ -1214,9 +1220,9 @@ impl Engine {
     async fn open(&mut self, ch: ChannelId) {
         self.focused = Some(ch.clone());
         // Cached first: the pane fills before any request is made.
-        if let Ok(cached) = self
-            .store
-            .latest_messages(&self.team, &ch, &self.self_id, 50)
+        if let Ok(cached) =
+            self.store
+                .latest_messages(&self.team, &ch, &self.self_id, self.page as usize)
         {
             if !cached.is_empty() {
                 self.emit(Event::Messages {
@@ -1228,7 +1234,11 @@ impl Engine {
             }
         }
 
-        match self.backend.history(&ch, HistoryQuery::default()).await {
+        let first = HistoryQuery {
+            limit: self.page,
+            ..Default::default()
+        };
+        match self.backend.history(&ch, first).await {
             Ok(page) => {
                 self.store_page(&page.messages);
                 self.emit(Event::Messages {
@@ -1250,6 +1260,7 @@ impl Engine {
                 &ch,
                 HistoryQuery {
                     latest: Some(before),
+                    limit: self.page,
                     ..Default::default()
                 },
             )
