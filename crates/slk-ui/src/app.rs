@@ -199,6 +199,8 @@ pub enum Msg {
     ListPick(usize),
     /// Files were dropped on the window.
     Dropped(Vec<std::path::PathBuf>),
+    /// Leaving was confirmed in the dialog.
+    Leave(ChannelId),
     /// An image in a message was clicked.
     ViewImage(String),
     /// The side pane's search box changed or was submitted.
@@ -408,13 +410,26 @@ impl App {
         self.title = found
             .as_ref()
             .map(|c| {
-                if c.is_dm() {
+                let name = if c.is_dm() {
                     c.name.clone()
                 } else if c.is_private() {
                     format!("🔒 {}", c.name)
                 } else {
                     format!("# {}", c.name)
+                };
+                // Star and mute in the header, as glyphs rather than as a
+                // colour: the sidebar shows the star and nothing showed the
+                // mute at all, so "why is this one quiet" had no answer on
+                // screen.
+                let mut out = String::new();
+                if c.is_starred {
+                    out.push_str("★ ");
                 }
+                out.push_str(&name);
+                if c.is_muted {
+                    out.push_str(" 🔕");
+                }
+                out
             })
             .unwrap_or_default();
         self.topic = found
@@ -1455,6 +1470,7 @@ impl SimpleComponent for App {
             Msg::Link(url) => self.follow_link(&url, &sender),
             Msg::ListPick(i) => self.pick(i, &sender),
             Msg::Dropped(paths) => self.upload(paths, &sender),
+            Msg::Leave(ch) => self.send(Command::Leave(ch)),
             Msg::ViewImage(file_id) => self.view_image(&file_id),
             // The entry is read when Enter is pressed, not per keystroke: a
             // search that fires on every letter is a request per letter.
@@ -1542,6 +1558,13 @@ impl SimpleComponent for App {
                 if self.editing.is_none() {
                     if let Some((command, rest)) = crate::logic::slash(&text) {
                         self.drafts.remove(&ch);
+                        self.composer_view().buffer().set_text("");
+                        // Some of them never leave this process: `/upload`
+                        // opens a chooser and `/search` focuses a box.
+                        if let Some((action, arg)) = crate::logic::local(&command, &rest) {
+                            self.run_local(action, &arg, &sender);
+                            return;
+                        }
                         self.send(Command::Slash {
                             channel: ch,
                             command,
@@ -2190,6 +2213,74 @@ impl App {
                 self.search.grab_focus();
             }
             "threads" => self.request_list(Command::ListThreads, "Threads"),
+            "pinned" => match self.open.clone() {
+                Some(ch) => self.request_list(Command::ListPinned(ch), "Pinned"),
+                None => self.say("no conversation open".into()),
+            },
+            "star" | "mute" => {
+                let Some(ch) = self.open.clone() else {
+                    self.say("no conversation open".into());
+                    return;
+                };
+                let Some(c) = self.convs().iter().find(|c| c.id == ch).cloned() else {
+                    return;
+                };
+                // A toggle reads the state it is toggling from the sidebar,
+                // not from a flag of its own: another client can mute a
+                // channel while this one is open, and the key has to mean
+                // "make it the other thing" rather than "make it the other
+                // thing than it was when we started".
+                self.send(if name == "star" {
+                    Command::Star {
+                        channel: ch,
+                        on: !c.is_starred,
+                    }
+                } else {
+                    Command::Mute {
+                        channel: ch,
+                        on: !c.is_muted,
+                    }
+                });
+            }
+            // Topic, purpose and invite need a word from the user, and the
+            // composer is already a text field that is focused, accessible
+            // and remappable. Prefilling it is one widget fewer to build,
+            // one more thing the a11y tree can see, and it puts the slash
+            // command in front of the user so they learn it.
+            "set_topic" | "set_purpose" | "invite" => {
+                if self.open.is_none() {
+                    self.say("no conversation open".into());
+                    return;
+                }
+                let prefill = match name {
+                    "set_topic" => {
+                        let now = self
+                            .open
+                            .clone()
+                            .and_then(|ch| self.convs().iter().find(|c| c.id == ch).cloned())
+                            .map(|c| c.topic)
+                            .unwrap_or_default();
+                        format!("/topic {now}")
+                    }
+                    "set_purpose" => {
+                        let now = self
+                            .open
+                            .clone()
+                            .and_then(|ch| self.convs().iter().find(|c| c.id == ch).cloned())
+                            .map(|c| c.purpose)
+                            .unwrap_or_default();
+                        format!("/purpose {now}")
+                    }
+                    _ => "/invite @".to_string(),
+                };
+                self.inserting.set(true);
+                let buf = self.composer_view().buffer();
+                buf.set_text(&prefill);
+                buf.place_cursor(&buf.end_iter());
+                self.inserting.set(false);
+                self.composer.grab_focus();
+            }
+            "leave_channel" => self.confirm_leave(sender),
             "saved" => self.request_list(Command::ListSaved, "Saved for later"),
             "mentions" => self.request_list(Command::ListMentions, "Mentions"),
             "browse_channels" => self.request_list(Command::BrowseChannels, "Channels to join"),
@@ -3104,6 +3195,55 @@ impl App {
     }
 
     /// Deleting is the one action with no undo, so it asks.
+    /// Leaving is the one conversation action with no undo key: rejoining a
+    /// private channel needs somebody else. So it asks, and it names the
+    /// channel in the question rather than saying "this one".
+    /// Run one of the slash commands the interface owns, with its argument.
+    fn run_local(&mut self, action: &str, arg: &str, sender: &ComponentSender<Self>) {
+        self.act(action, sender);
+        // The argument, if there is one, goes into whichever box the action
+        // just opened — jump-to or search — so `/msg alice` is one keystroke
+        // rather than two.
+        if arg.is_empty() {
+            return;
+        }
+        match action {
+            "jump_to" => {
+                self.jump.set_text(arg);
+                self.jump.set_position(-1);
+            }
+            "search" => {
+                self.search.set_text(arg);
+                self.search.set_position(-1);
+                sender.input(Msg::SearchRun);
+            }
+            _ => {}
+        }
+    }
+
+    fn confirm_leave(&mut self, sender: &ComponentSender<Self>) {
+        let Some(ch) = self.open.clone() else { return };
+        let name = self.title.clone();
+        let dialog = gtk::AlertDialog::builder()
+            .message(format!("Leave {name}?"))
+            .detail("Its history stays readable here until the cache is trimmed.")
+            .buttons(["Cancel", "Leave"])
+            .cancel_button(0)
+            .default_button(0)
+            .modal(true)
+            .build();
+        let s = sender.input_sender().clone();
+        dialog.choose(
+            self.window().as_ref(),
+            gtk::gio::Cancellable::NONE,
+            move |r| {
+                if r == Ok(1) {
+                    let _ = s.send(Msg::Leave(ch));
+                }
+            },
+        );
+    }
+
     fn confirm_delete(
         &mut self,
         channel: ChannelId,

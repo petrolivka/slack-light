@@ -105,8 +105,36 @@ pub enum Command {
         on: bool,
     },
     ListSaved,
+    /// What is pinned in this conversation.
+    ListPinned(ChannelId),
     ListThreads,
     ListMentions,
+    /// Star this conversation, or unstar it.
+    Star {
+        channel: ChannelId,
+        on: bool,
+    },
+    /// Mute this conversation, or unmute it.
+    Mute {
+        channel: ChannelId,
+        on: bool,
+    },
+    Leave(ChannelId),
+    SetTopic {
+        channel: ChannelId,
+        topic: String,
+    },
+    SetPurpose {
+        channel: ChannelId,
+        purpose: String,
+    },
+    /// Invite somebody here. `who` is whatever the user typed — a display
+    /// name, a handle or an id — and the engine resolves it, because the
+    /// engine is the side that holds the directory.
+    Invite {
+        channel: ChannelId,
+        who: String,
+    },
     /// Public channels the user is not in.
     BrowseChannels,
     /// Join a public channel and open it.
@@ -418,8 +446,6 @@ impl Engine {
     /// the workspace the way the web client sends it, so an app's `/giphy`
     /// still works. A command that is refused says so rather than vanishing.
     async fn slash(&mut self, channel: ChannelId, command: String, text: String) {
-        use slk_api::backend::ChannelOp;
-
         let result = match command.as_str() {
             "/me" => self.backend.me_message(&channel, &text).await.map(|_| None),
             "/shrug" => {
@@ -459,21 +485,78 @@ impl Engine {
                     }
                 })
             }
-            "/leave" | "/part" => self
-                .backend
-                .channel_op(ChannelOp::Leave(channel.clone()))
-                .await
-                .map(|_| Some("left")),
-            "/topic" => self
-                .backend
-                .channel_op(ChannelOp::SetTopic(channel.clone(), text.clone()))
-                .await
-                .map(|_| Some("topic set")),
-            "/purpose" => self
-                .backend
-                .channel_op(ChannelOp::SetPurpose(channel.clone(), text.clone()))
-                .await
-                .map(|_| Some("purpose set")),
+            // These five go back through the command handlers rather than
+            // straight at the backend, so that typing `/mute` and pressing the
+            // mute key do the same thing to the sidebar. Two implementations
+            // of "mute" is how one of them ends up not refreshing.
+            "/leave" | "/part" => {
+                Box::pin(self.handle(Command::Leave(channel.clone()))).await;
+                return;
+            }
+            "/topic" => {
+                Box::pin(self.handle(Command::SetTopic {
+                    channel: channel.clone(),
+                    topic: text.clone(),
+                }))
+                .await;
+                return;
+            }
+            "/purpose" => {
+                Box::pin(self.handle(Command::SetPurpose {
+                    channel: channel.clone(),
+                    purpose: text.clone(),
+                }))
+                .await;
+                return;
+            }
+            "/invite" => {
+                Box::pin(self.handle(Command::Invite {
+                    channel: channel.clone(),
+                    who: text.clone(),
+                }))
+                .await;
+                return;
+            }
+            "/mute" | "/unmute" => {
+                Box::pin(self.handle(Command::Mute {
+                    channel: channel.clone(),
+                    on: command == "/mute",
+                }))
+                .await;
+                return;
+            }
+            "/star" | "/unstar" => {
+                Box::pin(self.handle(Command::Star {
+                    channel: channel.clone(),
+                    on: command == "/star",
+                }))
+                .await;
+                return;
+            }
+            "/join" | "/open" => {
+                // `/join #design` and `/join design` both name a channel we
+                // may already be in, in which case joining is just opening.
+                let want = text.trim().trim_start_matches('#').to_string();
+                match self
+                    .store
+                    .conversations(&self.team)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&want))
+                {
+                    Some(c) if c.is_member => {
+                        self.emit(Event::OpenChannel(c.id.clone())).await;
+                        self.open(c.id).await;
+                    }
+                    Some(c) => Box::pin(self.handle(Command::Join(c.id))).await,
+                    None => {
+                        self.emit(Event::Notice(format!("no channel called {want}")))
+                            .await;
+                        self.emit(Event::SlashRejected { command, text }).await;
+                    }
+                }
+                return;
+            }
             // Anything else belongs to the workspace.
             _ => self
                 .backend
@@ -670,6 +753,54 @@ impl Engine {
         if !fetched.is_empty() {
             let _ = self.store.upsert_users(&fetched);
         }
+    }
+
+    /// Do something to a conversation, mirror it locally, and say so.
+    ///
+    /// The local write happens only after Slack agrees. A star that appears
+    /// and then quietly goes away at the next boot is the shape of bug that
+    /// makes people stop trusting the sidebar, so the optimistic path that
+    /// suits a reaction is wrong here: these are rare, deliberate acts where
+    /// a moment's wait costs nothing.
+    async fn conversation_op<F>(&mut self, op: slk_api::backend::ChannelOp, locally: F, note: &str)
+    where
+        F: FnOnce(&slk_store::Store, &TeamId) -> anyhow::Result<()>,
+    {
+        match self.backend.channel_op(op).await {
+            Ok(()) => {
+                if let Err(e) = locally(&self.store, &self.team) {
+                    warn!("mirroring a conversation change: {e:#}");
+                }
+                self.push_sidebar().await;
+                self.emit(Event::Notice(note.into())).await;
+            }
+            Err(e) => self.emit(Event::Notice(e.user_message())).await,
+        }
+    }
+
+    /// Turn what somebody typed into a user id.
+    ///
+    /// `@alice`, `alice`, `Alice Brennan` and `U0ALICE` all reach the same
+    /// person; anything else reaches nobody, which is better than inviting
+    /// the wrong one.
+    fn resolve_user(&self, who: &str) -> Option<UserId> {
+        let want = who.trim().trim_start_matches('@');
+        if want.is_empty() {
+            return None;
+        }
+        let labels = self.store.user_labels(&self.team).ok()?;
+        if let Some(u) = labels.iter().find(|u| u.id.as_str() == want) {
+            return Some(u.id.clone());
+        }
+        labels
+            .iter()
+            .find(|u| u.label.eq_ignore_ascii_case(want))
+            .or_else(|| {
+                labels
+                    .iter()
+                    .find(|u| u.label.to_lowercase().starts_with(&want.to_lowercase()))
+            })
+            .map(|u| u.id.clone())
     }
 
     async fn push_sidebar(&mut self) {
@@ -1018,6 +1149,131 @@ impl Engine {
                 })
                 .await;
             }
+
+            Command::ListPinned(ch) => {
+                // Ask Slack first: the store knows about a pin only for the
+                // history it has read, and the pin worth showing is often on
+                // a message from months ago.
+                let mut note = String::new();
+                if let Ok(all) = self.backend.pins(&ch).await {
+                    match self.store.set_pinned(&self.team, &ch, &all) {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            note = format!("{n} older than what is cached");
+                        }
+                        Err(e) => warn!("reconciling pins: {e:#}"),
+                    }
+                }
+                let mut rows: Vec<ListRow> = self
+                    .store
+                    .pinned(&self.team, &ch, 100)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(ts, text)| ListRow {
+                        label: one_line(&text),
+                        note: String::new(),
+                        target: ListTarget::Message(ch.clone(), ts),
+                    })
+                    .collect();
+                // Said rather than omitted: a pinned list that quietly drops
+                // what it cannot reach is worse than a short one that admits
+                // it, because the user cannot tell the two apart.
+                if !note.is_empty() {
+                    rows.push(ListRow {
+                        label: note,
+                        note: String::new(),
+                        target: ListTarget::Info,
+                    });
+                }
+                self.emit(Event::List {
+                    title: "pinned".into(),
+                    items: rows,
+                })
+                .await;
+            }
+
+            Command::Star { channel, on } => {
+                self.conversation_op(
+                    slk_api::backend::ChannelOp::Star(channel.clone(), on),
+                    |st, team| st.set_starred(team, &channel, on),
+                    if on { "starred" } else { "unstarred" },
+                )
+                .await;
+            }
+
+            Command::Mute { channel, on } => {
+                // The endpoint writes the whole muted set, so the local flag
+                // moves first and the list is read back from the store. If
+                // the write fails the flag is put back, which is why this one
+                // does not go through `conversation_op`.
+                let before = self.store.muted(&self.team).unwrap_or_default();
+                if let Err(e) = self.store.set_muted(&self.team, &channel, on) {
+                    self.emit(Event::Notice(format!("cannot write the cache: {e}")))
+                        .await;
+                    return;
+                }
+                let after = self.store.muted(&self.team).unwrap_or_default();
+                match self
+                    .backend
+                    .channel_op(slk_api::backend::ChannelOp::SetMuted(after))
+                    .await
+                {
+                    Ok(()) => {
+                        self.push_sidebar().await;
+                        self.emit(Event::Notice(if on { "muted" } else { "unmuted" }.into()))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ =
+                            self.store
+                                .set_muted(&self.team, &channel, before.contains(&channel));
+                        self.push_sidebar().await;
+                        self.emit(Event::Notice(e.user_message())).await;
+                    }
+                }
+            }
+
+            Command::Leave(channel) => {
+                self.conversation_op(
+                    slk_api::backend::ChannelOp::Leave(channel.clone()),
+                    |st, team| st.set_membership(team, &channel, false),
+                    "left",
+                )
+                .await;
+            }
+
+            Command::SetTopic { channel, topic } => {
+                self.conversation_op(
+                    slk_api::backend::ChannelOp::SetTopic(channel.clone(), topic.clone()),
+                    |st, team| st.set_topic(team, &channel, &topic),
+                    "topic set",
+                )
+                .await;
+            }
+
+            Command::SetPurpose { channel, purpose } => {
+                self.conversation_op(
+                    slk_api::backend::ChannelOp::SetPurpose(channel.clone(), purpose.clone()),
+                    |st, team| st.set_purpose(team, &channel, &purpose),
+                    "purpose set",
+                )
+                .await;
+            }
+
+            Command::Invite { channel, who } => match self.resolve_user(&who) {
+                Some(id) => {
+                    self.conversation_op(
+                        slk_api::backend::ChannelOp::Invite(channel, id),
+                        |_, _| Ok(()),
+                        "invited",
+                    )
+                    .await
+                }
+                None => {
+                    self.emit(Event::Notice(format!("nobody here is called {who}")))
+                        .await
+                }
+            },
 
             Command::Remember(where_) => {
                 // Best effort by design: failing to remember where someone was

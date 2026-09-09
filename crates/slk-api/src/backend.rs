@@ -48,6 +48,17 @@ pub enum ChannelOp {
     SetTopic(ChannelId, String),
     SetPurpose(ChannelId, String),
     Invite(ChannelId, UserId),
+    /// Star, or unstar. Slack calls it a favourite now and the endpoint still
+    /// calls it a star.
+    Star(ChannelId, bool),
+    /// The whole muted set, not one channel.
+    ///
+    /// `muted_channels` is a single preference holding a comma-separated list,
+    /// so muting one conversation is a write of every muted conversation. The
+    /// caller owns the list because the caller owns the conversations; a
+    /// backend that tried to keep its own copy would drift from the sidebar
+    /// the first time another client muted something.
+    SetMuted(Vec<ChannelId>),
 }
 
 /// One search result, from Slack or from the local index.
@@ -231,6 +242,16 @@ pub trait SlackBackend: Send + Sync {
 
     /// Pin to the conversation, or unpin.
     async fn pin(&self, ch: &ChannelId, ts: &Ts, on: bool) -> Result<()>;
+
+    /// What is pinned here, authoritatively.
+    ///
+    /// The store knows about a pin only for history it has actually read, and
+    /// somebody else's pin on a message from last year is exactly the one
+    /// worth showing. A default of "nothing" is the honest answer for a
+    /// backend that cannot ask.
+    async fn pins(&self, _ch: &ChannelId) -> Result<Vec<Ts>> {
+        Ok(Vec::new())
+    }
 
     /// Fetch a file to disk.
     ///

@@ -72,6 +72,14 @@ actions! {
     Save           => "save",            "Keep this for later",                  "messages";
     Pin            => "pin",             "Pin this to the conversation",         "messages";
     SearchLocal    => "search_local",    "Search what is already downloaded",    "global";
+    Pinned         => "pinned",          "What is pinned in this conversation",  "global";
+
+    Star           => "star",            "Star or unstar this conversation",     "conversation";
+    Mute           => "mute",            "Mute or unmute this conversation",     "conversation";
+    SetTopic       => "set_topic",       "Set the conversation's topic",         "conversation";
+    SetPurpose     => "set_purpose",     "Set the conversation's purpose",       "conversation";
+    InviteUser     => "invite",          "Invite somebody here",                 "conversation";
+    LeaveChannel   => "leave_channel",   "Leave this conversation",              "conversation";
 
     NextConv       => "next_conversation",   "Next conversation",                "navigate";
     PrevConv       => "prev_conversation",   "Previous conversation",            "navigate";

@@ -84,6 +84,13 @@ const DEFAULTS: &[(Action, &str)] = &[
     (Action::FollowThread, "<Control>n"),
     (Action::ToggleBroadcast, "<Control>b"),
     (Action::CopyLink, "<Control>l"),
+    (Action::Star, "<Control><Alt>s"),
+    (Action::Mute, "<Control><Alt>m"),
+    (Action::Pinned, "<Control>p"),
+    // Topic, purpose, invite and leave are deliberately keyless: they are
+    // rare, they are not reversible by pressing the same key again, and a
+    // mis-typed chord that leaves a channel is not a mistake anyone forgives.
+    // The palette and the conversation menu reach them by name.
 ];
 
 /// One installed binding, for the metrics log and the shortcuts window.

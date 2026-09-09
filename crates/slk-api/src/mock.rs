@@ -378,6 +378,11 @@ impl MockBackend {
         let mut msgs = Vec::new();
         for (user, ts, text) in script {
             let mut v = json!({"type":"message","user":user,"ts":ts,"text":text});
+            // One pinned message, so the pinned view has something to show
+            // in `--anonymous` and the suite can assert on it.
+            if ts == "1725701600.000100" {
+                v["pinned_to"] = json!(["C0ENG"]);
+            }
             if ts == "1725701900.000100" {
                 v["thread_ts"] = json!(ts);
                 v["reply_count"] = json!(2);
@@ -448,10 +453,16 @@ impl SlackBackend for MockBackend {
     }
 
     async fn boot(&self) -> Result<Boot> {
+        let conversations = self.convs.lock().unwrap().clone();
+        let muted = conversations
+            .iter()
+            .filter(|c| c.is_muted)
+            .map(|c| c.id.clone())
+            .collect();
         Ok(Boot {
-            conversations: self.convs.lock().unwrap().clone(),
+            conversations,
             users: self.users.clone(),
-            muted: Vec::new(),
+            muted,
         })
     }
 
@@ -708,7 +719,58 @@ impl SlackBackend for MockBackend {
     async fn snooze(&self, _minutes: u32) -> Result<()> {
         Ok(())
     }
+    async fn pins(&self, ch: &ChannelId) -> Result<Vec<Ts>> {
+        Ok(self
+            .messages
+            .lock()
+            .unwrap()
+            .get(ch.as_str())
+            .map(|ms| {
+                ms.iter()
+                    .filter(|m| m.pinned)
+                    .map(|m| m.ts.clone())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn channel_op(&self, op: ChannelOp) -> Result<()> {
+        // The demo workspace answers these for real, because a star that does
+        // not move is indistinguishable from a star that is not wired up, and
+        // the a11y suite has to be able to tell the two apart.
+        match &op {
+            ChannelOp::Star(ch, on) => {
+                let mut convs = self.convs.lock().unwrap();
+                if let Some(c) = convs.iter_mut().find(|c| c.id == *ch) {
+                    c.is_starred = *on;
+                }
+            }
+            ChannelOp::SetMuted(all) => {
+                let mut convs = self.convs.lock().unwrap();
+                for c in convs.iter_mut() {
+                    c.is_muted = all.contains(&c.id);
+                }
+            }
+            ChannelOp::SetTopic(ch, t) => {
+                let mut convs = self.convs.lock().unwrap();
+                if let Some(c) = convs.iter_mut().find(|c| c.id == *ch) {
+                    c.topic = t.clone();
+                }
+            }
+            ChannelOp::SetPurpose(ch, t) => {
+                let mut convs = self.convs.lock().unwrap();
+                if let Some(c) = convs.iter_mut().find(|c| c.id == *ch) {
+                    c.purpose = t.clone();
+                }
+            }
+            ChannelOp::Leave(ch) => {
+                let mut convs = self.convs.lock().unwrap();
+                if let Some(c) = convs.iter_mut().find(|c| c.id == *ch) {
+                    c.is_member = false;
+                }
+            }
+            _ => {}
+        }
         if let ChannelOp::Join(ch) = &op {
             let mut convs = self.convs.lock().unwrap();
             if !convs.iter().any(|c| c.id == *ch) {

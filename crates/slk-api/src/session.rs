@@ -600,6 +600,23 @@ impl SlackBackend for SessionBackend {
                 )
                 .await?;
             }
+            ChannelOp::Star(ch, on) => {
+                let method = if on { "stars.add" } else { "stars.remove" };
+                match self.call(method, &[("channel", ch.as_str())]).await {
+                    Ok(_) => {}
+                    // Two clients racing, or a sidebar that was already right.
+                    Err(e) if e.detail == "already_starred" || e.detail == "not_starred" => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            ChannelOp::SetMuted(all) => {
+                let value = all.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(",");
+                self.call(
+                    "users.prefs.set",
+                    &[("name", "muted_channels"), ("value", &value)],
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -665,6 +682,21 @@ impl SlackBackend for SessionBackend {
             Err(e) if e.detail == "already_pinned" || e.detail == "no_pin" => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    async fn pins(&self, ch: &ChannelId) -> Result<Vec<Ts>> {
+        let v = self.call("pins.list", &[("channel", ch.as_str())]).await?;
+        // `pins.list` returns items, not messages: a pinned file has no `ts`
+        // of its own and is skipped rather than guessed at.
+        Ok(v.get("items")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|i| i.get("message")?.get("ts")?.as_str())
+                    .map(Ts::new)
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn download(&self, url: &str, to: &std::path::Path) -> Result<u64> {

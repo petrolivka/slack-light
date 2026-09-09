@@ -282,12 +282,52 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/me", "Write in the third person"),
     ("/shrug", "Append ¯\\_(ツ)_/¯"),
     ("/topic", "Set the conversation's topic"),
+    ("/purpose", "Set the conversation's purpose"),
     ("/remind", "Ask Slackbot to remind somebody"),
-    ("/away", "Toggle your presence"),
+    ("/away", "Set yourself away"),
+    ("/active", "Set yourself active"),
+    ("/status", "Set your status: `:emoji: text`"),
+    ("/dnd", "Snooze notifications for so many minutes"),
     ("/dm", "Open a direct message"),
+    ("/msg", "Open a direct message"),
     ("/invite", "Invite somebody here"),
+    ("/join", "Join or open a channel"),
     ("/leave", "Leave this conversation"),
+    ("/mute", "Mute this conversation"),
+    ("/unmute", "Unmute this conversation"),
+    ("/star", "Star this conversation"),
+    ("/unstar", "Unstar this conversation"),
+    ("/search", "Search Slack"),
+    ("/upload", "Send a file"),
+    ("/thread", "Open the selected message's thread"),
+    ("/edit", "Edit the selected message"),
+    ("/pins", "What is pinned here"),
 ];
+
+/// A slash command the *interface* owns rather than the engine.
+///
+/// `/upload` opens a file chooser and `/search` focuses a box; neither has
+/// anything to send. Returning the action name rather than doing the work
+/// keeps one list of what each command means, which is what the command
+/// palette and the shortcuts window both read.
+///
+/// The second half of the pair is the text to hand the action, if it takes
+/// any: `/msg alice` should land in jump-to with `alice` already typed.
+pub fn local(command: &str, text: &str) -> Option<(&'static str, String)> {
+    let arg = text.trim().to_string();
+    Some(match command {
+        "/search" => ("search", arg),
+        "/upload" => ("upload_file", String::new()),
+        "/thread" => ("open_thread", String::new()),
+        "/edit" => ("edit_message", String::new()),
+        "/pins" => ("pinned", String::new()),
+        // Jump-to already fuzzy-matches every conversation and person, so
+        // `/msg alice` is that box with `alice` in it. Inventing a second
+        // people-picker would give two answers to "who is alice".
+        "/msg" | "/dm" => ("jump_to", arg),
+        _ => return None,
+    })
+}
 
 /// A message that is really a slash command, split into the two parts the
 /// engine wants.
@@ -461,6 +501,45 @@ pub fn accel(rendered: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_interface_owns_the_commands_with_nothing_to_send() {
+        use super::local;
+        assert_eq!(local("/upload", ""), Some(("upload_file", String::new())));
+        assert_eq!(local("/msg", " alice "), Some(("jump_to", "alice".into())));
+        assert_eq!(
+            local("/search", "from:bob"),
+            Some(("search", "from:bob".into()))
+        );
+        // Everything else is the engine's or the workspace's, and must not be
+        // swallowed here: `/giphy` has to reach Slack.
+        assert_eq!(local("/giphy", "cat"), None);
+        assert_eq!(local("/topic", "x"), None);
+        assert_eq!(local("/me", "waves"), None);
+    }
+
+    #[test]
+    fn every_advertised_command_is_owned_by_somebody() {
+        // The completion list is what the user is told exists. A command in
+        // it that neither the interface nor the engine answers is a promise
+        // the client does not keep — which is exactly how `/pins` was
+        // advertised and then forwarded to Slack as an unknown command.
+        const ENGINE: &[&str] = &[
+            "/me", "/shrug", "/topic", "/purpose", "/away", "/active", "/status", "/dnd",
+            "/invite", "/join", "/leave", "/mute", "/unmute", "/star", "/unstar",
+        ];
+        // Slackbot's, not ours, and it works because the engine forwards
+        // anything it does not recognise to the workspace.
+        const PASS_THROUGH: &[&str] = &["/remind"];
+        for (name, _) in super::COMMANDS {
+            assert!(
+                super::local(name, "").is_some()
+                    || ENGINE.contains(name)
+                    || PASS_THROUGH.contains(name),
+                "{name} is offered but nothing answers it"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

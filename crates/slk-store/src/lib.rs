@@ -494,6 +494,105 @@ impl Store {
         Ok(rows)
     }
 
+    /// What is pinned in one conversation, newest first.
+    ///
+    /// Scoped to a conversation because that is what a pin is: Slack has no
+    /// workspace-wide pinned list, and a flat one across channels would read
+    /// as a second Saved list rather than as this channel's notice board.
+    pub fn pinned(&self, team: &TeamId, ch: &ChannelId, limit: usize) -> Result<Vec<(Ts, String)>> {
+        let mut st = self.db.prepare(
+            "SELECT ts, text FROM message
+             WHERE team = ?1 AND channel = ?2 AND deleted = 0 AND pinned = 1
+             ORDER BY ts DESC LIMIT ?3",
+        )?;
+        let rows = st
+            .query_map(params![team.as_str(), ch.as_str(), limit as i64], |r| {
+                Ok((Ts::new(r.get::<_, String>(0)?), r.get(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Reconcile the pin flags in one conversation against what Slack says.
+    ///
+    /// A whole-channel reconcile rather than a set of individual flips, so a
+    /// pin somebody else removed while we were away disappears here too.
+    /// Returns how many of the given timestamps we do not actually hold —
+    /// pins older than the cache, which the interface reports rather than
+    /// silently omitting.
+    pub fn set_pinned(&self, team: &TeamId, ch: &ChannelId, all: &[Ts]) -> Result<usize> {
+        self.db.execute(
+            "UPDATE message SET pinned = 0 WHERE team = ?1 AND channel = ?2 AND pinned = 1",
+            params![team.as_str(), ch.as_str()],
+        )?;
+        let mut missing = 0;
+        for ts in all {
+            let n = self.db.execute(
+                "UPDATE message SET pinned = 1 WHERE team = ?1 AND channel = ?2 AND ts = ?3",
+                params![team.as_str(), ch.as_str(), ts.as_str()],
+            )?;
+            if n == 0 {
+                missing += 1;
+            }
+        }
+        Ok(missing)
+    }
+
+    // ---- conversation flags --------------------------------------------
+
+    pub fn set_starred(&self, team: &TeamId, ch: &ChannelId, on: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE conversation SET is_starred = ?3 WHERE team = ?1 AND id = ?2",
+            params![team.as_str(), ch.as_str(), on],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_muted(&self, team: &TeamId, ch: &ChannelId, on: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE conversation SET is_muted = ?3 WHERE team = ?1 AND id = ?2",
+            params![team.as_str(), ch.as_str(), on],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_membership(&self, team: &TeamId, ch: &ChannelId, member: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE conversation SET is_member = ?3 WHERE team = ?1 AND id = ?2",
+            params![team.as_str(), ch.as_str(), member],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_topic(&self, team: &TeamId, ch: &ChannelId, topic: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE conversation SET topic = ?3 WHERE team = ?1 AND id = ?2",
+            params![team.as_str(), ch.as_str(), topic],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_purpose(&self, team: &TeamId, ch: &ChannelId, purpose: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE conversation SET purpose = ?3 WHERE team = ?1 AND id = ?2",
+            params![team.as_str(), ch.as_str(), purpose],
+        )?;
+        Ok(())
+    }
+
+    /// Every muted conversation, which is what `muted_channels` wants written.
+    pub fn muted(&self, team: &TeamId) -> Result<Vec<ChannelId>> {
+        let mut st = self
+            .db
+            .prepare("SELECT id FROM conversation WHERE team = ?1 AND is_muted = 1 ORDER BY id")?;
+        let rows = st
+            .query_map(params![team.as_str()], |r| {
+                Ok(ChannelId::new(r.get::<_, String>(0)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Messages that name this user, newest first.
     ///
     /// A `LIKE` over the stored text: mentions are stored as `<@Uxxxx>`, which
