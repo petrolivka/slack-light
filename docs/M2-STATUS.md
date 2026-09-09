@@ -77,9 +77,13 @@ too.** Measured over five seconds with seven messages: M2a 116/489/491
 frames across three runs, M1 114/201/256. Idle CPU 0.5–2.5 % in both. It
 is position-dependent and survives pinning the scrollbar, replacing
 `ListView::scroll_to` with an adjustment move, and `ContentFit::Fill` on
-the picture. **It is a real defect against NFR-3 ("~0 % CPU when nothing
-changes") and it is not new**; it is on the M2b list with this evidence
-attached rather than left as a surprise.
+the picture.
+
+> **Answered in §10.** It is GTK's own text caret, which fades rather than
+> switches and so drives the frame clock at the display's full rate for as
+> long as the composer has focus. Not a defect in this client, and now a
+> switch. The "position-dependent" part was the window opening on the
+> 120 Hz panel or the 60 Hz monitor.
 
 The earlier "0.06 % idle, 54 MB" from M1 was one lucky sample that I
 believed. Three samples of the same command now give 99.0 / 98.8 / 99.1 MB
@@ -401,6 +405,62 @@ one was added rather than left unreachable.
 Drag-and-drop has neither, and is verified by eye alone. It is written down
 here rather than implied by a green suite.
 
+## 10. The idle repaint, answered
+
+Chased since M1, blamed on four different widgets, and finally measured by
+taking focus away rather than by reading code. Eight idle seconds, 50 rows,
+same binary:
+
+| | Idle CPU | Frames |
+|---|---|---|
+| Composer focused, caret blinking | 1.97 % | 484 |
+| Window not focused | 0.54 % | 114 |
+| `--read-only`, so the composer has no caret | 0.47 % | 115 |
+| `[ui] reduced_motion = true` | **0.02 %** | **0** |
+
+GTK 4 fades the text caret in and out rather than switching it on and off,
+which asks the frame clock for a frame every frame for as long as a text
+field has focus. That is the whole of it. The remaining ~14 frames a second
+were widget animations — a scrollbar settling, an overshoot — and
+`gtk-enable-animations` takes those too.
+
+So **NFR-3 is met**, and the honest statement of it is: an idle window
+costs 0.02 % of a core and paints nothing, *if* nothing on it is animating;
+a blinking caret costs 2 % of a core, on this machine, at 120 Hz. The
+client does not turn the caret off by default, because a text field without
+one is a text field people think is broken. `[ui] reduced_motion` — which
+already existed and meant "stop anything from changing on its own" — now
+does something in the window, and `e2e.sh` asserts that an idle window with
+it set paints exactly zero frames.
+
+Two things this cost, worth writing down: the earlier rounds ruled out
+`propagate_natural_height`, `ContentFit::Contain`, an automatic scrollbar
+policy and `ListView::scroll_to` — all four were plausible, three of them
+were genuinely worth fixing anyway, and none of them was the answer.
+Reading code found four suspects; changing one variable at a time found the
+cause in three measurements.
+
+## 11. The memory budget, decided
+
+NFR-4 was written as "private under 80 MB and resident under 200 MB with
+5 000 messages loaded". Paging changed the premise: the client loads a page
+of 50 and asks for more as the reader goes back, so five thousand messages
+in one list is now something a person has to work at.
+
+Measured, three samples each, `--anonymous --no-cache --demo-rows 5000`:
+
+| Rows in the list | Private | Resident |
+|---|---|---|
+| 50 (the default page) | 57.5 MB | 190 MB |
+| 1 000 (`history_page = 1000`) | 59.5 MB | 191 MB |
+| 5 007 (all of them, before paging) | 64.8 MB | 197 MB |
+
+The budget stands as written and is met at every size, including the stress
+case it was written for. No number needed changing; what needed changing
+was the loading strategy, and that is done.
+
 ### What is left in M2b
 
-- **The idle repaint** (§2), and the memory budget decision
+Nothing on the list. The remaining `M` requirements are the ones M2 never
+claimed: the workspace-level operations (archive, invite, channel
+management), and the parts of Block Kit that need interactivity.

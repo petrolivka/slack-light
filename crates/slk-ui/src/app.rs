@@ -957,6 +957,21 @@ impl SimpleComponent for App {
             options,
         } = init;
 
+        // `[ui] reduced_motion` means "stop anything from changing on its
+        // own", and in a window the thing that changes on its own is the
+        // caret. GTK 4 fades it in and out rather than switching it, which
+        // drives the frame clock at the display's full rate: measured at
+        // 1.97 % idle CPU and 60 frames a second with the composer focused,
+        // against 0.47 % and 14 with no caret. That is the whole of the idle
+        // repaint chased since M1 — not a defect in this client, but the
+        // price of a focused text field, and now a switch.
+        if config.ui.reduced_motion {
+            if let Some(settings) = gtk::Settings::default() {
+                settings.set_gtk_cursor_blink(false);
+                settings.set_gtk_enable_animations(false);
+            }
+        }
+
         let (palette, source) = slk_theme::load(&theme_choice);
         bench::report("theme_source", format!("{source:?}"));
         let theme = slk_theme::Applied::new(&palette, user_css.as_deref());

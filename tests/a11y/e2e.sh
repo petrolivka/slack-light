@@ -23,7 +23,7 @@ shot() { local g; g=$(hyprctl clients -j | jq -r ".[] | select(.class==\"$CLASS\
 # A stray window from an earlier run confuses tree.py, which reads the first
 # slack-light on the a11y bus. Start clean.
 pkill -x slack-light 2>/dev/null && sleep 1
-LOG=$(mktemp); LOG2=$(mktemp); LOG3=$(mktemp)
+LOG=$(mktemp); LOG2=$(mktemp); LOG3=$(mktemp); LOG4=$(mktemp)
 "$BIN" --anonymous --demo-rows 30 --metrics >"$LOG" 2>&1 &
 PID=$!
 sleep 3
@@ -199,6 +199,25 @@ check "a mention elsewhere is raised" "$( [ "$(grep -c '^notified=' "$LOG3")" -g
 check "and it says who and where" "$( grep -q '^notified=.*mentioned you in #' "$LOG3" && echo 1 || echo 0 )"
 
 kill $PID3 2>/dev/null; wait $PID3 2>/dev/null
+sleep 1
+
+# NFR-3: ~0 % CPU when nothing changes. What was in the way was GTK's own
+# caret, which fades rather than switches and so drives the frame clock at
+# the display's full rate. `[ui] reduced_motion` turns it off, and then an
+# idle window paints nothing at all — which is assertable, unlike a CPU
+# percentage.
+CFG=$(mktemp -d)
+mkdir -p "$CFG/slack-light"
+printf '[ui]\nreduced_motion = true\n' > "$CFG/slack-light/config.toml"
+XDG_CONFIG_HOME="$CFG" "$BIN" --anonymous --no-cache --demo-rows 50 --metrics --bench --idle 5 >"$LOG4" 2>&1 &
+PID4=$!
+sleep 3
+focus
+wait $PID4 2>/dev/null
+frames=$(grep '^idle_frames=' "$LOG4" | cut -d= -f2)
+check "an idle window with reduced motion paints nothing" "$( [ "${frames:-1}" = 0 ] && echo 1 || echo 0 )" "${frames:-no reading} frames"
+check "and costs no measurable cpu" "$( awk -F= '/^idle_cpu_pct=/ { exit ($2 < 0.2) ? 0 : 1 }' "$LOG4" && echo 1 || echo 0 )" "$(grep '^idle_cpu_pct=' "$LOG4")"
+rm -rf "$CFG"
 # Shift on a character key is delivered as the plain keyval and matches no
 # accelerator (see logic::bindable). A binding like that is dead on arrival,
 # so none may be installed — and every action must have a key or say why not.
@@ -209,5 +228,5 @@ check "every action but the two GTK owns has a key" "$( [ "$unbound" -le 2 ] && 
 
 echo "--- bindings installed ---"; grep '^binding=' "$LOG" | sed 's/^binding=/  /'
 echo; echo "$pass passed, $fail failed"
-rm -f "$LOG" "$LOG2" "$LOG3"
+rm -f "$LOG" "$LOG2" "$LOG3" "$LOG4"
 [ "$fail" = 0 ]
