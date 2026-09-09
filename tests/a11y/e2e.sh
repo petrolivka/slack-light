@@ -44,6 +44,24 @@ wtype "keyboard test"; sleep 0.2; wtype -k Return; sleep 2.5
 check "typing after the jump goes to the composer and sends" "$( tree | grep -q "keyboard test" && echo 1 || echo 0 )"
 check "the send was confirmed by the engine" "$( grep -q send_confirmed_ms "$LOG" && echo 1 || echo 0 )"
 
+# Completion. The popup offers, Enter takes, and the rest is unit-tested:
+# a resolved mention renders as the name it started as, so the tree cannot
+# tell `<@U0ALICE>` from `@alice` — slk-core's tests do that.
+wtype "hi @al"; sleep 1.0
+check "typing @ offers the people" "$( tree | grep -q "label '@alice'" && echo 1 || echo 0 )"
+wtype -k Return; sleep 0.4
+wtype ":roc"; sleep 1.0
+check "typing a shortcode offers emoji, best first" "$( tree | grep -A1 "list item" | grep -q ':rocket:' && echo 1 || echo 0 )" "$(tree | grep -oE "':[a-z]+:'" | head -2 | tr '\n' ' ')"
+wtype -k Escape; sleep 0.3
+check "escape closes the completions and leaves the draft" "$( tree | grep -q ':rocket:' && echo 0 || echo 1 )"
+
+# A draft survives a look at another conversation. Losing one is the thing
+# people never forgive a chat client for.
+wtype -M alt -k Up -m alt; sleep 1.2
+wtype -M alt -k Down -m alt; sleep 1.2
+wtype -k Return; sleep 2.0
+check "a draft survives leaving the conversation" "$( tree | grep -q 'hi @alice :roc' && echo 1 || echo 0 )" "$(tree | grep -oE "'hi @alice[^']*'" | head -1)"
+
 # E1: alt-Up moves to the previous conversation without the mouse.
 wtype -M alt -k Up -m alt; sleep 1.2
 check "alt-Up moves to the previous conversation" "$( tree | grep -q "label '🔒 leads'" && echo 1 || echo 0 )" "$(tree | grep -E "label '(#|🔒)" | head -2 | tr '\n' ' ')"

@@ -152,8 +152,13 @@ pub fn search_with(query: &str, limit: usize, skin: Option<u8>) -> Vec<(String, 
             }
         }
     }
-    prefix.sort_by_key(|(c, _)| c.len());
-    substring.sort_by_key(|(c, _)| c.len());
+    // Shortest first, but the curated set first of all: typing `roc` means
+    // :rocket: far more often than :rock:, and shortest-prefix alone put the
+    // rock ahead of it.
+    let common_first =
+        |(code, _): &(String, String)| (!COMMON.contains(&code.as_str()), code.len());
+    prefix.sort_by_key(common_first);
+    substring.sort_by_key(common_first);
     prefix.extend(substring);
     prefix.truncate(limit);
     // Only the ones that have a toned form change; a rocket stays a rocket.
@@ -187,6 +192,15 @@ fn has_tones(name: &str) -> bool {
 
 #[cfg(test)]
 mod tone_tests {
+    #[test]
+    fn the_common_set_wins_a_tie_on_prefix() {
+        let hits = super::search("roc", 8);
+        let names: Vec<&str> = hits.iter().map(|(n, _)| n.as_str()).collect();
+        let rocket = names.iter().position(|n| *n == "rocket").unwrap();
+        let rock = names.iter().position(|n| *n == "rock").unwrap();
+        assert!(rocket < rock, "rocket before rock: {names:?}");
+    }
+
     #[test]
     fn a_tone_is_added_only_where_there_is_one() {
         assert_eq!(super::with_tone("wave", Some(3)), "wave::skin-tone-3");

@@ -347,6 +347,13 @@ window {{ background-color: @sl_bg; color: @sl_fg; font-size: 13px; }}
 .threadpane .composer {{ background-color: @sl_bg; }}
 .threadpane checkbutton {{ color: @sl_fg_dim; font-size: 11px; padding: 0 6px 4px 6px; }}
 
+/* The completion popup: a list under the word being typed. */
+.completions {{ background-color: @sl_bg_light; }}
+.completions list {{ background-color: @sl_bg_light; }}
+.completions row {{ padding: 2px 0; }}
+.completions row:selected {{ background-color: alpha(@sl_accent, 0.30); }}
+.completions label {{ color: @sl_fg; font-family: {mono}; font-size: 12px; }}
+
 /* The picker and the shortcuts window. */
 .picker {{ background-color: @sl_bg; color: @sl_fg; }}
 .picker button {{ background: none; border: none; box-shadow: none; font-size: 17px; }}

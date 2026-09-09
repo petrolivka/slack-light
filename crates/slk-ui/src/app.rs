@@ -24,6 +24,24 @@ use tokio::sync::mpsc;
 pub struct Directory {
     pub users: HashMap<String, String>,
     pub channels: HashMap<String, String>,
+    /// The same, the other way round and lower-cased: rendering needs
+    /// id → name, sending needs name → id, and completing needs to search
+    /// names. One map cannot serve all three without a scan per mention.
+    pub user_ids: HashMap<String, String>,
+    pub channel_ids: HashMap<String, String>,
+    /// Handle → id, for `@design-team`.
+    pub groups: HashMap<String, String>,
+}
+
+impl Directory {
+    pub fn add_user(&mut self, id: String, label: String) {
+        self.user_ids.insert(label.to_lowercase(), id.clone());
+        self.users.insert(id, label);
+    }
+    pub fn add_channel(&mut self, id: String, name: String) {
+        self.channel_ids.insert(name.to_lowercase(), id.clone());
+        self.channels.insert(id, name);
+    }
 }
 
 impl Names for Directory {
@@ -32,6 +50,18 @@ impl Names for Directory {
     }
     fn channel(&self, id: &str) -> Option<&str> {
         self.channels.get(id).map(String::as_str)
+    }
+}
+
+impl slk_core::outgoing::Lookup for Directory {
+    fn user_id(&self, name: &str) -> Option<String> {
+        self.user_ids.get(&name.to_lowercase()).cloned()
+    }
+    fn channel_id(&self, name: &str) -> Option<String> {
+        self.channel_ids.get(&name.to_lowercase()).cloned()
+    }
+    fn usergroup_id(&self, handle: &str) -> Option<String> {
+        self.groups.get(&handle.to_lowercase()).cloned()
     }
 }
 
@@ -122,6 +152,11 @@ pub enum Msg {
     },
     /// A shortcode chosen in the picker.
     Picked(String),
+    /// The composer's text changed; re-read what is being completed.
+    ComposerChanged,
+    /// Move within, or accept, the completion list.
+    CompleteStep(i32),
+    CompleteAccept,
     JumpChanged(String),
     JumpAccept,
     Engine(TeamId, Event),
@@ -189,6 +224,22 @@ pub struct App {
     history: Vec<ChannelId>,
     history_at: usize,
     picker: Option<gtk::Window>,
+    /// The completion popup: what it is offering, and where in the buffer
+    /// the token being completed starts.
+    complete: gtk::Popover,
+    complete_list: gtk::ListBox,
+    completing: Option<crate::logic::Completing>,
+    /// Text to insert per offered row, alongside the row's own label.
+    candidates: Vec<String>,
+    /// Set while the client itself is rewriting the composer, and read
+    /// **inside the signal handler**: `changed` is emitted synchronously but
+    /// the input message it sends is handled later, by which time the flag
+    /// is down again. Restoring a draft re-opened the completion popup that
+    /// way, and the next Enter accepted a completion instead of sending.
+    inserting: Rc<std::cell::Cell<bool>>,
+    /// What was typed and not sent, per conversation. A draft lost by
+    /// glancing at another channel is the thing people never forgive.
+    drafts: HashMap<ChannelId, String>,
     /// Slack's skin tone, applied to what the picker shows and to what is
     /// sent, so the two cannot disagree.
     skin: Option<u8>,
@@ -268,6 +319,10 @@ impl App {
         if self.open.as_ref() == Some(&id) {
             return;
         }
+        // An edit in flight belongs to the conversation being left.
+        self.stash_draft();
+        self.editing = None;
+        self.close_completions();
         let found = self.convs().iter().find(|c| c.id == id).cloned();
         self.title = found
             .as_ref()
@@ -305,6 +360,12 @@ impl App {
         if self.thread.is_some() {
             self.close_thread();
         }
+        self.inserting.set(true);
+        self.composer
+            .buffer()
+            .set_text(self.drafts.get(&id).map(String::as_str).unwrap_or(""));
+        self.inserting.set(false);
+        self.refresh_hint();
         self.send(Command::Open(id));
     }
 
@@ -312,6 +373,7 @@ impl App {
         if i >= self.workspaces.len() || i == self.current {
             return;
         }
+        self.stash_draft();
         self.current = i;
         self.open = None;
         self.list.clear();
@@ -831,6 +893,12 @@ impl SimpleComponent for App {
             history: Vec::new(),
             history_at: 0,
             picker: None,
+            complete: gtk::Popover::new(),
+            complete_list: gtk::ListBox::new(),
+            completing: None,
+            candidates: Vec::new(),
+            inserting: Rc::new(std::cell::Cell::new(false)),
+            drafts: HashMap::new(),
             skin: (config.emoji.skin_tone > 0).then_some(config.emoji.skin_tone),
             sidebar: gtk::ListBox::new(),
             sidebar_box: gtk::Box::new(gtk::Orientation::Vertical, 0),
@@ -906,16 +974,63 @@ impl SimpleComponent for App {
         // Where a pooled row's buttons send what they were clicked for.
         ROW_SENDER.with_borrow_mut(|slot| *slot = Some(sender.input_sender().clone()));
 
+        // The completion popup. `autohide` off, because the composer has to
+        // keep the keyboard: a popup that takes focus turns every completion
+        // into a click to get back.
+        {
+            let pop = &model.complete;
+            pop.set_autohide(false);
+            pop.set_has_arrow(false);
+            pop.set_position(gtk::PositionType::Top);
+            pop.add_css_class("completions");
+            let scroller = gtk::ScrolledWindow::new();
+            scroller.set_max_content_height(220);
+            scroller.set_propagate_natural_height(true);
+            scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
+            scroller.set_child(Some(&model.complete_list));
+            pop.set_child(Some(&scroller));
+            pop.set_parent(&model.composer);
+            let s2 = sender.input_sender().clone();
+            model.complete_list.connect_row_activated(move |list, row| {
+                list.select_row(Some(row));
+                let _ = s2.send(Msg::CompleteAccept);
+            });
+        }
+
         // Enter sends, shift+Enter is a newline. A TextView has no
-        // `activate`, so each composer needs the key itself.
+        // `activate`, so each composer needs the key itself. While the
+        // completion popup is up the same keys drive it instead — Enter that
+        // sends a half-typed mention is worse than no completion at all.
         for (view, to_thread) in [(&model.composer, false), (&model.thread_composer, true)] {
             let k = gtk::EventControllerKey::new();
             let s2 = sender.input_sender().clone();
             let view2 = view.clone();
+            let pop = model.complete.clone();
             k.connect_key_pressed(move |_, key, _, state| {
-                if key == gtk::gdk::Key::Return
-                    && !state.contains(gtk::gdk::ModifierType::SHIFT_MASK)
-                {
+                use gtk::gdk::Key;
+                let open = !to_thread && pop.is_visible();
+                if open {
+                    match key {
+                        Key::Down | Key::Tab => {
+                            let _ = s2.send(Msg::CompleteStep(1));
+                            return gtk::glib::Propagation::Stop;
+                        }
+                        Key::Up | Key::ISO_Left_Tab => {
+                            let _ = s2.send(Msg::CompleteStep(-1));
+                            return gtk::glib::Propagation::Stop;
+                        }
+                        Key::Return | Key::KP_Enter => {
+                            let _ = s2.send(Msg::CompleteAccept);
+                            return gtk::glib::Propagation::Stop;
+                        }
+                        Key::Escape => {
+                            let _ = s2.send(Msg::CompleteStep(0));
+                            return gtk::glib::Propagation::Stop;
+                        }
+                        _ => {}
+                    }
+                }
+                if key == Key::Return && !state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
                     let buf = view2.buffer();
                     let (a, b) = buf.bounds();
                     let text = buf.text(&a, &b, false).to_string();
@@ -932,6 +1047,15 @@ impl SimpleComponent for App {
                 gtk::glib::Propagation::Proceed
             });
             view.add_controller(k);
+        }
+        {
+            let s2 = sender.input_sender().clone();
+            let quiet = model.inserting.clone();
+            model.composer.buffer().connect_changed(move |_| {
+                if !quiet.get() {
+                    let _ = s2.send(Msg::ComposerChanged);
+                }
+            });
         }
 
         // Nothing is selected until something is: an autoselecting list puts
@@ -1067,6 +1191,30 @@ impl SimpleComponent for App {
                     None => self.act(&act, &sender),
                 }
             }
+            Msg::ComposerChanged => self.refresh_completions(),
+            Msg::CompleteStep(d) => {
+                if d == 0 {
+                    self.close_completions();
+                } else {
+                    let n = self.candidates.len() as i32;
+                    if n > 0 {
+                        let at = self
+                            .complete_list
+                            .selected_row()
+                            .map(|r| r.index())
+                            .unwrap_or(0);
+                        let to = (at + d).rem_euclid(n);
+                        if let Some(row) = self.complete_list.row_at_index(to) {
+                            self.complete_list.select_row(Some(&row));
+                            // Keep it in view: a selection scrolled out of
+                            // the popup is a selection you cannot read.
+                            row.grab_focus();
+                            self.composer.grab_focus();
+                        }
+                    }
+                }
+            }
+            Msg::CompleteAccept => self.accept_completion(),
             Msg::Picked(name) => {
                 self.close_picker();
                 self.react(&name, &sender);
@@ -1077,6 +1225,7 @@ impl SimpleComponent for App {
                     return;
                 }
                 if let (Some(ch), Some(parent)) = (self.open.clone(), self.thread.clone()) {
+                    let text = self.wire(&text);
                     self.send(Command::Send {
                         channel: ch,
                         thread: Some(parent),
@@ -1099,6 +1248,7 @@ impl SimpleComponent for App {
                 }
                 let Some(ch) = self.open.clone() else { return };
                 if let Some(ts) = self.editing.take() {
+                    let text = self.wire(&text);
                     self.send(Command::Edit {
                         channel: ch,
                         ts,
@@ -1108,6 +1258,8 @@ impl SimpleComponent for App {
                     return;
                 }
                 self.sent_at = Some(std::time::Instant::now());
+                self.drafts.remove(&ch);
+                let text = self.wire(&text);
                 self.send(Command::Send {
                     channel: ch,
                     thread: None,
@@ -1199,14 +1351,20 @@ impl App {
             Event::Users(users) => {
                 let mut d = self.shared.names.borrow_mut();
                 for u in users {
-                    d.users.insert(u.id.as_str().to_string(), u.label);
+                    d.add_user(u.id.as_str().to_string(), u.label);
+                }
+            }
+            Event::UserGroups(groups) => {
+                let mut d = self.shared.names.borrow_mut();
+                for (id, handle) in groups {
+                    d.groups.insert(handle.to_lowercase(), id);
                 }
             }
             Event::Conversations(convs) => {
                 {
                     let mut d = self.shared.names.borrow_mut();
                     for c in &convs {
-                        d.channels.insert(c.id.as_str().to_string(), c.name.clone());
+                        d.add_channel(c.id.as_str().to_string(), c.name.clone());
                     }
                 }
                 self.workspaces[idx].convs = convs;
@@ -1674,6 +1832,182 @@ impl App {
             other => self.say(format!("unbound action {other}")),
         }
     }
+    // ---- composing -----------------------------------------------------
+
+    /// What the user typed, as Slack wants it on the wire.
+    fn wire(&self, text: &str) -> String {
+        slk_core::outgoing::encode(text, &*self.shared.names.borrow())
+    }
+
+    /// The text left of the cursor in the main composer.
+    fn before_cursor(&self) -> String {
+        let buf = self.composer.buffer();
+        let cursor = buf.iter_at_mark(&buf.get_insert());
+        buf.text(&buf.start_iter(), &cursor, false).to_string()
+    }
+
+    /// Decide whether the completion popup should be up, and with what.
+    fn refresh_completions(&mut self) {
+        // Only the last line matters, and only up to the cursor: a mention
+        // three lines above is finished business.
+        let before = self.before_cursor();
+        let line = before.rsplit('\n').next().unwrap_or_default().to_string();
+        let base = before.len() - line.len();
+        let Some(mut c) = crate::logic::completing(&line) else {
+            self.close_completions();
+            return;
+        };
+        c.at += base;
+        let rows = self.candidates(&c);
+        if rows.is_empty() {
+            self.close_completions();
+            return;
+        }
+
+        while let Some(child) = self.complete_list.first_child() {
+            self.complete_list.remove(&child);
+        }
+        self.candidates = rows.iter().map(|(insert, _)| insert.clone()).collect();
+        for (_, label) in &rows {
+            let l = gtk::Label::new(Some(label));
+            l.set_xalign(0.0);
+            l.set_margin_start(8);
+            l.set_margin_end(8);
+            self.complete_list.append(&l);
+        }
+        if let Some(row) = self.complete_list.row_at_index(0) {
+            self.complete_list.select_row(Some(&row));
+        }
+        self.completing = Some(c);
+        self.point_completions();
+        self.complete.popup();
+    }
+
+    /// Put the popup under the word being completed, not under the widget:
+    /// a list anchored to the whole composer points at nothing.
+    fn point_completions(&self) {
+        let buf = self.composer.buffer();
+        let cursor = buf.iter_at_mark(&buf.get_insert());
+        let loc = self.composer.iter_location(&cursor);
+        let (x, y) =
+            self.composer
+                .buffer_to_window_coords(gtk::TextWindowType::Widget, loc.x(), loc.y());
+        self.complete
+            .set_pointing_to(Some(&gtk::gdk::Rectangle::new(x, y, 1, loc.height())));
+    }
+
+    fn close_completions(&mut self) {
+        self.completing = None;
+        self.candidates.clear();
+        if self.complete.is_visible() {
+            self.complete.popdown();
+        }
+    }
+
+    /// Replace the token under the cursor with what is selected.
+    fn accept_completion(&mut self) {
+        let Some(c) = self.completing.take() else {
+            return;
+        };
+        let i = self
+            .complete_list
+            .selected_row()
+            .map(|r| r.index() as usize)
+            .unwrap_or(0);
+        let Some(insert) = self.candidates.get(i).cloned() else {
+            return;
+        };
+        let buf = self.composer.buffer();
+        let mut start = buf.start_iter();
+        start.forward_chars(self.before_cursor()[..c.at].chars().count() as i32);
+        let cursor = buf.iter_at_mark(&buf.get_insert());
+        // The flag, because deleting and inserting each fire `changed`, and
+        // the popup would reopen on its own half-finished work.
+        self.inserting.set(true);
+        buf.delete(&mut start, &mut cursor.clone());
+        buf.insert(&mut start, &insert);
+        self.inserting.set(false);
+        self.close_completions();
+    }
+
+    /// What to offer, as (what to insert, what to show).
+    fn candidates(&self, c: &crate::logic::Completing) -> Vec<(String, String)> {
+        use crate::logic::Complete;
+        let q = c.query.to_lowercase();
+        let names = self.shared.names.borrow();
+        // Prefix matches first: typing "de" should reach #design before
+        // #incidents-decided.
+        let rank = |name: &str| -> Option<usize> {
+            let n = name.to_lowercase();
+            if n.starts_with(&q) {
+                Some(0)
+            } else if q.is_empty() || n.contains(&q) {
+                Some(1)
+            } else {
+                None
+            }
+        };
+        let mut out: Vec<(usize, String, String)> = match c.kind {
+            Complete::User => {
+                let mut v: Vec<(usize, String, String)> = names
+                    .users
+                    .values()
+                    .filter_map(|label| {
+                        rank(label).map(|r| (r, format!("@{label} "), format!("@{label}")))
+                    })
+                    .collect();
+                v.extend(names.groups.keys().filter_map(|h| {
+                    rank(h).map(|r| (r, format!("@{h} "), format!("@{h}  ·  group")))
+                }));
+                v.extend(["here", "channel", "everyone"].iter().filter_map(|b| {
+                    rank(b).map(|r| {
+                        (
+                            r + 1,
+                            format!("@{b} "),
+                            format!("@{b}  ·  notifies the conversation"),
+                        )
+                    })
+                }));
+                v
+            }
+            Complete::Channel => names
+                .channels
+                .values()
+                .filter_map(|name| rank(name).map(|r| (r, format!("#{name} "), format!("#{name}"))))
+                .collect(),
+            // Ranked by position, not by name: `search_with` already put
+            // the best first, and re-sorting these by label length offered
+            // :rock: ahead of :rocket:.
+            Complete::Emoji => slk_core::emoji::search_with(&c.query, 24, self.skin)
+                .into_iter()
+                .enumerate()
+                .map(|(i, (name, glyph))| (i, format!(":{name}: "), format!("{glyph}  :{name}:")))
+                .collect(),
+            Complete::Command => crate::logic::COMMANDS
+                .iter()
+                .filter_map(|(cmd, help)| {
+                    rank(&cmd[1..]).map(|r| (r, format!("{cmd} "), format!("{cmd}  ·  {help}")))
+                })
+                .collect(),
+        };
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.len().cmp(&b.2.len())));
+        out.truncate(24);
+        out.into_iter().map(|(_, i, l)| (i, l)).collect()
+    }
+
+    /// Keep what was typed and not sent, per conversation.
+    fn stash_draft(&mut self) {
+        let Some(ch) = self.open.clone() else { return };
+        let buf = self.composer.buffer();
+        let (a, b) = buf.bounds();
+        let text = buf.text(&a, &b, false).to_string();
+        if text.trim().is_empty() {
+            self.drafts.remove(&ch);
+        } else {
+            self.drafts.insert(ch, text);
+        }
+    }
+
     // ---- the message cursor -------------------------------------------
 
     fn list_of(&self, pane: Pane) -> &TypedListView<Row, gtk::SingleSelection> {
@@ -1831,7 +2165,9 @@ impl App {
 
     /// What Escape closes, innermost first.
     fn escape(&mut self) {
-        if self.picker.is_some() {
+        if self.complete.is_visible() {
+            self.close_completions();
+        } else if self.picker.is_some() {
             self.close_picker();
         } else if gtk::prelude::WidgetExt::is_visible(&self.jump) {
             self.close_jump();

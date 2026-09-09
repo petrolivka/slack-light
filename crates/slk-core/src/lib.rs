@@ -11,6 +11,7 @@ pub mod emoji;
 pub mod ids;
 pub mod model;
 pub mod mrkdwn;
+pub mod outgoing;
 pub mod permalink;
 pub mod richtext;
 

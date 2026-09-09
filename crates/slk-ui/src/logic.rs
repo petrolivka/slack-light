@@ -220,6 +220,75 @@ pub fn first_link(doc: &slk_core::Doc) -> Option<String> {
 
 /// A rendered `slk-config` chord ("ctrl+k", "alt+up", "f1", "esc") as a
 /// GTK accelerator ("<Control>k", "<Alt>Up", "F1", "Escape").
+/// What the composer is completing, if anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Complete {
+    User,
+    Channel,
+    Emoji,
+    Command,
+}
+
+/// Where a completion starts and what has been typed into it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Completing {
+    pub kind: Complete,
+    /// Byte offset of the sigil in the text before the cursor.
+    pub at: usize,
+    pub query: String,
+}
+
+/// Read the text left of the cursor and decide what is being completed.
+///
+/// Deliberately strict, because the alternative is a popup that appears
+/// while somebody is typing an e-mail address or a fraction:
+///
+/// - the sigil must start a word — `me@example` completes nothing
+/// - the query may not contain whitespace; a space ends the completion
+/// - `/` only counts at the very start of the message, which is what a
+///   slash command is
+/// - `:` needs at least one character after it, or every clock time opens
+///   the emoji list
+pub fn completing(before: &str) -> Option<Completing> {
+    let sigil_at = before
+        .char_indices()
+        .rev()
+        .find_map(|(i, c)| matches!(c, '@' | '#' | ':' | '/').then_some(i))?;
+    let query = &before[sigil_at + 1..];
+    if query.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let sigil = before[sigil_at..].chars().next()?;
+    let prev = before[..sigil_at].chars().next_back();
+    let boundary = prev.is_none_or(|c| c.is_whitespace() || matches!(c, '(' | '[' | '{' | '"'));
+    let kind = match sigil {
+        '@' if boundary => Complete::User,
+        '#' if boundary => Complete::Channel,
+        ':' if boundary && !query.is_empty() => Complete::Emoji,
+        '/' if sigil_at == 0 => Complete::Command,
+        _ => return None,
+    };
+    Some(Completing {
+        kind,
+        at: sigil_at,
+        query: query.to_string(),
+    })
+}
+
+/// The slash commands worth offering. Slack has hundreds behind apps; these
+/// are the ones the client itself can answer for, and anything else the user
+/// types is passed through to Slack unchanged.
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("/me", "Write in the third person"),
+    ("/shrug", "Append ¯\\_(ツ)_/¯"),
+    ("/topic", "Set the conversation's topic"),
+    ("/remind", "Ask Slackbot to remind somebody"),
+    ("/away", "Toggle your presence"),
+    ("/dm", "Open a direct message"),
+    ("/invite", "Invite somebody here"),
+    ("/leave", "Leave this conversation"),
+];
+
 /// A capital letter is written as `<Shift>` plus the lower-case key, which
 /// is the form GTK parses — but see `bindable`: such a chord never actually
 /// arrives, so nothing installs one. The translation is kept correct anyway,
@@ -476,6 +545,44 @@ mod tests {
             .as_deref(),
             Some("https://c"),
         );
+    }
+
+    #[test]
+    fn the_composer_completes_only_where_it_should() {
+        assert_eq!(
+            completing("hi @al"),
+            Some(Completing {
+                kind: Complete::User,
+                at: 3,
+                query: "al".into()
+            })
+        );
+        assert_eq!(
+            completing("see #des").map(|c| c.kind),
+            Some(Complete::Channel)
+        );
+        assert_eq!(completing("yes :ro").map(|c| c.kind), Some(Complete::Emoji));
+        assert_eq!(completing("/to").map(|c| c.kind), Some(Complete::Command));
+
+        // An e-mail address is not a mention.
+        assert_eq!(completing("me@example"), None);
+        // A slash mid-sentence is a slash.
+        assert_eq!(completing("and/or"), None);
+        assert_eq!(completing("see foo/bar"), None);
+        // A clock time is not an emoji.
+        assert_eq!(completing("at 11:"), None);
+        // A space closes it.
+        assert_eq!(completing("hi @alice there"), None);
+        assert_eq!(completing("plain words"), None);
+        // An empty mention still completes: that is the moment the list of
+        // everybody is most useful.
+        assert_eq!(completing("hi @").map(|c| c.query), Some(String::new()));
+    }
+
+    #[test]
+    fn a_bracket_counts_as_a_word_boundary() {
+        assert_eq!(completing("(@al").map(|c| c.kind), Some(Complete::User));
+        assert_eq!(completing("\"@al").map(|c| c.kind), Some(Complete::User));
     }
 
     #[test]

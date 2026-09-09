@@ -227,10 +227,33 @@ at, so most of those widgets never existed.
 
 The idle repaint of §2 is unchanged and still unfixed, in both builds.
 
+## 5. M2b, second block: composing
+
+| | |
+|---|---|
+| Completion | `@` people and groups, `#` channels, `:emoji:` and `/commands`, in a popup under the word being typed. Tab and the arrows move, Enter takes, Escape closes and leaves what was typed |
+| The wire format | `slk-core::outgoing` turns `@alice` into `<@U0ALICE>`, `#design` into `<#C0DESIGN\|design>`, `@here` into `<!here>`, escapes `&`, `<` and `>`, and **never rewrites inside code** — a client that mentions somebody because their name appeared in a stack trace is a client people turn off |
+| Drafts | what was typed and not sent is kept per conversation, and comes back |
+
+The completion rules are deliberately strict, because the alternative is a
+popup that opens while somebody types an e-mail address: the sigil must
+start a word, whitespace ends the token, `/` only counts at the very start
+of a message, and `:` needs a character after it or every clock time opens
+the emoji list.
+
+Two defects, both from driving it:
+
+- **`:roc` offered `:rock:` before `:rocket:`.** The picker's own ranking is
+  shortest-prefix-first, which is right in general and wrong here; the
+  curated common set now wins a tie.
+- **Restoring a draft re-opened the completion popup, and the next Enter
+  accepted a completion instead of sending.** The flag that says "the client
+  is editing the buffer, not the user" was read in the message handler,
+  which runs *after* the flag is down again. It is read inside the signal
+  handler now, where it is still up.
+
 ### What is left in M2b
 
-- **Composing**: completion for `@`, `#`, `:emoji:` and `/commands`,
-  outgoing conversion to Slack's wire format, drafts
 - **History**: scrollback upward with its loading state, jump to a message
   in context — `back`/`forward` are wired, the rest is not
 - **The lists**: search (both halves), threads, saved, mentions, members,
