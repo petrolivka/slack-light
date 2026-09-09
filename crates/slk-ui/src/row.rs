@@ -10,6 +10,14 @@
 //! under them, consecutive messages from one person merged into a block —
 //! drawn in the language of an editor: no line between messages, a mono
 //! body, a rounded-square avatar, chips with a border rather than a fill.
+//!
+//! Everything the row can *do* goes through one message, `Msg::RowAction`,
+//! carrying a timestamp and an action name from `slk-config`. The pointer and
+//! the keyboard therefore run the same code: clicking the thread link and
+//! pressing alt-t are the same call, and an action can only be wrong in one
+//! place. It also means the hover bar needs no state of its own — `bind`
+//! writes the current timestamp into a cell the buttons close over, which is
+//! the only way a recycled widget can know which message it is showing.
 
 use crate::app::Shared;
 use crate::logic::Meta;
@@ -17,7 +25,31 @@ use crate::{blockkit, markup};
 use gtk::prelude::*;
 use relm4::typed_view::list::RelmListItem;
 use slk_core::{Delivery, Message, Names};
+use std::cell::RefCell;
 use std::rc::Rc;
+
+/// What the "more" menu offers, in the order the official client offers it.
+/// Every entry is an action name, so the menu, the keyboard and the command
+/// palette cannot drift apart.
+const MORE: &[(&str, &str)] = &[
+    ("Edit message", "edit_message"),
+    ("Delete message", "delete_message"),
+    ("Copy text", "copy_text"),
+    ("Copy link", "copy_link"),
+    ("Open first link", "open_link"),
+    ("Save for later", "save"),
+    ("Pin to conversation", "pin"),
+    ("Download files", "download_files"),
+];
+
+/// Run an action against one message.
+///
+/// A pooled button cannot hold a `ComponentSender` — it outlives every model
+/// it was built for — so the window leaves one where any widget on the main
+/// thread can reach it. Same call as the keyboard's, by design.
+fn send(at: &str, act: &str) {
+    crate::app::row_action(at, act);
+}
 
 /// Where the body starts: the avatar's width plus its gap, so a grouped
 /// message lines up under the one above it.
@@ -32,6 +64,12 @@ pub struct Row {
 pub struct Widgets {
     /// The whole decoration above the message: day and unread separators.
     breaks: gtk::Box,
+    /// The hover bar, and the timestamp its buttons act on. A pooled widget
+    /// outlives the message it was bound to, so the buttons cannot capture
+    /// one; they read this instead.
+    actions: gtk::Box,
+    at: Rc<RefCell<String>>,
+    marks: gtk::Label,
     /// Avatar and the name/time line, hidden entirely when grouped.
     head: gtk::Box,
     avatar: gtk::Label,
@@ -51,12 +89,16 @@ pub struct Widgets {
 }
 
 impl RelmListItem for Row {
-    type Root = gtk::Box;
+    type Root = gtk::Overlay;
     type Widgets = Widgets;
 
-    fn setup(_item: &gtk::ListItem) -> (gtk::Box, Widgets) {
+    fn setup(item: &gtk::ListItem) -> (gtk::Overlay, Widgets) {
+        // The shared handle is on the item's own data only after the first
+        // bind, so the buttons are wired to a sender taken from the list
+        // item's root at click time instead. See `send`.
+        let _ = item;
         relm4::view! {
-            root = gtk::Box {
+            content = gtk::Box {
                 set_orientation: gtk::Orientation::Vertical,
 
                 #[name = "breaks"]
@@ -102,6 +144,15 @@ impl RelmListItem for Row {
                     set_margin_end: 12,
                     set_margin_bottom: 3,
 
+                    // Pinned and saved go here rather than on the name
+                    // line, because a grouped message has no name line — and
+                    // a pin you cannot see is a pin you will not remove.
+                    #[name = "marks"]
+                    gtk::Label {
+                        set_xalign: 0.0,
+                        add_css_class: "marks",
+                        set_visible: false,
+                    },
                     #[name = "body"]
                     gtk::Label {
                         set_xalign: 0.0,
@@ -152,14 +203,135 @@ impl RelmListItem for Row {
                 }
             }
         }
+        let at = Rc::new(RefCell::new(String::new()));
+
+        // The hover bar. An overlay rather than a row of its own, so nothing
+        // moves when it appears: a bar that reflows the message under the
+        // pointer is a bar you cannot click.
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        actions.add_css_class("msgactions");
+        actions.set_halign(gtk::Align::End);
+        actions.set_valign(gtk::Align::Start);
+        actions.set_margin_end(20);
+        actions.set_visible(false);
+
+        // Built on the first hover, not per pooled row. Five buttons and a
+        // menu on thirty pooled rows is a hundred and eighty widgets, and
+        // most rows are never pointed at. Measured: the bar cost 15 MB of
+        // private memory when it was built eagerly.
+        let build = |bar: &gtk::Box, at: &Rc<RefCell<String>>| {
+            let button = |label: &str, tip: &str, act: &str, at: &Rc<RefCell<String>>| {
+                let b = gtk::Button::new();
+                b.set_child(Some(&gtk::Label::new(Some(label))));
+                b.set_tooltip_text(Some(tip));
+                b.add_css_class("flat");
+                // The composer keeps the keyboard: an action bar that takes
+                // focus costs a click to give it back, every time.
+                b.set_can_focus(false);
+                let at = at.clone();
+                let act = act.to_string();
+                b.connect_clicked(move |_| send(&at.borrow(), &act));
+                b
+            };
+
+            for (i, name) in slk_core::emoji::QUICK.iter().take(3).enumerate() {
+                let glyph = slk_core::emoji::shortcode(name, None).unwrap_or_else(|| "+".into());
+                bar.append(&button(
+                    &glyph,
+                    &format!(":{name}:"),
+                    &format!("react_{}", i + 1),
+                    at,
+                ));
+            }
+            bar.append(&button("☺", "Add a reaction", "react", at));
+            bar.append(&button("↳", "Reply in thread", "open_thread", at));
+
+            let more = gtk::MenuButton::new();
+            // A child, not `set_label`: a labelled MenuButton draws a
+            // dropdown arrow next to it, and a second glyph in a six-button
+            // bar reads as a seventh button.
+            more.set_child(Some(&gtk::Label::new(Some("⋯"))));
+            more.set_tooltip_text(Some("More actions"));
+            more.add_css_class("flat");
+            more.set_can_focus(false);
+            let at2 = at.clone();
+            // The menu itself is built when it is opened, for the same
+            // reason the bar is.
+            more.set_create_popup_func(move |mb| {
+                let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                list.add_css_class("moremenu");
+                let pop = gtk::Popover::new();
+                for (label, act) in MORE {
+                    let b = gtk::Button::new();
+                    b.set_child(Some(&{
+                        let l = gtk::Label::new(Some(label));
+                        l.set_xalign(0.0);
+                        l
+                    }));
+                    b.add_css_class("flat");
+                    let at = at2.clone();
+                    let act = act.to_string();
+                    let pop = pop.clone();
+                    b.connect_clicked(move |_| {
+                        pop.popdown();
+                        send(&at.borrow(), &act);
+                    });
+                    list.append(&b);
+                }
+                pop.set_child(Some(&list));
+                mb.set_popover(Some(&pop));
+            });
+            bar.append(&more);
+            more
+        };
+
+        let root = gtk::Overlay::new();
+        root.set_child(Some(&content));
+        root.add_overlay(&actions);
+
+        // Hover reveals it, and builds it the first time. Not hidden again
+        // while the "more" menu is open, or walking to the menu would close
+        // the menu.
+        {
+            let motion = gtk::EventControllerMotion::new();
+            let menu: Rc<RefCell<Option<gtk::MenuButton>>> = Rc::new(RefCell::new(None));
+            let (bar, at2, m) = (actions.clone(), at.clone(), menu.clone());
+            motion.connect_enter(move |_, _, _| {
+                if m.borrow().is_none() {
+                    *m.borrow_mut() = Some(build(&bar, &at2));
+                }
+                bar.set_visible(true);
+            });
+            let (bar2, m2) = (actions.clone(), menu.clone());
+            motion.connect_leave(move |_| {
+                if !m2.borrow().as_ref().is_some_and(|mb| mb.is_active()) {
+                    bar2.set_visible(false);
+                }
+            });
+            root.add_controller(motion);
+        }
+
+        // The thread summary is a link: clicking it opens the thread, which
+        // is what everyone tries first.
+        {
+            let click = gtk::GestureClick::new();
+            let at = at.clone();
+            click.connect_released(move |_, _, _, _| send(&at.borrow(), "open_thread"));
+            thread.add_controller(click);
+            thread.set_cursor_from_name(Some("pointer"));
+        }
+
         (
             root,
             Widgets {
                 breaks,
+                actions,
+                at,
                 head,
                 avatar,
                 author,
                 time,
+                marks,
                 body,
                 extras,
                 picture,
@@ -171,7 +343,7 @@ impl RelmListItem for Row {
         )
     }
 
-    fn bind(&mut self, w: &mut Widgets, _root: &mut gtk::Box) {
+    fn bind(&mut self, w: &mut Widgets, _root: &mut gtk::Overlay) {
         let m = &self.msg;
         let names = self.shared.names.borrow();
         let pal = self.shared.pal.borrow();
@@ -181,6 +353,11 @@ impl RelmListItem for Row {
             self_id: self_id.as_str(),
             pal: &pal,
         };
+
+        // What every button on this row will act on. First, because a
+        // recycled row is still wired to the last message until this runs.
+        *w.at.borrow_mut() = m.ts.as_str().to_string();
+        w.actions.set_visible(false);
 
         // Separators, above everything.
         while let Some(c) = w.breaks.first_child() {
@@ -241,6 +418,14 @@ impl RelmListItem for Row {
             ));
             w.time.set_label(&hhmm(&m.ts));
         }
+        let marks = match (m.pinned, m.saved) {
+            (true, true) => "📌 pinned · 🔖 saved",
+            (true, false) => "📌 pinned",
+            (false, true) => "🔖 saved",
+            (false, false) => "",
+        };
+        w.marks.set_label(marks);
+        w.marks.set_visible(!marks.is_empty());
 
         // Body: the AST as one label of markup.
         let mut body = markup::doc(&m.body, &ctx);
@@ -330,13 +515,38 @@ impl RelmListItem for Row {
         for r in &m.reactions {
             let glyph = slk_core::emoji::shortcode(&r.name, None)
                 .unwrap_or_else(|| format!(":{}:", r.name));
-            let chip = gtk::Label::new(Some(&format!("{glyph} {}", r.count)));
+            let chip = gtk::Button::new();
+            chip.set_child(Some(&gtk::Label::new(Some(&format!(
+                "{glyph} {}",
+                r.count
+            )))));
             chip.add_css_class("chip");
+            chip.set_can_focus(false);
             if r.by_me {
                 chip.add_css_class("mine");
             }
-            chip.set_tooltip_text(Some(&format!(":{}:", r.name)));
+            chip.set_tooltip_text(Some(&format!(
+                ":{}: — click to {}",
+                r.name,
+                if r.by_me { "remove yours" } else { "add yours" }
+            )));
+            let at = w.at.clone();
+            let name = r.name.clone();
+            chip.connect_clicked(move |_| send(&at.borrow(), &format!("react:{name}")));
             w.chips.append(&chip);
+        }
+        // One more, to add a reaction where there already are some: the row
+        // where reactions live is where people look for the button.
+        if !m.reactions.is_empty() {
+            let add = gtk::Button::new();
+            add.set_child(Some(&gtk::Label::new(Some("＋"))));
+            add.add_css_class("chip");
+            add.add_css_class("addchip");
+            add.set_can_focus(false);
+            add.set_tooltip_text(Some("Add a reaction"));
+            let at = w.at.clone();
+            add.connect_clicked(move |_| send(&at.borrow(), "react"));
+            w.chips.append(&add);
         }
         w.chips.set_visible(!m.reactions.is_empty());
 
@@ -369,7 +579,7 @@ impl RelmListItem for Row {
         }
     }
 
-    fn unbind(&mut self, w: &mut Widgets, _root: &mut gtk::Box) {
+    fn unbind(&mut self, w: &mut Widgets, _root: &mut gtk::Overlay) {
         // Release the texture and the Block Kit tree: a row that scrolled
         // away must cost nothing, or NFR-4 is a lie.
         w.picture.set_paintable(None::<&gtk::gdk::Paintable>);

@@ -49,6 +49,29 @@ pub struct Shared {
     pub pending: RefCell<HashMap<String, Vec<gtk::Picture>>>,
 }
 
+thread_local! {
+    /// Where a widget with no model behind it sends its actions.
+    ///
+    /// A pooled list row is built once and rebound thousands of times; its
+    /// buttons outlive every `Row` they were ever shown for, so they cannot
+    /// hold a `ComponentSender`. Everything here runs on the GTK main thread
+    /// and there is exactly one window, which is what makes a thread-local
+    /// the honest shape rather than a shortcut.
+    static ROW_SENDER: RefCell<Option<relm4::Sender<Msg>>> = const { RefCell::new(None) };
+}
+
+/// Run an action against one message, from a widget. See `ROW_SENDER`.
+pub fn row_action(at: &str, act: &str) {
+    ROW_SENDER.with_borrow(|s| {
+        if let Some(s) = s {
+            let _ = s.send(Msg::RowAction {
+                at: at.to_string(),
+                act: act.to_string(),
+            });
+        }
+    });
+}
+
 impl Shared {
     pub fn need_image(&self, file_id: &str, url: &str) {
         let _ = self.sender.send(Msg::NeedImage {
@@ -78,22 +101,41 @@ pub struct Init {
     pub options: Options,
 }
 
+/// Which list the message cursor is in. Every message action reads it, so
+/// "react" in a thread cannot land on the conversation behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Conv,
+    Thread,
+}
+
 #[derive(Debug)]
 pub enum Msg {
     ThemeChanged,
     /// A keyboard action, by its `slk-config` name.
     Action(String),
+    /// The same, aimed at one message: what the row's own buttons send.
+    /// `act` is either an action name or `react:<shortcode>`.
+    RowAction {
+        at: String,
+        act: String,
+    },
+    /// A shortcode chosen in the picker.
+    Picked(String),
     JumpChanged(String),
     JumpAccept,
     Engine(TeamId, Event),
     Open(usize),
     Send(String),
+    SendThread(String),
     NeedImage {
         file_id: String,
         url: String,
     },
+    /// The cursor moved into one of the two message lists.
+    Focused(Pane),
     Mapped,
-    StatusExpired,
+    StatusExpired(u32),
     ToggleSection(u8),
     BenchScrollDone,
     IdleDone,
@@ -129,10 +171,31 @@ pub struct App {
     workspaces: Vec<WorkspaceState>,
     current: usize,
     open: Option<ChannelId>,
-    list: TypedListView<Row, gtk::NoSelection>,
+    list: TypedListView<Row, gtk::SingleSelection>,
+    /// The open thread's parent, and its replies.
+    thread: Option<slk_core::Ts>,
+    thread_list: TypedListView<Row, gtk::SingleSelection>,
+    thread_pane: gtk::Box,
+    thread_title: gtk::Label,
+    thread_scroller: gtk::ScrolledWindow,
+    thread_composer: gtk::TextView,
+    follow: gtk::ToggleButton,
+    broadcast: gtk::CheckButton,
+    conv_paned: gtk::Paned,
+    active: Pane,
+    /// The message being edited, if the composer is holding one.
+    editing: Option<slk_core::Ts>,
+    /// Conversations visited, and where in them we are: back and forward.
+    history: Vec<ChannelId>,
+    history_at: usize,
+    picker: Option<gtk::Window>,
+    /// Slack's skin tone, applied to what the picker shows and to what is
+    /// sent, so the two cannot disagree.
+    skin: Option<u8>,
     // Made before the view and referenced into it, because `update` needs a
     // handle to each and relm4 hands widgets to the view, not the model.
     sidebar: gtk::ListBox,
+    sidebar_box: gtk::Box,
     /// Row index in the sidebar to conversation index, because the section
     /// headings are rows too and the two stopped being the same thing.
     row_map: Vec<Option<usize>>,
@@ -142,13 +205,21 @@ pub struct App {
     composer: gtk::TextView,
     jump: gtk::Entry,
     jump_query: Rc<RefCell<String>>,
-    bindings: Vec<(String, String, bool)>,
+    bindings: Vec<crate::keys::Binding>,
     requested: HashSet<String>,
     theme: slk_theme::Applied,
     theme_choice: slk_theme::Choice,
     _theme_monitor: Option<gtk::gio::FileMonitor>,
     status: String,
     status_right: String,
+    /// Under the composer: what Enter will do right now.
+    hint: String,
+    /// How many things have been said in the status bar. A notice's timer
+    /// carries the number it was raised with, so an older one expiring
+    /// cannot wipe a newer one — measured: "you can only edit your own
+    /// messages" lasted a fraction of a second because a "pinned" from six
+    /// seconds earlier chose that moment to clear itself.
+    said: u32,
     title: String,
     topic: String,
     window_title: String,
@@ -177,7 +248,23 @@ impl App {
         }
     }
 
+    /// Open a conversation and remember it, so back and forward have
+    /// somewhere to go. A conversation reached *by* back or forward calls
+    /// `visit` instead, or the history would grow every time it was walked.
     fn open_channel(&mut self, id: ChannelId) {
+        if self.open.as_ref() == Some(&id) {
+            return;
+        }
+        if self.history.get(self.history_at) != Some(&id) {
+            self.history
+                .truncate(self.history_at + usize::from(!self.history.is_empty()));
+            self.history.push(id.clone());
+            self.history_at = self.history.len() - 1;
+        }
+        self.visit(id);
+    }
+
+    fn visit(&mut self, id: ChannelId) {
         if self.open.as_ref() == Some(&id) {
             return;
         }
@@ -214,6 +301,10 @@ impl App {
             .unwrap_or_default();
         self.open = Some(id.clone());
         self.list.clear();
+        // A thread belongs to the conversation it is in.
+        if self.thread.is_some() {
+            self.close_thread();
+        }
         self.send(Command::Open(id));
     }
 
@@ -277,6 +368,71 @@ impl App {
                     last_read,
                     day_label,
                 );
+                prev = Some((m.author.id_str().to_string(), m.ts.secs()));
+                Row {
+                    msg: m,
+                    meta,
+                    shared: self.shared.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// One row, grouped against whatever is above it at `above`.
+    ///
+    /// `make_rows` computes each row's grouping from the one before it in the
+    /// batch, which is right for a page and wrong for a replacement: an
+    /// edited or echoed message is compared against the *end* of the list,
+    /// which for the newest message is itself — same author, same second, so
+    /// it groups under itself and loses its avatar, its name and its pin.
+    fn row_at(&self, msg: slk_core::Message, above: Option<u32>) -> Row {
+        let last_read = self
+            .convs()
+            .iter()
+            .find(|c| Some(&c.id) == self.open.as_ref())
+            .and_then(|c| c.last_read.as_ref())
+            .map(|t| t.secs());
+        let prev = above.and_then(|i| self.list.get(i)).map(|r| {
+            let m = &r.borrow().msg;
+            (m.author.id_str().to_string(), m.ts.secs())
+        });
+        let meta = crate::logic::meta(
+            prev.as_ref().map(|(a, t)| (a.as_str(), *t)),
+            msg.author.id_str(),
+            msg.ts.secs(),
+            last_read,
+            day_label,
+        );
+        Row {
+            msg,
+            meta,
+            shared: self.shared.clone(),
+        }
+    }
+
+    /// A thread's rows. Grouped among themselves, with no day breaks and no
+    /// unread line: a thread is read as one exchange, and a rule across a
+    /// 360-pixel pane is noise rather than structure.
+    fn thread_rows(&self, msgs: Vec<slk_core::Message>) -> Vec<Row> {
+        let mut prev: Option<(String, i64)> = self
+            .thread_list
+            .len()
+            .checked_sub(1)
+            .and_then(|i| self.thread_list.get(i))
+            .map(|r| {
+                let m = &r.borrow().msg;
+                (m.author.id_str().to_string(), m.ts.secs())
+            });
+        msgs.into_iter()
+            .map(|m| {
+                let mut meta = crate::logic::meta(
+                    prev.as_ref().map(|(a, t)| (a.as_str(), *t)),
+                    m.author.id_str(),
+                    m.ts.secs(),
+                    None,
+                    day_label,
+                );
+                meta.day_break = None;
                 prev = Some((m.author.id_str().to_string(), m.ts.secs()));
                 Row {
                     msg: m,
@@ -359,7 +515,8 @@ impl SimpleComponent for App {
                         set_resize_end_child: true,
 
                         #[wrap(Some)]
-                        set_start_child = &gtk::Box {
+                        #[local_ref]
+                        set_start_child = sidebar_box -> gtk::Box {
                             set_orientation: gtk::Orientation::Vertical,
                             add_css_class: "sidebar",
 
@@ -388,8 +545,19 @@ impl SimpleComponent for App {
                             },
                         },
 
+                        // Conversation on the left, the open thread on the
+                        // right — the official client's shape, and the one
+                        // that keeps the thread readable next to what it is
+                        // replying to rather than instead of it.
                         #[wrap(Some)]
-                        set_end_child = &gtk::Box {
+                        #[local_ref]
+                        set_end_child = conv_paned -> gtk::Paned {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_shrink_end_child: false,
+                        set_resize_end_child: false,
+
+                        #[wrap(Some)]
+                        set_start_child = &gtk::Box {
                             set_orientation: gtk::Orientation::Vertical,
 
                             gtk::Box {
@@ -465,13 +633,92 @@ impl SimpleComponent for App {
                                     set_xalign: 0.0,
                                     add_css_class: "hint",
                                     #[watch]
-                                    set_label: if model.read_only {
-                                        "read-only — nothing is sent"
-                                    } else {
-                                        "enter sends · shift+enter newline"
+                                    set_label: &model.hint,
+                                },
+                            },
+                        },
+
+                        // The thread pane. Hidden rather than absent: a pane
+                        // that is built when it is first needed opens a frame
+                        // late, and this one opens on every reply.
+                        #[wrap(Some)]
+                        #[local_ref]
+                        set_end_child = thread_pane -> gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            set_visible: false,
+                            set_size_request: (360, -1),
+                            add_css_class: "threadpane",
+
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_spacing: 8,
+                                add_css_class: "header",
+                                #[local_ref]
+                                thread_title -> gtk::Label {
+                                    set_xalign: 0.0,
+                                    set_hexpand: true,
+                                    set_ellipsize: gtk::pango::EllipsizeMode::End,
+                                    add_css_class: "title",
+                                },
+                                #[local_ref]
+                                follow -> gtk::ToggleButton {
+                                    set_can_focus: false,
+                                    add_css_class: "flat",
+                                    set_tooltip_text: Some("Follow this thread"),
+                                    connect_toggled[sender] => move |_| {
+                                        sender.input(Msg::Action("follow_thread".into()));
+                                    },
+                                },
+                                gtk::Button {
+                                    set_label: "✕",
+                                    set_can_focus: false,
+                                    add_css_class: "flat",
+                                    set_tooltip_text: Some("Close the thread"),
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(Msg::Action("close_thread".into()));
                                     },
                                 },
                             },
+                            gtk::Box { add_css_class: "hairline" },
+
+                            #[local_ref]
+                            thread_scroller -> gtk::ScrolledWindow {
+                                set_vexpand: true,
+                                set_hscrollbar_policy: gtk::PolicyType::Never,
+                                set_vscrollbar_policy: gtk::PolicyType::Always,
+                                #[local_ref]
+                                thread_view -> gtk::ListView {
+                                    add_css_class: "conversation",
+                                }
+                            },
+
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                add_css_class: "composer",
+
+                                gtk::ScrolledWindow {
+                                    set_min_content_height: 34,
+                                    set_max_content_height: 120,
+                                    set_hscrollbar_policy: gtk::PolicyType::Never,
+                                    #[local_ref]
+                                    thread_composer -> gtk::TextView {
+                                        set_wrap_mode: gtk::WrapMode::WordChar,
+                                        set_top_margin: 5,
+                                        set_bottom_margin: 5,
+                                        set_left_margin: 9,
+                                        set_right_margin: 9,
+                                        set_accepts_tab: false,
+                                        #[watch]
+                                        set_editable: !model.read_only,
+                                    },
+                                },
+                                #[local_ref]
+                                broadcast -> gtk::CheckButton {
+                                    set_label: Some("Also send to the conversation"),
+                                    add_css_class: "hint",
+                                },
+                            },
+                        },
                         },
                     },
 
@@ -570,7 +817,23 @@ impl SimpleComponent for App {
             current: 0,
             open: None,
             list: TypedListView::new(),
+            thread: None,
+            thread_list: TypedListView::new(),
+            thread_pane: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            thread_title: gtk::Label::new(None),
+            thread_scroller: gtk::ScrolledWindow::new(),
+            thread_composer: gtk::TextView::new(),
+            follow: gtk::ToggleButton::new(),
+            broadcast: gtk::CheckButton::new(),
+            conv_paned: gtk::Paned::new(gtk::Orientation::Horizontal),
+            active: Pane::Conv,
+            editing: None,
+            history: Vec::new(),
+            history_at: 0,
+            picker: None,
+            skin: (config.emoji.skin_tone > 0).then_some(config.emoji.skin_tone),
             sidebar: gtk::ListBox::new(),
+            sidebar_box: gtk::Box::new(gtk::Orientation::Vertical, 0),
             row_map: Vec::new(),
             collapsed: HashSet::new(),
             rail: gtk::Box::new(gtk::Orientation::Vertical, 0),
@@ -585,6 +848,12 @@ impl SimpleComponent for App {
             _theme_monitor: monitor,
             status: "starting".into(),
             status_right: String::new(),
+            said: 0,
+            hint: if read_only {
+                "read-only — nothing is sent".into()
+            } else {
+                "enter sends · shift+enter newline".into()
+            },
             title: String::new(),
             topic: String::new(),
             window_title: if first_name.is_empty() {
@@ -597,35 +866,87 @@ impl SimpleComponent for App {
             sent_at: None,
         };
         let list_view = &model.list.view;
+        let thread_view = &model.thread_list.view;
+        let thread_pane = &model.thread_pane;
+        let thread_title = &model.thread_title;
+        let thread_scroller = &model.thread_scroller;
+        let thread_composer = &model.thread_composer;
+        let follow = &model.follow;
+        let broadcast = &model.broadcast;
+        let conv_paned = &model.conv_paned;
         let sidebar = &model.sidebar;
+        let sidebar_box = &model.sidebar_box;
         let rail = &model.rail;
         let scroller = &model.scroller;
         let composer = &model.composer;
         let jump = &model.jump;
         let widgets = view_output!();
 
-        // Enter sends, shift+Enter is a newline. A TextView has no
-        // `activate`, so the composer needs the key itself.
+        // Under `--metrics`, log chords — and only chords. This is the
+        // instrument that found the dead shift bindings: nothing else in the
+        // stack says whether a key reached the application, and guessing
+        // cost most of an afternoon. Plain keys are never logged, because
+        // plain keys are the message the user is typing.
         {
             let k = gtk::EventControllerKey::new();
+            k.set_propagation_phase(gtk::PropagationPhase::Capture);
+            k.connect_key_pressed(|_, key, _, state| {
+                use gtk::gdk::ModifierType as M;
+                if state.intersects(M::CONTROL_MASK | M::ALT_MASK) {
+                    bench::report(
+                        "key",
+                        format!("{} {state:?}", key.name().unwrap_or_default()),
+                    );
+                }
+                gtk::glib::Propagation::Proceed
+            });
+            root.add_controller(k);
+        }
+
+        // Where a pooled row's buttons send what they were clicked for.
+        ROW_SENDER.with_borrow_mut(|slot| *slot = Some(sender.input_sender().clone()));
+
+        // Enter sends, shift+Enter is a newline. A TextView has no
+        // `activate`, so each composer needs the key itself.
+        for (view, to_thread) in [(&model.composer, false), (&model.thread_composer, true)] {
+            let k = gtk::EventControllerKey::new();
             let s2 = sender.input_sender().clone();
-            let view = model.composer.clone();
+            let view2 = view.clone();
             k.connect_key_pressed(move |_, key, _, state| {
                 if key == gtk::gdk::Key::Return
                     && !state.contains(gtk::gdk::ModifierType::SHIFT_MASK)
                 {
-                    let buf = view.buffer();
+                    let buf = view2.buffer();
                     let (a, b) = buf.bounds();
                     let text = buf.text(&a, &b, false).to_string();
                     if !text.trim().is_empty() {
-                        let _ = s2.send(Msg::Send(text));
+                        let _ = s2.send(if to_thread {
+                            Msg::SendThread(text)
+                        } else {
+                            Msg::Send(text)
+                        });
                         buf.set_text("");
                     }
                     return gtk::glib::Propagation::Stop;
                 }
                 gtk::glib::Propagation::Proceed
             });
-            model.composer.add_controller(k);
+            view.add_controller(k);
+        }
+
+        // Nothing is selected until something is: an autoselecting list puts
+        // the cursor on the oldest message every time a conversation loads,
+        // and then alt-e edits whatever that happens to be.
+        for (list, pane) in [
+            (&model.list, Pane::Conv),
+            (&model.thread_list, Pane::Thread),
+        ] {
+            list.selection_model.set_autoselect(false);
+            list.selection_model.set_can_unselect(true);
+            let s2 = sender.input_sender().clone();
+            list.selection_model.connect_selected_item_notify(move |_| {
+                let _ = s2.send(Msg::Focused(pane));
+            });
         }
 
         // Keys: the preset's chords as accelerators on application actions.
@@ -635,10 +956,10 @@ impl SimpleComponent for App {
             &config.keymap.preset,
             sender.input_sender().clone(),
         );
-        for (name, acc, from) in &model.bindings {
+        for b in &model.bindings {
             bench::report(
                 "binding",
-                format!("{name}={acc}{}", if *from { "" } else { " (default)" }),
+                format!("{}={} ({})", b.action.name(), b.accel, b.source),
             );
         }
         // The sidebar filters by the jump query; rows are (label, badge) boxes.
@@ -675,14 +996,16 @@ impl SimpleComponent for App {
                 // Rows carry their colours in their markup, so they have to
                 // be bound again: detaching and reattaching the model does
                 // exactly that for the realised ones and nothing for the rest.
-                let model = self.list.selection_model.clone();
-                self.list.view.set_model(None::<&gtk::NoSelection>);
-                self.list.view.set_model(Some(&model));
+                for list in [&self.list, &self.thread_list] {
+                    let model = list.selection_model.clone();
+                    list.view.set_model(None::<&gtk::SingleSelection>);
+                    list.view.set_model(Some(&model));
+                }
                 self.rebuild_sidebar();
                 bench::report("theme_source", format!("{source:?}"));
-                self.status = format!("theme: {}", slk_theme::Applied::describe(&source));
+                self.say(format!("theme: {}", slk_theme::Applied::describe(&source)));
             }
-            Msg::Action(name) => self.action(&name),
+            Msg::Action(name) => self.act(&name, &sender),
             Msg::JumpChanged(q) => {
                 *self.jump_query.borrow_mut() = q;
                 self.sidebar.invalidate_filter();
@@ -715,7 +1038,54 @@ impl SimpleComponent for App {
                     }
                 }
             }
-            Msg::StatusExpired => self.refresh_status(),
+            Msg::StatusExpired(n) => {
+                if n == self.said {
+                    self.refresh_status()
+                }
+            }
+            Msg::Focused(pane) => {
+                // Clearing a list emits a selection change of its own, and
+                // closing the thread clears one: without this, alt-w moved
+                // the cursor *into* the pane it had just closed and every
+                // message action afterwards said "no message selected".
+                if pane == Pane::Conv || self.thread.is_some() {
+                    self.active = pane;
+                }
+            }
+            Msg::RowAction { at, act } => {
+                // Point the cursor at the message the button belongs to, then
+                // run exactly what the keyboard would have run.
+                if let Some(pos) = self.position_in(Pane::Conv, &at) {
+                    self.active = Pane::Conv;
+                    self.list.selection_model.set_selected(pos);
+                } else if let Some(pos) = self.position_in(Pane::Thread, &at) {
+                    self.active = Pane::Thread;
+                    self.thread_list.selection_model.set_selected(pos);
+                }
+                match act.strip_prefix("react:") {
+                    Some(name) => self.react(name, &sender),
+                    None => self.act(&act, &sender),
+                }
+            }
+            Msg::Picked(name) => {
+                self.close_picker();
+                self.react(&name, &sender);
+            }
+            Msg::SendThread(text) => {
+                if self.read_only {
+                    self.notice("read-only: nothing is sent".into(), &sender);
+                    return;
+                }
+                if let (Some(ch), Some(parent)) = (self.open.clone(), self.thread.clone()) {
+                    self.send(Command::Send {
+                        channel: ch,
+                        thread: Some(parent),
+                        text,
+                        local_id: format!("sl-{}", bench::since_start().as_nanos()),
+                        broadcast: self.broadcast.is_active(),
+                    });
+                }
+            }
             Msg::ToggleSection(sec) => {
                 if !self.collapsed.remove(&sec) {
                     self.collapsed.insert(sec);
@@ -727,16 +1097,24 @@ impl SimpleComponent for App {
                     self.notice("read-only: nothing is sent".into(), &sender);
                     return;
                 }
-                if let Some(ch) = self.open.clone() {
-                    self.sent_at = Some(std::time::Instant::now());
-                    self.send(Command::Send {
+                let Some(ch) = self.open.clone() else { return };
+                if let Some(ts) = self.editing.take() {
+                    self.send(Command::Edit {
                         channel: ch,
-                        thread: None,
+                        ts,
                         text,
-                        local_id: format!("sl-{}", bench::since_start().as_nanos()),
-                        broadcast: false,
                     });
+                    self.refresh_hint();
+                    return;
                 }
+                self.sent_at = Some(std::time::Instant::now());
+                self.send(Command::Send {
+                    channel: ch,
+                    thread: None,
+                    text,
+                    local_id: format!("sl-{}", bench::since_start().as_nanos()),
+                    broadcast: false,
+                });
             }
             Msg::NeedImage { file_id, url } => {
                 if self.requested.insert(file_id.clone()) {
@@ -805,10 +1183,10 @@ impl App {
                 }
             }
             Event::AuthLost => {
-                self.status = format!(
+                self.say(format!(
                     "{}: session expired — run `slack-light auth add`",
                     self.workspaces[idx].name
-                );
+                ));
             }
             Event::Notice(t) => {
                 if is_current {
@@ -895,6 +1273,27 @@ impl App {
                         _ => {}
                     }
                 }
+                // A reply belongs in the thread pane; only a broadcast of
+                // one also belongs in the conversation, and Slack marks that
+                // by sending it without a `thread_ts` of its own.
+                if let Some(parent) = self.thread.clone() {
+                    let in_thread =
+                        message.ts == parent || message.thread_ts.as_ref() == Some(&parent);
+                    if in_thread {
+                        match self.position_in(Pane::Thread, message.ts.as_str()) {
+                            Some(pos) => self.replace_row(Pane::Thread, pos, (*message).clone()),
+                            None => {
+                                let rows = self.thread_rows(vec![(*message).clone()]);
+                                self.thread_list.extend_from_iter(rows);
+                                let adj = self.thread_scroller.vadjustment();
+                                adj.set_value(adj.upper() - adj.page_size());
+                            }
+                        }
+                        if message.ts != parent && message.thread_ts.is_some() {
+                            return;
+                        }
+                    }
+                }
                 let rows: Vec<String> = self
                     .list
                     .iter()
@@ -906,14 +1305,28 @@ impl App {
                     message.ts.as_str(),
                     replaces.as_ref().map(|t| t.as_str()),
                 );
-                let row = self
-                    .make_rows(vec![*message], true)
-                    .pop()
-                    .expect("one message in, one row out");
+                let above = match place {
+                    crate::logic::Placement::Replace(pos) => (pos as u32).checked_sub(1),
+                    crate::logic::Placement::Append => self.list.len().checked_sub(1),
+                };
+                let row = self.row_at(*message, above);
                 match place {
                     crate::logic::Placement::Replace(pos) => {
-                        self.list.remove(pos as u32);
-                        self.list.insert(pos as u32, row);
+                        // A replaced row loses the selection with the widget
+                        // it was on. Measured: saving a message put a notice
+                        // on screen, the engine echoed the message back, and
+                        // the next action said "no message selected" — with
+                        // the cursor still visibly on the row.
+                        let pos = pos as u32;
+                        let had_cursor = self.list.selection_model.selected() == pos;
+                        self.list.remove(pos);
+                        self.list.insert(pos, row);
+                        if had_cursor {
+                            self.list.selection_model.set_selected(pos);
+                            self.list
+                                .view
+                                .scroll_to(pos, gtk::ListScrollFlags::NONE, None);
+                        }
                     }
                     crate::logic::Placement::Append => {
                         self.list.append(row);
@@ -921,10 +1334,53 @@ impl App {
                     }
                 }
             }
+            Event::Thread {
+                channel,
+                parent,
+                messages,
+            } => {
+                if !is_current
+                    || self.open.as_ref() != Some(&channel)
+                    || self.thread.as_ref() != Some(&parent)
+                {
+                    return;
+                }
+                let head = messages.iter().find(|m| m.ts == parent);
+                self.thread_title.set_label(&match head {
+                    Some(m) => {
+                        let names = self.shared.names.borrow();
+                        let one = m.body.plain_with(&*names).replace('\n', " ");
+                        format!("Thread · {}", one.chars().take(48).collect::<String>())
+                    }
+                    None => "Thread".into(),
+                });
+                if let Some(m) = head {
+                    self.follow.set_active(m.subscribed);
+                    self.refresh_follow_label();
+                }
+                self.thread_list.clear();
+                // Every reply is its own author's, and grouping a thread the
+                // way the conversation is grouped makes the parent read as
+                // part of the reply above it.
+                let rows = self.thread_rows(messages);
+                self.thread_list.extend_from_iter(rows);
+                let adj = self.thread_scroller.vadjustment();
+                adj.set_value(adj.upper() - adj.page_size());
+            }
+            Event::Permalink { url, .. } => {
+                self.to_clipboard(&url);
+                self.notice("link copied".into(), sender);
+            }
             Event::Deleted { channel, ts } => {
                 if is_current && self.open.as_ref() == Some(&channel) {
                     if let Some(pos) = self.position(|r| r.msg.ts == ts) {
                         self.list.remove(pos);
+                    }
+                    if let Some(pos) = self.position_in(Pane::Thread, ts.as_str()) {
+                        self.thread_list.remove(pos);
+                    }
+                    if self.thread.as_ref() == Some(&ts) {
+                        self.close_thread();
                     }
                 }
             }
@@ -981,11 +1437,18 @@ impl App {
 
     /// A notice, shown for a few seconds and then replaced by the state.
     fn notice(&mut self, text: String, sender: &ComponentSender<Self>) {
-        self.status = text;
+        self.say(text);
         let s = sender.input_sender().clone();
+        let n = self.said;
         gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(6), move || {
-            let _ = s.send(Msg::StatusExpired);
+            let _ = s.send(Msg::StatusExpired(n));
         });
+    }
+
+    /// Put something in the status bar and remember that it is the newest.
+    fn say(&mut self, text: String) {
+        self.said = self.said.wrapping_add(1);
+        self.status = text;
     }
 
     /// The right-hand end of the status bar: what is waiting, and the two
@@ -1005,13 +1468,17 @@ impl App {
         };
     }
 
-    fn action(&mut self, name: &str) {
+    /// One place where every action happens, whatever pressed it.
+    fn act(&mut self, name: &str, sender: &ComponentSender<Self>) {
         match name {
             "jump_to" => {
                 self.jump.set_visible(true);
                 self.jump.grab_focus();
             }
-            "normal" => self.close_jump(),
+            // Escape unwinds one layer at a time, innermost first. One key,
+            // one meaning, and never "closed the thread when I meant to
+            // dismiss the picker".
+            "normal" => self.escape(),
             "next_conversation" | "prev_conversation" => {
                 // Over what is on screen, in the order it is on screen: the
                 // sidebar has headings now, so a row index is not a
@@ -1029,35 +1496,641 @@ impl App {
                 }
                 self.composer.grab_focus();
             }
-            "next_workspace" => {
+            "next_unread" | "prev_unread" => {
+                let shown: Vec<usize> = self
+                    .row_map
+                    .iter()
+                    .filter_map(|m| *m)
+                    .filter(|i| {
+                        self.convs()
+                            .get(*i)
+                            .is_some_and(|c| !c.is_muted && (c.unread > 0 || c.mentions > 0))
+                    })
+                    .collect();
+                if shown.is_empty() {
+                    self.say("nothing unread".into());
+                    return;
+                }
+                let here = self
+                    .sidebar
+                    .selected_row()
+                    .and_then(|r| self.row_map.get(r.index() as usize).copied().flatten());
+                let next = if name == "next_unread" {
+                    shown.iter().find(|i| Some(**i) > here)
+                } else {
+                    shown.iter().rev().find(|i| Some(**i) < here)
+                };
+                if let Some(i) = next.or(shown.first()) {
+                    self.select_conv(*i);
+                }
+            }
+            "next_workspace" | "prev_workspace" => {
                 let n = self.workspaces.len();
                 if n > 1 {
-                    self.switch_to((self.current + 1) % n);
+                    let step = if name == "next_workspace" { 1 } else { n - 1 };
+                    self.switch_to((self.current + step) % n);
                 }
             }
-            "clear_composer" => self.composer.buffer().set_text(""),
-            "help" | "palette" => {
-                self.status = self
-                    .bindings
-                    .iter()
-                    .map(|(n, a, _)| format!("{a} {n}"))
-                    .collect::<Vec<_>>()
-                    .join("   ");
+            "clear_composer" => self.composer_view().buffer().set_text(""),
+            "toggle_sidebar" => {
+                let on = !self.sidebar_box.is_visible();
+                self.sidebar_box.set_visible(on);
             }
-            other => {
-                if let Some(n) = other
-                    .strip_prefix("workspace_")
-                    .and_then(|d| d.parse::<usize>().ok())
-                {
-                    if n >= 1 && n <= self.workspaces.len() {
-                        self.switch_to(n - 1);
-                    } else {
-                        self.status = format!("no workspace {n}");
+            "back" | "forward" => self.go(name == "forward"),
+            "help" | "palette" => self.show_shortcuts(),
+
+            // Moving the cursor over messages. The list scrolls to follow it,
+            // because a selection you cannot see is not a cursor.
+            "cursor_up" => self.move_cursor(-1),
+            "cursor_down" => self.move_cursor(1),
+            "page_up" => self.move_cursor(-10),
+            "page_down" => self.move_cursor(10),
+            "goto_oldest" => self.set_cursor(Some(0)),
+            "goto_newest" => {
+                let len = self.list_of(self.active).len();
+                self.set_cursor(len.checked_sub(1).map(|i| i as usize));
+            }
+
+            "open_thread" => self.open_thread(sender),
+            "close_thread" => self.close_thread(),
+            "follow_thread" => {
+                if let (Some(ch), Some(parent)) = (self.open.clone(), self.thread.clone()) {
+                    self.send(Command::FollowThread {
+                        channel: ch,
+                        thread: parent,
+                        on: self.follow.is_active(),
+                    });
+                    self.refresh_follow_label();
+                }
+            }
+            "broadcast" => self.broadcast.set_active(!self.broadcast.is_active()),
+
+            "react" => self.open_picker(sender),
+            "mark_read" => {
+                if let (Some(ch), Some(m)) = (self.open.clone(), self.newest()) {
+                    self.send(Command::MarkRead(ch, m));
+                    self.notice("marked read".into(), sender);
+                }
+            }
+            "upload_file" => self.pick_file(sender),
+            "search" | "search_local" | "threads" | "saved" | "mentions" | "members"
+            | "profile" | "browse_channels" | "editor" => {
+                // Named, bound, and listed in the shortcuts window — but not
+                // built yet. Saying so beats a key that does nothing, which
+                // reads as a broken client rather than an unfinished one.
+                self.say(format!("{name}: not in this build yet"));
+            }
+
+            _ => self.message_action(name, sender),
+        }
+    }
+
+    /// The actions that need a message under the cursor.
+    fn message_action(&mut self, name: &str, sender: &ComponentSender<Self>) {
+        if let Some(n) = name
+            .strip_prefix("workspace_")
+            .and_then(|d| d.parse::<usize>().ok())
+        {
+            if n >= 1 && n <= self.workspaces.len() {
+                self.switch_to(n - 1);
+            } else {
+                self.say(format!("no workspace {n}"));
+            }
+            return;
+        }
+        if let Some(n) = name
+            .strip_prefix("react_")
+            .and_then(|d| d.parse::<usize>().ok())
+        {
+            match slk_core::emoji::QUICK.get(n - 1) {
+                Some(e) => self.react(e, sender),
+                None => self.say(format!("no quick reaction {n}")),
+            }
+            return;
+        }
+
+        let Some((_, m)) = self.cursor_message() else {
+            self.notice("no message selected — alt-Up picks one".into(), sender);
+            return;
+        };
+        let mine = m.author.id_str() == self.shared.self_id.borrow().as_str();
+        let link = crate::logic::first_link(&m.body);
+        if let Err(why) = crate::logic::allowed(name, mine, m.files.len(), link.iter().len()) {
+            self.notice(why.into(), sender);
+            return;
+        }
+        let Some(ch) = self.open.clone() else { return };
+
+        match name {
+            "copy_text" => {
+                let names = self.shared.names.borrow();
+                let text = m.body.plain_with(&*names);
+                drop(names);
+                self.to_clipboard(&text);
+                self.notice("copied".into(), sender);
+            }
+            // Asked for, not built here: a permalink is Slack's to mint, and
+            // the answer arrives as an event that puts it on the clipboard.
+            "copy_link" => self.send(Command::Permalink(ch, m.ts.clone())),
+            "open_link" => {
+                if let Some(url) = link {
+                    if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(
+                        &url,
+                        None::<&gtk::gio::AppLaunchContext>,
+                    ) {
+                        self.notice(format!("could not open: {e}"), sender);
                     }
-                } else {
-                    self.status = format!("unbound action {other}");
                 }
             }
+            "save" => self.send(Command::Save {
+                channel: ch,
+                ts: m.ts.clone(),
+                on: !m.saved,
+            }),
+            "pin" => self.send(Command::Pin {
+                channel: ch,
+                ts: m.ts.clone(),
+                on: !m.pinned,
+            }),
+            "download_files" => self.send(Command::DownloadFiles {
+                channel: ch,
+                ts: m.ts.clone(),
+                dir: download_dir(),
+            }),
+            "edit_message" => {
+                // The raw mrkdwn, not the rendered text: an edit that
+                // re-sends the rendering strips every link and mention the
+                // message had.
+                self.composer.buffer().set_text(&m.text);
+                self.editing = Some(m.ts.clone());
+                self.active = Pane::Conv;
+                self.composer.grab_focus();
+                self.refresh_hint();
+            }
+            "delete_message" => self.confirm_delete(ch, m.ts.clone(), sender),
+            // What the confirmation dialog sends back. Not bindable, and not
+            // in the action list: there is no key that deletes without asking.
+            "delete_confirmed" => self.send(Command::Delete(ch, m.ts.clone())),
+            other => self.say(format!("unbound action {other}")),
+        }
+    }
+    // ---- the message cursor -------------------------------------------
+
+    fn list_of(&self, pane: Pane) -> &TypedListView<Row, gtk::SingleSelection> {
+        match pane {
+            Pane::Thread if self.thread.is_some() => &self.thread_list,
+            _ => &self.list,
+        }
+    }
+
+    fn position_in(&self, pane: Pane, ts: &str) -> Option<u32> {
+        self.list_of(pane)
+            .iter()
+            .position(|i| i.borrow().msg.ts.as_str() == ts)
+            .map(|i| i as u32)
+    }
+
+    /// The message under the cursor, and where it is.
+    fn cursor_message(&self) -> Option<(u32, slk_core::Message)> {
+        let list = self.list_of(self.active);
+        let sel = list.selection_model.selected();
+        if sel == gtk::INVALID_LIST_POSITION {
+            return None;
+        }
+        list.get(sel).map(|r| (sel, r.borrow().msg.clone()))
+    }
+
+    fn set_cursor(&self, to: Option<usize>) {
+        let Some(to) = to else { return };
+        let list = self.list_of(self.active);
+        if to as u32 >= list.len() {
+            return;
+        }
+        list.selection_model.set_selected(to as u32);
+        // A selection that scrolled off screen is not a cursor.
+        list.view
+            .scroll_to(to as u32, gtk::ListScrollFlags::NONE, None);
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        let list = self.list_of(self.active);
+        let sel = list.selection_model.selected();
+        let at = (sel != gtk::INVALID_LIST_POSITION).then_some(sel as usize);
+        let to = crate::logic::cursor(at, list.len() as usize, delta);
+        self.set_cursor(to);
+    }
+
+    /// The newest message in the conversation, for marking read.
+    fn newest(&self) -> Option<slk_core::Ts> {
+        self.list
+            .len()
+            .checked_sub(1)
+            .and_then(|i| self.list.get(i))
+            .map(|r| r.borrow().msg.ts.clone())
+    }
+
+    /// Put a rebuilt row back where it was, keeping the cursor on it.
+    ///
+    /// `TypedListView` binds on demand, so mutating the model behind a bound
+    /// widget changes nothing on screen; the row has to be replaced.
+    fn replace_row(&mut self, pane: Pane, pos: u32, msg: slk_core::Message) {
+        let list = match pane {
+            Pane::Thread if self.thread.is_some() => &mut self.thread_list,
+            _ => &mut self.list,
+        };
+        let Some(old) = list.get(pos) else { return };
+        let (meta, shared) = {
+            let r = old.borrow();
+            (
+                crate::logic::Meta {
+                    grouped: r.meta.grouped,
+                    day_break: r.meta.day_break.clone(),
+                    unread_break: r.meta.unread_break,
+                },
+                r.shared.clone(),
+            )
+        };
+        list.remove(pos);
+        list.insert(pos, Row { msg, meta, shared });
+        list.selection_model.set_selected(pos);
+        // Removing and re-inserting can take the row out of the viewport —
+        // measured: reacting to the newest message scrolled it off screen and
+        // the chip appeared somewhere nobody was looking. The cursor has to
+        // stay where the eye is.
+        list.view.scroll_to(pos, gtk::ListScrollFlags::NONE, None);
+    }
+
+    /// Toggle a reaction on the message under the cursor.
+    fn react(&mut self, name: &str, sender: &ComponentSender<Self>) {
+        let Some((pos, mut m)) = self.cursor_message() else {
+            self.notice("no message selected — alt-Up picks one".into(), sender);
+            return;
+        };
+        let Some(ch) = self.open.clone() else { return };
+        if self.read_only {
+            self.notice("read-only: nothing is sent".into(), sender);
+            return;
+        }
+        let toned = slk_core::emoji::with_tone(name, self.skin);
+        let on = crate::logic::toggle_reaction(&mut m.reactions, &toned);
+        let ts = m.ts.clone();
+        let pane = self.active;
+        self.replace_row(pane, pos, m);
+        self.send(Command::React {
+            channel: ch,
+            ts,
+            name: toned,
+            on,
+        });
+    }
+
+    // ---- threads -------------------------------------------------------
+
+    fn open_thread(&mut self, sender: &ComponentSender<Self>) {
+        let Some((_, m)) = self.cursor_message() else {
+            self.notice("no message selected — alt-Up picks one".into(), sender);
+            return;
+        };
+        let Some(ch) = self.open.clone() else { return };
+        // A reply opens its own parent's thread, not a thread of its own.
+        let parent = m.thread_ts.clone().unwrap_or_else(|| m.ts.clone());
+        self.thread = Some(parent.clone());
+        self.thread_list.clear();
+        self.thread_title.set_label("Thread");
+        self.follow.set_active(m.subscribed);
+        self.refresh_follow_label();
+        self.thread_pane.set_visible(true);
+        // Measured from the left, so the pane's own width has to be taken
+        // off the current split rather than set on it — and never more than
+        // half, or on a tiled window the thread squeezes the conversation it
+        // is a reply to down to a column of two words.
+        let w = self.conv_paned.width();
+        if w > 320 {
+            self.conv_paned.set_position(w - 380.min(w / 2));
+        }
+        self.active = Pane::Thread;
+        self.send(Command::OpenThread(ch, parent));
+        self.thread_composer.grab_focus();
+    }
+
+    fn close_thread(&mut self) {
+        self.thread = None;
+        self.thread_list.clear();
+        self.thread_pane.set_visible(false);
+        self.active = Pane::Conv;
+        self.composer.grab_focus();
+    }
+
+    fn refresh_follow_label(&self) {
+        self.follow.set_label(if self.follow.is_active() {
+            "Following"
+        } else {
+            "Follow"
+        });
+    }
+
+    /// What Escape closes, innermost first.
+    fn escape(&mut self) {
+        if self.picker.is_some() {
+            self.close_picker();
+        } else if gtk::prelude::WidgetExt::is_visible(&self.jump) {
+            self.close_jump();
+        } else if self.editing.is_some() {
+            self.editing = None;
+            self.composer.buffer().set_text("");
+            self.refresh_hint();
+        } else if self.thread.is_some() {
+            self.close_thread();
+        } else {
+            self.list
+                .selection_model
+                .set_selected(gtk::INVALID_LIST_POSITION);
+            self.composer.grab_focus();
+        }
+    }
+
+    // ---- windows the actions open --------------------------------------
+
+    fn window(&self) -> Option<gtk::Window> {
+        self.composer.root().and_downcast::<gtk::Window>()
+    }
+
+    /// The emoji picker: one window rather than a popover per row, because
+    /// the keyboard has no anchor to hang a popover from and two
+    /// implementations of the same picker is one too many.
+    fn open_picker(&mut self, sender: &ComponentSender<Self>) {
+        if self.cursor_message().is_none() {
+            self.notice("no message selected — alt-Up picks one".into(), sender);
+            return;
+        }
+        self.close_picker();
+        let win = gtk::Window::new();
+        win.set_title(Some("Add a reaction"));
+        win.set_modal(true);
+        win.set_transient_for(self.window().as_ref());
+        win.set_default_size(360, 320);
+        win.add_css_class("picker");
+
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        outer.set_margin_top(8);
+        outer.set_margin_bottom(8);
+        outer.set_margin_start(8);
+        outer.set_margin_end(8);
+        let entry = gtk::SearchEntry::new();
+        entry.set_placeholder_text(Some("search emoji…"));
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_vexpand(true);
+        let flow = gtk::FlowBox::new();
+        flow.set_selection_mode(gtk::SelectionMode::Single);
+        flow.set_max_children_per_line(8);
+        scroller.set_child(Some(&flow));
+        outer.append(&entry);
+        outer.append(&scroller);
+        win.set_child(Some(&outer));
+
+        let skin = self.skin;
+        let s = sender.input_sender().clone();
+        let fill = move |flow: &gtk::FlowBox, query: &str| {
+            while let Some(c) = flow.first_child() {
+                flow.remove(&c);
+            }
+            for (name, glyph) in slk_core::emoji::search_with(query, 64, skin) {
+                let b = gtk::Button::new();
+                b.set_child(Some(&gtk::Label::new(Some(&glyph))));
+                b.set_tooltip_text(Some(&format!(":{name}:")));
+                b.add_css_class("flat");
+                // The name, not the glyph: Slack reacts by shortcode, and
+                // the tone is added when it is sent.
+                b.set_widget_name(&name);
+                let s = s.clone();
+                b.connect_clicked(move |b| {
+                    let _ = s.send(Msg::Picked(b.widget_name().to_string()));
+                });
+                flow.append(&b);
+            }
+        };
+        fill(&flow, "");
+        {
+            let flow2 = flow.clone();
+            let fill = fill.clone();
+            entry.connect_search_changed(move |e| fill(&flow2, &e.text()));
+        }
+        // Enter takes the first match, which is the whole point of typing a
+        // name; arrow-then-Enter takes the one under the cursor. Without
+        // both, the picker is mouse-only and every reaction costs a reach.
+        {
+            let flow2 = flow.clone();
+            entry.connect_activate(move |_| {
+                if let Some(b) = flow2
+                    .child_at_index(0)
+                    .and_then(|c| c.child())
+                    .and_downcast::<gtk::Button>()
+                {
+                    b.emit_clicked();
+                }
+            });
+        }
+        flow.connect_child_activated(|_, child| {
+            if let Some(b) = child.child().and_downcast::<gtk::Button>() {
+                b.emit_clicked();
+            }
+        });
+        {
+            // Escape here, not only on the main window: a modal window has
+            // the keyboard, so the window's accelerators never see the key.
+            let k = gtk::EventControllerKey::new();
+            let s = sender.input_sender().clone();
+            k.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    let _ = s.send(Msg::Action("normal".into()));
+                    return gtk::glib::Propagation::Stop;
+                }
+                gtk::glib::Propagation::Proceed
+            });
+            win.add_controller(k);
+        }
+        win.present();
+        entry.grab_focus();
+        self.picker = Some(win);
+    }
+
+    fn close_picker(&mut self) {
+        if let Some(w) = self.picker.take() {
+            w.close();
+        }
+    }
+
+    /// Deleting is the one action with no undo, so it asks.
+    fn confirm_delete(
+        &mut self,
+        channel: ChannelId,
+        ts: slk_core::Ts,
+        sender: &ComponentSender<Self>,
+    ) {
+        let dialog = gtk::AlertDialog::builder()
+            .message("Delete this message?")
+            .detail("It disappears for everyone, and there is no undo.")
+            .buttons(["Cancel", "Delete"])
+            .cancel_button(0)
+            .default_button(0)
+            .modal(true)
+            .build();
+        let s = sender.input_sender().clone();
+        let at = ts.as_str().to_string();
+        let _ = channel;
+        dialog.choose(
+            self.window().as_ref(),
+            gtk::gio::Cancellable::NONE,
+            move |r| {
+                if r == Ok(1) {
+                    let _ = s.send(Msg::RowAction {
+                        at,
+                        act: "delete_confirmed".into(),
+                    });
+                }
+            },
+        );
+    }
+
+    fn pick_file(&mut self, sender: &ComponentSender<Self>) {
+        let Some(ch) = self.open.clone() else { return };
+        if self.read_only {
+            self.notice("read-only: nothing is sent".into(), sender);
+            return;
+        }
+        let thread = self.thread.clone();
+        let tx = self.ws().map(|w| w.commands.clone());
+        let rt = self.runtime.clone();
+        let dialog = gtk::FileDialog::builder().title("Send a file").build();
+        dialog.open(
+            self.window().as_ref(),
+            gtk::gio::Cancellable::NONE,
+            move |r| {
+                let Ok(file) = r else { return };
+                let Some(path) = file.path() else { return };
+                if let Some(tx) = tx {
+                    rt.spawn(async move {
+                        let _ = tx
+                            .send(Command::UploadFile {
+                                channel: ch,
+                                thread,
+                                path,
+                                comment: None,
+                            })
+                            .await;
+                    });
+                }
+            },
+        );
+    }
+
+    /// The shortcuts window, generated from the live keymap.
+    ///
+    /// Written by hand it drifts from the bindings within a month; generated
+    /// it cannot, and an action with no free key says so instead of being
+    /// quietly missing.
+    fn show_shortcuts(&mut self) {
+        let win = gtk::Window::new();
+        win.set_title(Some("Keyboard shortcuts"));
+        win.set_transient_for(self.window().as_ref());
+        win.set_default_size(460, 560);
+        win.add_css_class("picker");
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        outer.set_margin_top(10);
+        outer.set_margin_bottom(10);
+        outer.set_margin_start(12);
+        outer.set_margin_end(12);
+
+        let mut groups: Vec<&'static str> = Vec::new();
+        for b in &self.bindings {
+            if !groups.contains(&b.action.group()) {
+                groups.push(b.action.group());
+            }
+        }
+        for g in groups {
+            let head = gtk::Label::new(Some(&g.to_uppercase()));
+            head.set_xalign(0.0);
+            head.add_css_class("section");
+            head.set_margin_top(10);
+            outer.append(&head);
+            for b in self.bindings.iter().filter(|b| b.action.group() == g) {
+                let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                let key = gtk::Label::new(Some(if b.accel.is_empty() {
+                    "—"
+                } else {
+                    b.accel.as_str()
+                }));
+                key.set_xalign(1.0);
+                key.set_size_request(150, -1);
+                key.add_css_class("chip");
+                let what = gtk::Label::new(Some(b.action.help()));
+                what.set_xalign(0.0);
+                what.set_hexpand(true);
+                line.append(&key);
+                line.append(&what);
+                outer.append(&line);
+            }
+        }
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_child(Some(&outer));
+        win.set_child(Some(&scroller));
+        {
+            let k = gtk::EventControllerKey::new();
+            let w = win.clone();
+            k.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    w.close();
+                    return gtk::glib::Propagation::Stop;
+                }
+                gtk::glib::Propagation::Proceed
+            });
+            win.add_controller(k);
+        }
+        win.present();
+    }
+
+    // ---- small things --------------------------------------------------
+
+    fn composer_view(&self) -> &gtk::TextView {
+        match self.active {
+            Pane::Thread if self.thread.is_some() => &self.thread_composer,
+            _ => &self.composer,
+        }
+    }
+
+    fn to_clipboard(&self, text: &str) {
+        if let Some(d) = gtk::gdk::Display::default() {
+            d.clipboard().set_text(text);
+        }
+    }
+
+    fn refresh_hint(&mut self) {
+        self.hint = if self.read_only {
+            "read-only — nothing is sent".into()
+        } else if self.editing.is_some() {
+            "editing — enter saves · esc cancels".into()
+        } else {
+            "enter sends · shift+enter newline".into()
+        };
+    }
+
+    /// Back and forward over the conversations visited.
+    fn go(&mut self, forward: bool) {
+        let to = if forward {
+            self.history_at + 1
+        } else {
+            match self.history_at.checked_sub(1) {
+                Some(i) => i,
+                None => return,
+            }
+        };
+        let Some(id) = self.history.get(to).cloned() else {
+            return;
+        };
+        self.history_at = to;
+        self.visit(id.clone());
+        if let Some(i) = self.convs().iter().position(|c| c.id == id) {
+            self.select_conv(i);
         }
     }
 
@@ -1279,6 +2352,14 @@ impl Drop for App {
 /// "Today", "Yesterday", a weekday within the week, else the date. The one
 /// place the client formats a day, so the separator and anything else that
 /// needs one agree.
+/// Where downloaded files go: the user's own download directory, or their
+/// home if the desktop has not told us where that is.
+fn download_dir() -> std::path::PathBuf {
+    gtk::glib::user_special_dir(gtk::glib::UserDirectory::Downloads)
+        .or_else(|| Some(gtk::glib::home_dir()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
 pub fn day_label(secs: i64) -> String {
     let Ok(ts) = jiff::Timestamp::from_second(secs) else {
         return String::new();

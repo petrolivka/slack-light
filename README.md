@@ -18,15 +18,19 @@ your desktop.
 Built for Wayland, verified on Hyprland, themed by
 [Omarchy](https://omarchy.org) when it is there.
 
-> **Status: M2a — the look.** `slack-light --anonymous` opens a themed window on a demo workspace; with a session it follows a conversation and replies. This is the successor to a
-> terminal client that reached parity and turned out to be the wrong shape
-> for a medium full of images and threads. The Slack layer — session route,
-> websocket, cache, sync engine — carries over intact and verified. The GTK
-> shell was spiked and measured — 60 fps over 5 000 rows, 0.06 % idle,
-> themed live from Omarchy, driven from the keyboard and asserted through
-> the accessibility tree — and then built. See [ADR-001](docs/ADR-001-native-gui.md)
-> for why, [the findings](docs/M0-GUI-FINDINGS.md) for the numbers, and
-> [M1-STATUS.md](docs/M1-STATUS.md) for what works today.
+> **Status: M2b — a message you can act on.** `slack-light --anonymous`
+> opens a themed window on a demo workspace; with a session it follows a
+> conversation, replies in a thread, reacts, edits, pins and saves. This is
+> the successor to a terminal client that reached parity and turned out to
+> be the wrong shape for a medium full of images and threads. The Slack
+> layer — session route, websocket, cache, sync engine — carries over
+> intact and verified. The GTK shell was spiked and measured — no dropped
+> frame scrolling 5 000 rows, 65 MB of private memory holding them, themed
+> live from Omarchy, driven from the keyboard and asserted through the
+> accessibility tree — and then built. See [ADR-001](docs/ADR-001-native-gui.md)
+> for why, [the findings](docs/M0-GUI-FINDINGS.md) for the spike numbers,
+> and [M2-STATUS.md](docs/M2-STATUS.md) for what works today and what does
+> not — including one measurement that had to be taken back.
 
 ---
 

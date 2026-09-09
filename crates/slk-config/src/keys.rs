@@ -217,6 +217,17 @@ impl Keymap {
             (Chord::ctrl('w'), NextWorkspace),
             (
                 Chord::new(
+                    Char('w'),
+                    KeyModifiers {
+                        ctrl: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                ),
+                PrevWorkspace,
+            ),
+            (
+                Chord::new(
                     Char('1'),
                     KeyModifiers {
                         ctrl: true,
@@ -496,10 +507,35 @@ impl Keymap {
             (Chord::ctrl('p'), Palette),
             (Chord::ctrl('f'), SearchLocal),
             (alt('/'), Search),
-            (alt_key(Up), CursorUp),
-            (alt_key(Down), CursorDown),
+            // The arrows move between conversations, the way the official
+            // client's alt-arrows do; the message cursor is on j and k,
+            // where somebody who wants a message cursor will look for it.
+            (alt_key(Up), PrevConv),
+            (alt_key(Down), NextConv),
             (alt('k'), CursorUp),
             (alt('j'), CursorDown),
+            (
+                Chord::new(
+                    Up,
+                    KeyModifiers {
+                        alt: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                ),
+                PrevUnread,
+            ),
+            (
+                Chord::new(
+                    Down,
+                    KeyModifiers {
+                        alt: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                ),
+                NextUnread,
+            ),
             (alt('g'), GotoNewest),
             (alt('t'), OpenThread),
             (alt('F'), FollowThread),
@@ -507,8 +543,13 @@ impl Keymap {
             (alt('z'), ToggleSection),
             (alt('['), GoBack),
             (alt(']'), GoForward),
-            (alt('b'), ToggleBroadcast),
-            (Chord::key(Esc), CloseThread),
+            (alt('B'), ToggleBroadcast),
+            // Escape unwinds whatever is open, innermost first — the
+            // picker, then the jump bar, then an edit, then the thread. One
+            // key with one meaning beats four keys nobody remembers, and it
+            // is why `close_thread` gets a key of its own.
+            (Chord::key(Esc), Normal),
+            (alt('w'), CloseThread),
             (alt('r'), React),
             (alt('e'), EditMessage),
             (alt('d'), DeleteMessage),

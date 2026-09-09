@@ -98,16 +98,142 @@ pub fn step(selected: Option<usize>, len: usize, down: bool) -> Option<usize> {
     })
 }
 
+/// Where the message cursor goes. Clamped at both ends, and from nowhere it
+/// lands on the newest message, because that is where the eye already is.
+pub fn cursor(at: Option<usize>, len: usize, delta: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let last = len as isize - 1;
+    Some(match at {
+        None => last as usize,
+        Some(i) => (i as isize + delta).clamp(0, last) as usize,
+    })
+}
+
+/// Whether a chord may be installed as a window-wide accelerator.
+///
+/// The `slack` preset keeps the composer focused at all times, so a
+/// modifier-less accelerator is not a shortcut — it is a character the user
+/// can no longer type. The preset binds `[` and `]` to back and forward; as
+/// accelerators those would eat every bracket typed into a code snippet. A
+/// chord earns a global accelerator by having a modifier, or by being a key
+/// that produces no text at all.
+pub fn bindable(rendered: &str) -> bool {
+    let mut parts = rendered.split('+').peekable();
+    let mut modified = false;
+    let mut shift = false;
+    let mut key = "";
+    while let Some(p) = parts.next() {
+        match p {
+            "ctrl" | "alt" if parts.peek().is_some() => modified = true,
+            "shift" if parts.peek().is_some() => shift = true,
+            other => key = other,
+        }
+    }
+    // Shift on a character key never arrives. Measured through the Wayland
+    // virtual keyboard: alt-shift-m is delivered as keyval `m` with
+    // SHIFT|ALT, and neither `<Alt><Shift>m` nor `<Alt><Shift>M` matches it,
+    // while `<Alt>m`, `<Alt>slash`, `<Alt>at` and `<Alt><Shift>Down` all fire.
+    // Nine of the preset's bindings were dead this way with no warning from
+    // anywhere. Shift on a *named* key — the arrows — is fine, so the rule is
+    // about the character, not about shift.
+    let one_char = key.chars().count() == 1;
+    if (shift || key.chars().next().is_some_and(char::is_uppercase)) && one_char {
+        return false;
+    }
+    if modified {
+        return true;
+    }
+    key == "esc" || (key.starts_with('f') && key[1..].parse::<u8>().is_ok())
+}
+
+/// Whether an action can be taken on the message under the cursor, and what
+/// to say when it cannot.
+///
+/// A silent no-op is the worst answer here: the user presses alt-e on
+/// somebody else's message and cannot tell whether the key is unbound, the
+/// message is unselected, or Slack refused. Every refusal has a sentence.
+pub fn allowed(act: &str, mine: bool, files: usize, links: usize) -> Result<(), &'static str> {
+    match act {
+        "edit_message" if !mine => Err("you can only edit your own messages"),
+        "delete_message" if !mine => Err("you can only delete your own messages"),
+        "download_files" if files == 0 => Err("no files on this message"),
+        "open_link" if links == 0 => Err("no link in this message"),
+        _ => Ok(()),
+    }
+}
+
+/// Apply a reaction toggle the way the server will, so the chip moves under
+/// the pointer instead of a round trip later.
+///
+/// The engine deliberately does not echo a successful reaction — it only
+/// re-fetches the message when one *fails* — so this is not a decoration on
+/// top of the truth, it is the truth until something contradicts it.
+pub fn toggle_reaction(reactions: &mut Vec<slk_core::Reaction>, name: &str) -> bool {
+    match reactions.iter_mut().position(|r| r.name == name) {
+        Some(i) => {
+            let on = !reactions[i].by_me;
+            reactions[i].by_me = on;
+            if on {
+                reactions[i].count += 1;
+            } else {
+                reactions[i].count = reactions[i].count.saturating_sub(1);
+                if reactions[i].count == 0 {
+                    reactions.remove(i);
+                }
+            }
+            on
+        }
+        None => {
+            reactions.push(slk_core::Reaction {
+                name: name.to_string(),
+                count: 1,
+                by_me: true,
+            });
+            true
+        }
+    }
+}
+
+/// The first link in a message, for "open link".
+///
+/// Slack writes links in the body, in attachments and in Block Kit; this
+/// takes the body's, which is what "the link in this message" means to
+/// somebody looking at one.
+pub fn first_link(doc: &slk_core::Doc) -> Option<String> {
+    use slk_core::ast::BlockNode;
+    use slk_core::Inline;
+    fn scan(xs: &[Inline]) -> Option<String> {
+        xs.iter().find_map(|i| match i {
+            Inline::Link { url, .. } => Some(url.clone()),
+            Inline::Date { url: Some(u), .. } => Some(u.clone()),
+            _ => None,
+        })
+    }
+    doc.0.iter().find_map(|b| match b {
+        BlockNode::Section(xs) | BlockNode::Quote(xs) => scan(xs),
+        BlockNode::List { items, .. } => items.iter().find_map(|i| scan(i)),
+        BlockNode::Preformatted(_) => None,
+    })
+}
+
 /// A rendered `slk-config` chord ("ctrl+k", "alt+up", "f1", "esc") as a
 /// GTK accelerator ("<Control>k", "<Alt>Up", "F1", "Escape").
+/// A capital letter is written as `<Shift>` plus the lower-case key, which
+/// is the form GTK parses — but see `bindable`: such a chord never actually
+/// arrives, so nothing installs one. The translation is kept correct anyway,
+/// because the shortcuts window renders it and a wrong string there is a lie
+/// to the reader.
 pub fn accel(rendered: &str) -> Option<String> {
     let mut mods = String::new();
+    let mut shift = false;
     let mut key = None;
     for part in rendered.split('+') {
         match part {
             "ctrl" => mods.push_str("<Control>"),
             "alt" => mods.push_str("<Alt>"),
-            "shift" => mods.push_str("<Shift>"),
+            "shift" => shift = true,
             "" => key = Some("plus".to_string()),
             k => {
                 key = Some(match k {
@@ -122,14 +248,33 @@ pub fn accel(rendered: &str) -> Option<String> {
                     }
                     "pageup" => "Page_Up".into(),
                     "pagedown" => "Page_Down".into(),
+                    // GTK parses accelerators by key *name*: "<Alt>/" is not
+                    // one, and gtk_accelerator_parse answers nothing rather
+                    // than complaining, which is a binding that silently
+                    // does not exist.
+                    "/" => "slash".into(),
+                    "[" => "bracketleft".into(),
+                    "]" => "bracketright".into(),
+                    "@" => "at".into(),
+                    "," => "comma".into(),
+                    "." => "period".into(),
+                    ";" => "semicolon".into(),
+                    "-" => "minus".into(),
+                    "=" => "equal".into(),
                     f if f.starts_with('f') && f[1..].parse::<u8>().is_ok() => f.to_uppercase(),
-                    c if c.chars().count() == 1 => c.to_string(),
+                    c if c.chars().count() == 1 => {
+                        let ch = c.chars().next().unwrap();
+                        if ch.is_uppercase() {
+                            shift = true;
+                        }
+                        ch.to_lowercase().to_string()
+                    }
                     _ => return None,
                 })
             }
         }
     }
-    key.map(|k| format!("{mods}{k}"))
+    key.map(|k| format!("{mods}{}{k}", if shift { "<Shift>" } else { "" }))
 }
 
 #[cfg(test)]
@@ -232,6 +377,108 @@ mod tests {
     }
 
     #[test]
+    fn the_message_cursor_clamps_and_starts_at_the_newest() {
+        assert_eq!(cursor(None, 10, -1), Some(9), "from nowhere, the newest");
+        assert_eq!(cursor(Some(9), 10, 1), Some(9));
+        assert_eq!(cursor(Some(0), 10, -1), Some(0));
+        assert_eq!(cursor(Some(5), 10, -10), Some(0), "a page up past the top");
+        assert_eq!(cursor(Some(5), 10, 10), Some(9));
+        assert_eq!(cursor(None, 0, 1), None);
+    }
+
+    #[test]
+    fn only_a_chord_that_is_not_text_becomes_an_accelerator() {
+        assert!(bindable("ctrl+k"));
+        assert!(bindable("alt+up"));
+        assert!(bindable("f1"));
+        assert!(bindable("esc"));
+        // The preset binds these, and as accelerators they would eat the
+        // bracket out of every code snippet typed into the composer.
+        assert!(!bindable("["));
+        assert!(!bindable("]"));
+        assert!(!bindable("enter"));
+        assert!(!bindable("tab"));
+        // Shift on a character key is dead in GTK; shift on a named key
+        // is not, and the difference is measured, not assumed.
+        assert!(!bindable("alt+shift+m"));
+        assert!(!bindable("alt+M"));
+        assert!(!bindable("ctrl+shift+w"));
+        assert!(bindable("alt+shift+down"));
+        assert!(bindable("alt+slash"));
+    }
+
+    #[test]
+    fn an_action_that_cannot_apply_says_why() {
+        assert_eq!(allowed("edit_message", true, 0, 0), Ok(()));
+        assert!(allowed("edit_message", false, 0, 0).is_err());
+        assert!(allowed("delete_message", false, 0, 0).is_err());
+        assert!(allowed("download_files", true, 0, 0).is_err());
+        assert_eq!(allowed("download_files", true, 2, 0), Ok(()));
+        assert!(allowed("open_link", true, 0, 0).is_err());
+        // Anything not gated is allowed; the list is a set of exceptions,
+        // not a permission table to keep in step with the action list.
+        assert_eq!(allowed("react_1", false, 0, 0), Ok(()));
+    }
+
+    #[test]
+    fn a_reaction_toggles_both_ways_and_the_last_one_removes_the_chip() {
+        let mut r = Vec::new();
+        assert!(toggle_reaction(&mut r, "tada"));
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].count, r[0].by_me), (1, true));
+
+        // Off again: the chip goes with it, because a zero-count chip is a
+        // reaction nobody made.
+        assert!(!toggle_reaction(&mut r, "tada"));
+        assert!(r.is_empty());
+
+        // Joining somebody else's reaction leaves the chip and adds to it.
+        let mut r = vec![slk_core::Reaction {
+            name: "eyes".into(),
+            count: 2,
+            by_me: false,
+        }];
+        assert!(toggle_reaction(&mut r, "eyes"));
+        assert_eq!((r[0].count, r[0].by_me), (3, true));
+        assert!(!toggle_reaction(&mut r, "eyes"));
+        assert_eq!((r[0].count, r[0].by_me), (2, false));
+    }
+
+    #[test]
+    fn the_first_link_is_found_wherever_it_is_written() {
+        use slk_core::ast::BlockNode;
+        use slk_core::{Doc, Inline, Style};
+        let text = |t: &str| Inline::Text {
+            text: t.into(),
+            style: Style::default(),
+        };
+        let link = |u: &str| Inline::Link {
+            url: u.into(),
+            text: None,
+            style: Style::default(),
+        };
+        assert_eq!(first_link(&Doc(vec![])), None);
+        assert_eq!(
+            first_link(&Doc(vec![BlockNode::Section(vec![
+                text("see "),
+                link("https://a"),
+                link("https://b"),
+            ])]))
+            .as_deref(),
+            Some("https://a"),
+        );
+        // A code block is not a link, and a later section still is.
+        assert_eq!(
+            first_link(&Doc(vec![
+                BlockNode::Preformatted("https://not-a-link".into()),
+                BlockNode::Quote(vec![link("https://c")]),
+            ]))
+            .as_deref(),
+            Some("https://c"),
+        );
+    }
+
+    #[test]
     fn chords_become_accelerators() {
         assert_eq!(accel("ctrl+k").as_deref(), Some("<Control>k"));
         assert_eq!(accel("alt+up").as_deref(), Some("<Alt>Up"));
@@ -240,6 +487,12 @@ mod tests {
         assert_eq!(accel("ctrl+shift+p").as_deref(), Some("<Control><Shift>p"));
         assert_eq!(accel("enter").as_deref(), Some("Return"));
         assert_eq!(accel("ctrl+1").as_deref(), Some("<Control>1"));
+        assert_eq!(accel("alt+/").as_deref(), Some("<Alt>slash"));
+        assert_eq!(accel("alt+[").as_deref(), Some("<Alt>bracketleft"));
+        // The collision that cost an afternoon: GTK matches on the
+        // lower-cased keyval, so a capital has to be written as shift.
+        assert_eq!(accel("alt+T").as_deref(), Some("<Alt><Shift>t"));
+        assert_ne!(accel("alt+T"), accel("alt+t"));
         assert_eq!(accel("nonsense"), None);
     }
 

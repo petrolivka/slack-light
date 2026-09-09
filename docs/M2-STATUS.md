@@ -1,7 +1,8 @@
 # M2 — Parity core: Status
 
 M2 is being done in two halves. **M2a — the look** is complete; **M2b —
-the features** is the rest of the `M` requirements. The order was
+the features** is the rest of the `M` requirements, and its first block —
+a message you can act on — is complete too (§4). The order was
 deliberate: the message row is the thing every later feature is drawn on
 top of, so redoing it afterwards would mean redoing reactions, threads and
 hover actions with it.
@@ -121,3 +122,121 @@ of 67 at M1, fewer now. By area:
   from the live keymap rather than printed into the status bar
 - **The idle repaint** (§2), and the five preset bindings that still fall
   back to defaults because `slack` does not bind them
+
+---
+
+## 4. M2b, first block: a message you can act on
+
+M2a drew reactions, a thread summary and a hover area with nothing behind
+any of them. This block puts the engine behind them. The engine needed no
+changes at all: every command was already written and tested for the
+terminal client, so this is entirely the window learning to ask.
+
+| | Before | Now |
+|---|---|---|
+| The cursor | there was none; the list was `NoSelection` | a selected message, moved with alt-j/k, alt-Home/End and the page keys, marked by an accent edge rather than a filled row |
+| Reactions | chips you could read | chips you can click, a `＋` beside them, three quick reactions on alt-1/2/3, and a picker on alt-r with search and skin tone |
+| Threads | `↳ 2 replies` as text | a pane beside the conversation: the parent, its replies, follow, "also send to the conversation", and its own composer. Opened by the link, by alt-t, or by any reply in it |
+| Message actions | none | edit, delete (with a confirmation, because it is the one action with no undo), copy text, copy link, open the first link, save, pin, download files, upload, mark read |
+| Where they live | — | a hover bar over the row — three quick reactions, the picker, the thread, and a `⋯` menu built only when it is opened |
+| Pinned and saved | invisible | a line under the message: `📌 pinned · 🔖 saved` |
+| The keyboard | 13 actions bound | 55, with the shortcuts window (F1) generated from the live keymap, including what has no key |
+| Escape | closed the jump bar | unwinds one layer at a time: picker, jump bar, edit, thread, cursor |
+
+Everything the pointer can do goes through `Msg::RowAction`, which carries
+a timestamp and an action name and then runs the same code the keyboard
+runs. Clicking `↳` and pressing alt-t are one call.
+
+### The keymap defect that was worth the afternoon
+
+**Nine bindings were dead, and nothing anywhere said so.** Turning on the
+whole action list at once made it visible; a smaller change would have
+shipped it.
+
+- `<Alt>T` and `<Alt>t` are the **same accelerator**. `gtk_accelerator_parse`
+  lower-cases a capital that has no `<Shift>` beside it, so the preset's
+  `threads` (alt-T) and `open_thread` (alt-t) collided silently and alt-t
+  answered "threads: not in this build yet".
+- `<Alt><Shift>t` matches **nothing**. Measured with a capture-phase key
+  logger: alt-shift-m arrives as keyval `m` with `SHIFT|ALT`, and neither
+  `<Alt><Shift>m` nor `<Alt><Shift>M` fires on it — while `<Alt>m`,
+  `<Alt>slash`, `<Alt>at` and `<Alt><Shift>Down` all do. Shift on a *named*
+  key is fine; shift on a *character* is not.
+
+So `logic::bindable` refuses shift-plus-a-character, the affected actions
+get control chords instead, and `e2e.sh` asserts that no such binding is
+ever installed again. Two more rules came out of the same pass: a chord
+with no modifier at all is text, not a shortcut — the preset binds `[` and
+`]`, which as accelerators would eat the brackets out of every code
+snippet — and the first action to claim an accelerator keeps it, with the
+loser reported rather than silently dropped.
+
+The logger that found it stayed, under `--metrics`, and logs **only chords**:
+a plain key is the message the user is typing.
+
+### Five more defects, all found by driving it
+
+- **A replaced row was grouped against itself.** An edited or echoed
+  message is compared against the end of the list, which for the newest
+  message is the message itself — same author, same second — so it grouped
+  under itself and lost its avatar, its name and its pin. Present since M1;
+  invisible until a pin needed somewhere to render.
+- **The cursor did not survive an echo.** Saving a message made the engine
+  send it back, the row was replaced, and the next action said "no message
+  selected" with the cursor still visibly on the row.
+- **Closing the thread moved the cursor into it.** Clearing a list emits a
+  selection change; the thread pane's arrived after `close_thread` had
+  already pointed the cursor back at the conversation.
+- **An expiring notice wiped a newer one.** "you can only edit your own
+  messages" lasted a fraction of a second because a "pinned" from six
+  seconds earlier chose that moment to clear itself. Notices are numbered
+  now, and a timer only clears the one it was raised for.
+- **A reaction scrolled its own message off screen.** Removing and
+  re-inserting a row can take it out of the viewport; the chip appeared
+  somewhere nobody was looking.
+
+And one that was mine, not the code's: `./build.sh test` ran `cargo test`,
+which in this workspace tests the root package — a thin binary with no
+tests. "0 passed" read as success and covered nothing. It runs the whole
+workspace now.
+
+### Measurements
+
+Both builds measured today, on this machine, with the same command —
+`--anonymous --no-cache --demo-rows 5000 --metrics --bench --idle 5` —
+three samples each. **The command is written down this time**, because §2's
+numbers were not: re-measuring commit `da426f5` today gives 60 MB and
+178 MB where §2 records 99 MB and 224 MB, so §2's memory row and this one
+are not comparable and §2 should be read as "M2a against M1", nothing more.
+
+| Measure | M2a (da426f5) | M2b | Budget |
+|---|---|---|---|
+| Window mapped | 100–109 ms | 101–117 ms | < 300 ms ✅ |
+| 5 007 rows on screen | 242–268 ms | 253–263 ms | < 300 ms ✅ |
+| Frames over 20 ms while scrolling | 0.0 % | 0.0 % | 60 fps ✅ |
+| Anonymous (private) memory, idle | 60.0 MB | 64.8 MB | < 80 MB ✅ |
+| Resident, idle | 178.4 MB | 196.7 MB | < 200 MB ✅ |
+| Idle CPU over five seconds | 2.0–2.2 % | 2.1–2.2 % | ~0 % ❌ |
+
+The first version of the hover bar built its six buttons in every pooled
+row and cost **15 MB of private memory and 10 MB resident**. Building it on
+the first hover instead gives most of that back — the numbers above are
+with the lazy version; the eager one measured 75.4 MB private and 207 MB
+resident, over the resident budget on its own. Most rows are never pointed
+at, so most of those widgets never existed.
+
+The idle repaint of §2 is unchanged and still unfixed, in both builds.
+
+### What is left in M2b
+
+- **Composing**: completion for `@`, `#`, `:emoji:` and `/commands`,
+  outgoing conversion to Slack's wire format, drafts
+- **History**: scrollback upward with its loading state, jump to a message
+  in context — `back`/`forward` are wired, the rest is not
+- **The lists**: search (both halves), threads, saved, mentions, members,
+  profiles, presence, browse-and-join. Each is bound, named in the
+  shortcuts window, and answers "not in this build yet" rather than doing
+  nothing
+- **Notifications**: the full policy, mark-read policies, gap fill
+- **The command palette**, which today shows the shortcuts window
+- **The idle repaint** (§2), and the memory budget decision

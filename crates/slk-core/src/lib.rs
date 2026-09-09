@@ -17,5 +17,5 @@ pub mod richtext;
 pub use ast::{Doc, Inline, Names, Style};
 pub use ids::{BotId, ChannelId, FileId, MsgRef, SubteamId, TeamId, Ts, UserId};
 pub use model::{
-    Author, Conversation, ConversationKind, Delivery, Message, Presence, User, Workspace,
+    Author, Conversation, ConversationKind, Delivery, Message, Presence, Reaction, User, Workspace,
 };

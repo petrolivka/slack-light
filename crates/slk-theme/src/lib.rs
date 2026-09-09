@@ -296,7 +296,12 @@ window {{ background-color: @sl_bg; color: @sl_fg; font-size: 13px; }}
 .conversation {{ background-color: @sl_bg; }}
 .conversation > row {{ padding: 0; }}
 .conversation > row:hover {{ background-color: alpha(@sl_fg, 0.03); }}
-.conversation > row:selected {{ background: none; }}
+/* The message cursor. A left edge rather than a filled row: a selection
+   that repaints the whole message hides the grouping it sits inside. */
+.conversation > row:selected {{
+    background-color: alpha(@sl_accent, 0.10);
+    box-shadow: inset 2px 0 0 0 @sl_accent;
+}}
 .avatar {{
     min-width: 24px; min-height: 24px; border-radius: 5px;
     color: @sl_bg; font-weight: bold; font-size: 11px;
@@ -312,7 +317,42 @@ window {{ background-color: @sl_bg; color: @sl_fg; font-size: 13px; }}
     border-radius: 10px; padding: 0 7px; font-size: 11px; color: @sl_fg;
 }}
 .chip.mine {{ background-color: alpha(@sl_accent, 0.22); border-color: @sl_accent; }}
+.chip:hover {{ border-color: @sl_accent; }}
+.chip.addchip {{ color: @sl_fg_dim; }}
 .threadlink {{ color: @sl_accent; font-size: 12px; }}
+.threadlink:hover {{ color: @sl_fg_bright; }}
+.marks {{ color: @sl_fg_dim; font-size: 11px; }}
+
+/* The hover bar. It floats over the row's top-right corner, so nothing
+   reflows when it appears — a bar that moves the text under the pointer is
+   a bar you cannot click. */
+.msgactions {{
+    background-color: @sl_bg_light; border: 1px solid alpha(@sl_muted, 0.9);
+    border-radius: 6px; padding: 1px;
+}}
+.msgactions button, .moremenu button {{
+    background: none; border: none; box-shadow: none;
+    min-height: 22px; min-width: 24px; padding: 0 4px;
+    color: @sl_fg; font-size: 12px;
+}}
+.msgactions button:hover, .moremenu button:hover {{
+    background-color: alpha(@sl_accent, 0.25);
+}}
+.moremenu button {{ min-width: 150px; padding: 3px 8px; }}
+
+/* The thread pane: the same conversation, one shade apart from it. */
+.threadpane {{ background-color: @sl_bg_light; border-left: 1px solid alpha(@sl_muted, 0.6); }}
+.threadpane .header {{ background-color: @sl_bg_light; }}
+.threadpane .conversation {{ background-color: @sl_bg_light; }}
+.threadpane .composer {{ background-color: @sl_bg; }}
+.threadpane checkbutton {{ color: @sl_fg_dim; font-size: 11px; padding: 0 6px 4px 6px; }}
+
+/* The picker and the shortcuts window. */
+.picker {{ background-color: @sl_bg; color: @sl_fg; }}
+.picker button {{ background: none; border: none; box-shadow: none; font-size: 17px; }}
+.picker button:hover {{ background-color: alpha(@sl_accent, 0.25); border-radius: 5px; }}
+.picker .section {{ color: @sl_fg_dim; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; }}
+.picker .chip {{ font-family: monospace; }}
 .blockkit {{
     padding: 8px 10px; border-radius: 6px;
     background-color: alpha(@sl_fg, 0.04);

@@ -6,7 +6,7 @@ stream and asserted on it. This is the GUI equivalent: the same tree a
 screen reader reads, walked over D-Bus, printed as roles and names — and
 therefore assertable. A control that is not in here is a defect twice over.
 
-    tree.py [--app NAME] [--json]
+    tree.py [--app NAME] [--json] [--states]
 
 Talks to the a11y bus directly (its address comes from org.a11y.Bus on the
 session bus), with PyGObject's Gio and nothing else: no pyatspi, no atspi
@@ -21,6 +21,12 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
 ACC = "org.a11y.atspi.Accessible"
+
+# The states worth printing. AT-SPI sends a 64-bit bitfield in two words;
+# these are the ones a test asks about — "is the message cursor on this row"
+# has no other observable answer.
+STATES = {12: "focused", 23: "selected", 8: "enabled", 25: "showing"}
+ASKED = (12, 23)
 
 
 def a11y_bus():
@@ -62,6 +68,17 @@ def children(bus, name, path):
         return []
 
 
+def states(bus, name, path):
+    try:
+        words = call(bus, name, path, ACC, "GetState", None, GLib.VariantType("(au)"))[0]
+    except GLib.Error:
+        return []
+    bits = 0
+    for i, w in enumerate(words):
+        bits |= w << (32 * i)
+    return [STATES[b] for b in ASKED if bits >> b & 1]
+
+
 def role(bus, name, path):
     try:
         return call(bus, name, path, ACC, "GetRoleName", None, GLib.VariantType("(s)"))[0]
@@ -69,7 +86,7 @@ def role(bus, name, path):
         return "?"
 
 
-def walk(bus, name, path, depth=0, out=None, limit=400):
+def walk(bus, name, path, depth=0, out=None, limit=1500, with_states=False):
     """Depth-first, bounded: a list of five thousand rows is virtualised,
     so the tree only ever holds the realised ones, but a runaway is still
     worth a ceiling."""
@@ -82,9 +99,11 @@ def walk(bus, name, path, depth=0, out=None, limit=400):
         "role": role(bus, name, path),
         "name": prop(bus, name, path, "Name") or "",
     }
+    if with_states:
+        node["states"] = states(bus, name, path)
     out.append(node)
     for cname, cpath in children(bus, name, path):
-        walk(bus, cname, cpath, depth + 1, out, limit)
+        walk(bus, cname, cpath, depth + 1, out, limit, with_states)
     return out
 
 
@@ -106,13 +125,14 @@ def main():
         print(f"no application matching {want!r} on the a11y bus; present: {names}", file=sys.stderr)
         sys.exit(2)
     name, path, app_name = found[0]
-    nodes = walk(bus, name, path)
+    nodes = walk(bus, name, path, with_states="--states" in sys.argv)
     if as_json:
         print(json.dumps({"app": app_name, "nodes": nodes}, ensure_ascii=False))
     else:
         for n in nodes:
             label = f" {n['name']!r}" if n["name"] else ""
-            print(f"{'  ' * n['depth']}{n['role']}{label}")
+            st = f" [{','.join(n['states'])}]" if n.get("states") else ""
+            print(f"{'  ' * n['depth']}{n['role']}{label}{st}")
 
 
 if __name__ == "__main__":
