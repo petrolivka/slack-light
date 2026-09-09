@@ -301,6 +301,13 @@ pub struct App {
     /// What was typed and not sent, per conversation. A draft lost by
     /// glancing at another channel is the thing people never forgive.
     drafts: HashMap<ChannelId, String>,
+    /// A message on its way to another conversation: which one it is, and its
+    /// link once Slack has minted one. Cleared when the target is chosen or
+    /// the picker is dismissed.
+    forwarding: Option<(ChannelId, slk_core::Ts)>,
+    forward_link: Option<String>,
+    /// `[debug] enabled`: offer "view source".
+    debug: bool,
     /// Scrollback: whether a page is in flight, and whether the server has
     /// said there is nothing older left.
     loading_older: bool,
@@ -1091,6 +1098,9 @@ impl SimpleComponent for App {
             candidates: Vec::new(),
             inserting: Rc::new(std::cell::Cell::new(false)),
             drafts: HashMap::new(),
+            forwarding: None,
+            forward_link: None,
+            debug: config.debug.enabled,
             loading_older: false,
             at_beginning: false,
             follow_bottom: true,
@@ -1405,6 +1415,25 @@ impl SimpleComponent for App {
                     i += 1;
                 }
                 self.close_jump();
+                // A forward chose its target rather than navigating: the
+                // conversation is now open, so the link goes in its composer
+                // and the person presses Enter themselves.
+                if self.forwarding.take().is_some() {
+                    match self.forward_link.take() {
+                        Some(url) => {
+                            self.inserting.set(true);
+                            let buf = self.composer_view().buffer();
+                            buf.set_text(&format!("{url}\n"));
+                            buf.place_cursor(&buf.end_iter());
+                            self.inserting.set(false);
+                            self.composer.grab_focus();
+                            self.say("forwarded here — press enter to send".into());
+                        }
+                        // Slack has not answered yet, or would not. Say so
+                        // rather than leave an empty composer and no reason.
+                        None => self.say("no link for that message yet".into()),
+                    }
+                }
             }
             Msg::Mapped => {
                 bench::report("first_map_ms", bench::since_start().as_millis());
@@ -1976,8 +2005,15 @@ impl App {
                 }
             }
             Event::Permalink { url, .. } => {
-                self.to_clipboard(&url);
-                self.notice("link copied".into(), sender);
+                // The same answer serves copy-link and forward; which one
+                // asked is the difference between the clipboard and the
+                // composer of whichever conversation is chosen next.
+                if self.forwarding.is_some() {
+                    self.forward_link = Some(url);
+                } else {
+                    self.to_clipboard(&url);
+                    self.notice("link copied".into(), sender);
+                }
             }
             Event::Deleted { channel, ts } => {
                 if is_current && self.open.as_ref() == Some(&channel) {
@@ -2024,8 +2060,15 @@ impl App {
 
     fn close_jump(&mut self) {
         self.jump.set_text("");
+        self.jump.set_placeholder_text(Some("jump to…"));
         self.jump.set_visible(false);
         self.composer.grab_focus();
+    }
+
+    /// Give up on a forward in progress. Escape means escape.
+    fn cancel_forward(&mut self) {
+        self.forwarding = None;
+        self.forward_link = None;
     }
 
     /// The left-hand end: what the client is, right now. A notice from the
@@ -2397,6 +2440,49 @@ impl App {
                 self.active = Pane::Conv;
                 self.composer.grab_focus();
                 self.refresh_hint();
+            }
+            "quote" => {
+                // Whose words they are matters more than where they are, so
+                // the name goes in rather than a link. The raw mrkdwn, not
+                // the rendering: quoting a message must not strip its links.
+                let who = self.author_label(&m);
+                let quoted = crate::logic::quote(&who, &m.text);
+                self.inserting.set(true);
+                let buf = self.composer_view().buffer();
+                let existing = buf
+                    .text(&buf.start_iter(), &buf.end_iter(), false)
+                    .to_string();
+                // In front of a draft rather than over it: losing what
+                // somebody had already typed is the unforgivable one.
+                buf.set_text(&format!("{quoted}{existing}"));
+                let at = buf.iter_at_offset(quoted.chars().count() as i32);
+                buf.place_cursor(&at);
+                self.inserting.set(false);
+                self.active = Pane::Conv;
+                self.composer.grab_focus();
+            }
+            // Forwarding does not send. It asks Slack for the link, opens the
+            // conversation you pick, and leaves the link in the composer for
+            // you to press Enter on. A client that posts into a channel you
+            // are not looking at, with no confirmation, is a client people
+            // stop trusting with the keyboard.
+            "forward_message" => {
+                self.forwarding = Some((ch.clone(), m.ts.clone()));
+                self.send(Command::Permalink(ch, m.ts.clone()));
+                self.jump.set_text("");
+                self.jump.set_placeholder_text(Some("forward to…"));
+                self.jump.set_visible(true);
+                self.jump.grab_focus();
+            }
+            "view_source" => {
+                if !self.debug {
+                    self.notice(
+                        "view source needs `[debug] enabled = true` in the config".into(),
+                        sender,
+                    );
+                    return;
+                }
+                self.show_source(&m);
             }
             "delete_message" => self.confirm_delete(ch, m.ts.clone(), sender),
             // What the confirmation dialog sends back. Not bindable, and not
@@ -3059,6 +3145,7 @@ impl App {
         } else if self.picker.is_some() {
             self.close_picker();
         } else if gtk::prelude::WidgetExt::is_visible(&self.jump) {
+            self.cancel_forward();
             self.close_jump();
         } else if self.editing.is_some() {
             self.editing = None;
@@ -3219,6 +3306,71 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Who wrote a message, in the words the row shows.
+    fn author_label(&self, m: &slk_core::Message) -> String {
+        match &m.author {
+            slk_core::Author::User(id) => self
+                .shared
+                .names
+                .borrow()
+                .user(id.as_str())
+                .unwrap_or(id.as_str())
+                .to_string(),
+            slk_core::Author::Bot { name, .. } => name.clone(),
+            slk_core::Author::System => "slackbot".to_string(),
+        }
+    }
+
+    /// What Slack actually sent for one message, pretty-printed.
+    ///
+    /// Every message keeps its `raw` for exactly this reason — the store holds
+    /// it so a parser fix is a migration rather than a re-fetch — so this
+    /// window is a read of something already there, not a new request.
+    fn show_source(&mut self, m: &slk_core::Message) {
+        let pretty = serde_json::from_str::<serde_json::Value>(&m.raw)
+            .and_then(|v| serde_json::to_string_pretty(&v))
+            .unwrap_or_else(|_| m.raw.clone());
+
+        let view = gtk::TextView::new();
+        view.buffer().set_text(&pretty);
+        view.set_editable(false);
+        view.set_monospace(true);
+        view.set_margin_start(8);
+        view.set_margin_end(8);
+        view.set_margin_top(8);
+        view.set_margin_bottom(8);
+        // Selectable and copyable: the point of looking at it is usually to
+        // paste it into a bug report.
+        view.set_cursor_visible(false);
+        view.set_wrap_mode(gtk::WrapMode::None);
+
+        let scroller = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .child(&view)
+            .build();
+        let win = gtk::Window::builder()
+            .title(format!("Source — {}", m.ts.as_str()))
+            .default_width(760)
+            .default_height(560)
+            .child(&scroller)
+            .build();
+        if let Some(parent) = self.window() {
+            win.set_transient_for(Some(&parent));
+        }
+        let esc = gtk::EventControllerKey::new();
+        let w2 = win.clone();
+        esc.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                w2.close();
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        win.add_controller(esc);
+        win.present();
     }
 
     fn confirm_leave(&mut self, sender: &ComponentSender<Self>) {

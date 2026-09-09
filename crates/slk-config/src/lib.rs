@@ -28,6 +28,7 @@ pub struct Config {
     pub window: WindowCfg,
     pub store: StoreCfg,
     pub log: Log,
+    pub debug: Debug,
     /// `[keys.normal]` and `[keys.insert]`: chord to action name.
     pub keys: Keys,
 }
@@ -308,6 +309,19 @@ impl Default for Log {
             file: false,
         }
     }
+}
+
+/// Things that are useful when the client is wrong about Slack, and clutter
+/// the rest of the time.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Debug {
+    /// Offer "view source": the JSON Slack actually sent for a message.
+    ///
+    /// Off by default, and not because it is dangerous — because a menu entry
+    /// nobody wants is worse than a missing one, and half the value of the
+    /// raw shape is that reaching for it means something is already wrong.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

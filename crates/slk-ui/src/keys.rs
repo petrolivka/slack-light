@@ -84,6 +84,7 @@ const DEFAULTS: &[(Action, &str)] = &[
     (Action::FollowThread, "<Control>n"),
     (Action::ToggleBroadcast, "<Control>b"),
     (Action::CopyLink, "<Control>l"),
+    (Action::Quote, "<Control>q"),
     (Action::Star, "<Control><Alt>s"),
     (Action::Mute, "<Control><Alt>m"),
     // Not <Control><Alt>p, which reads better and is already this table's

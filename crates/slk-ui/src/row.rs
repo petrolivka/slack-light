@@ -34,6 +34,8 @@ use std::rc::Rc;
 const MORE: &[(&str, &str)] = &[
     ("Edit message", "edit_message"),
     ("Delete message", "delete_message"),
+    ("Quote in a reply", "quote"),
+    ("Forward…", "forward_message"),
     ("Copy text", "copy_text"),
     ("Copy link", "copy_link"),
     ("Open first link", "open_link"),
@@ -41,6 +43,9 @@ const MORE: &[(&str, &str)] = &[
     ("Pin to conversation", "pin"),
     ("View image", "view_image"),
     ("Download files", "download_files"),
+    // Last, and only when `[debug] enabled` is on. The window says why when
+    // it is not, rather than the menu silently offering nothing.
+    ("View source", "view_source"),
 ];
 
 /// Run an action against one message.

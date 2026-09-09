@@ -107,6 +107,9 @@ actions! {
     ReactQuick3    => "react_3",         "React with the third",                 "messages";
     ReactQuick4    => "react_4",         "React with the fourth",                "messages";
     ReactQuick5    => "react_5",         "React with the fifth",                 "messages";
+    Quote          => "quote",           "Quote this into the composer",         "messages";
+    Forward        => "forward_message", "Forward this to another conversation", "messages";
+    ViewSource     => "view_source",     "The JSON Slack sent for this",         "messages";
     EditMessage    => "edit_message",    "Edit your message",                    "messages";
     DeleteMessage  => "delete_message",  "Delete your message",                  "messages";
 

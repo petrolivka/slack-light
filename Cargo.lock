@@ -2413,6 +2413,7 @@ dependencies = [
  "gtk4",
  "jiff",
  "relm4",
+ "serde_json",
  "slk-config",
  "slk-core",
  "slk-notify",

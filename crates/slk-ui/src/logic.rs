@@ -304,6 +304,33 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/pins", "What is pinned here"),
 ];
 
+/// A message, as a quote to put in front of a reply.
+///
+/// Slack's own mrkdwn quote is a leading `>` per line, and a blank line ends
+/// the block — so an empty line inside the quoted text has to be `>` too, or
+/// the second half stops being a quote. The trailing newline is what puts the
+/// cursor under the quote rather than inside it.
+///
+/// Attribution goes on the first line rather than after, because a quote whose
+/// author is named underneath reads as the reply's own words on a narrow
+/// window, and that is worth more than the two characters it costs.
+pub fn quote(who: &str, text: &str) -> String {
+    let mut out = String::new();
+    if !who.is_empty() {
+        out.push_str(&format!("> *{who}*\n"));
+    }
+    for line in text.lines() {
+        out.push_str("> ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    if text.is_empty() {
+        out.push_str(">\n");
+    }
+    out.push('\n');
+    out
+}
+
 /// A slash command the *interface* owns rather than the engine.
 ///
 /// `/upload` opens a file chooser and `/search` focuses a box; neither has
@@ -501,6 +528,23 @@ pub fn accel(rendered: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_quote_survives_the_blank_line_in_the_middle_of_it() {
+        // A bare empty line ends a mrkdwn quote, so the second paragraph
+        // would come out as the replier's own words — attributed to them, in
+        // a conversation, which is the worst possible way to get it wrong.
+        let q = super::quote("alice", "first\n\nsecond");
+        assert_eq!(q, "> *alice*\n> first\n> \n> second\n\n");
+        assert!(
+            q.lines()
+                .filter(|l| !l.is_empty())
+                .all(|l| l.starts_with('>')),
+            "every line of the quote is quoted: {q:?}"
+        );
+        // And the cursor lands under it, not in it.
+        assert!(q.ends_with("\n\n"));
+    }
+
     #[test]
     fn the_interface_owns_the_commands_with_nothing_to_send() {
         use super::local;
