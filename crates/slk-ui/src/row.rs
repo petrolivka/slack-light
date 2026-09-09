@@ -187,8 +187,11 @@ impl RelmListItem for Row {
                         // into a loop — measured at 60 Hz on an idle window,
                         // 1.9 % CPU and 45 MB of churned render nodes. The
                         // aspect is computed here instead, once, and the
-                        // widget is told exactly how big it is.
-                        set_content_fit: gtk::ContentFit::Fill,
+                        // widget is told exactly how tall it is. `Contain`
+                        // is safe *because* the height is fixed: the loop
+                        // was height-from-width, and there is none now.
+                        set_content_fit: gtk::ContentFit::Contain,
+                        set_halign: gtk::Align::Start,
                         set_visible: false,
                     },
                     #[name = "chips"]
@@ -511,11 +514,14 @@ impl RelmListItem for Row {
             );
             let scale = (420.0 / pw as f64).min(1.0);
             let (sw, sh) = ((pw as f64 * scale) as i32, (ph as f64 * scale) as i32);
-            // A size request as well as a paintable: `can_shrink` will
-            // otherwise take a picture in a vertical box down to nothing,
-            // which is exactly what it did — the texture was fetched, the
-            // widget was in the tree, and the row showed a gap.
-            w.picture.set_size_request(sw, sh);
+            // Height only. A width request is a *minimum* for the whole
+            // row, and the list's minimum is the widest row in it: with a
+            // 420-pixel picture asking for its width, opening the side pane
+            // made the conversation narrower than its own rows and every
+            // message was clipped behind the sidebar. The height alone is
+            // enough to stop `can_shrink` taking the picture to nothing,
+            // which is what the request was for.
+            w.picture.set_size_request(-1, sh);
             w.picture.set_visible(true);
             if let Some(t) = self.shared.textures.borrow().get(&id) {
                 w.picture.set_paintable(Some(t));

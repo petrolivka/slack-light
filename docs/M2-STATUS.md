@@ -459,6 +459,33 @@ The budget stands as written and is met at every size, including the stress
 case it was written for. No number needed changing; what needed changing
 was the loading strategy, and that is done.
 
+## 12. One more layout defect, found by looking
+
+Opening the side pane on a half-screen tile **clipped the left edge of
+every message**: avatars, names and the start of each line disappeared
+behind the sidebar. Three wrong explanations before the right one, all
+worth recording because each was plausible:
+
+- *The paned is squeezing the conversation* — it was not; `set_position`
+  was giving the conversation the width it asked for.
+- *The picture is forcing the row wide* — it was, partly. A `Picture` with
+  a width request makes that width the row's minimum, and the list's
+  minimum is its widest row. Fixed by requesting only the height and
+  letting `Contain` scale the picture.
+- *The minimums do not fit* — they did not, but shrinking them only made
+  the clipping smaller.
+
+The cause was `hscrollbar_policy: Never`. It does not mean "do not scroll
+horizontally"; it means **"demand the child's full minimum width"**. That
+minimum travelled up through the panes into the window, the window's
+minimum grew past the tile the compositor had given it, and the compositor
+clipped what would not fit. `External` gives the child its minimum and
+scrolls instead, with no scrollbar drawn — which is what "never scroll
+horizontally" was meant to say in the first place.
+
+A window whose minimum size exceeds its tile is a class of bug a tiling
+compositor finds and a floating one hides. Worth remembering.
+
 ### What is left in M2b
 
 Nothing on the list. The remaining `M` requirements are the ones M2 never

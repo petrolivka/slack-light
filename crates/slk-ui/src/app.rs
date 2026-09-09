@@ -688,7 +688,7 @@ impl SimpleComponent for App {
                             },
 
                             gtk::ScrolledWindow {
-                                set_hscrollbar_policy: gtk::PolicyType::Never,
+                                set_hscrollbar_policy: gtk::PolicyType::External,
                                 set_vexpand: true,
                                 #[local_ref]
                                 sidebar -> gtk::ListBox {
@@ -715,6 +715,14 @@ impl SimpleComponent for App {
                         #[wrap(Some)]
                         set_start_child = &gtk::Box {
                             set_orientation: gtk::Orientation::Vertical,
+                            // The conversation is what the window is for: it
+                            // does not get squeezed to a column by the pane
+                            // beside it. Small enough that sidebar plus
+                            // conversation plus pane still fit a half-screen
+                            // tile — a window whose minimum exceeds its tile
+                            // is a window the compositor clips, and what got
+                            // clipped was the left edge of every message.
+                            set_size_request: (260, -1),
 
                             gtk::Box {
                                 set_orientation: gtk::Orientation::Horizontal,
@@ -750,7 +758,17 @@ impl SimpleComponent for App {
                             #[local_ref]
                             scroller -> gtk::ScrolledWindow {
                                 set_vexpand: true,
-                                set_hscrollbar_policy: gtk::PolicyType::Never,
+                                // `External`, not `Never`. `Never` makes the
+                                // scrolled window demand its child's minimum
+                                // width, and a message row's minimum is the
+                                // longest unbreakable thing in it. Opening
+                                // the side pane then pushed the window's own
+                                // minimum past the tile the compositor had
+                                // given it, and the compositor clipped —
+                                // taking the left edge of every message with
+                                // it. `External` gives the child its minimum
+                                // and scrolls instead, with no bar drawn.
+                                set_hscrollbar_policy: gtk::PolicyType::External,
                                 // Always, not Automatic: a conversation whose
                                 // height lands within a few pixels of the
                                 // viewport makes the scrollbar appear, which
@@ -867,7 +885,7 @@ impl SimpleComponent for App {
                             side_scroller -> gtk::ScrolledWindow {
                                 set_vexpand: true,
                                 set_visible: false,
-                                set_hscrollbar_policy: gtk::PolicyType::Never,
+                                set_hscrollbar_policy: gtk::PolicyType::External,
                                 #[local_ref]
                                 side_list -> gtk::ListBox {
                                     add_css_class: "sidelist",
@@ -882,7 +900,7 @@ impl SimpleComponent for App {
                                 #[watch]
                                 set_visible: model.side == Side::Thread,
                                 set_vexpand: true,
-                                set_hscrollbar_policy: gtk::PolicyType::Never,
+                                set_hscrollbar_policy: gtk::PolicyType::External,
                                 set_vscrollbar_policy: gtk::PolicyType::Always,
                                 #[local_ref]
                                 thread_view -> gtk::ListView {
@@ -2384,10 +2402,7 @@ impl App {
         self.thread_title.set_label(title);
         self.side_scroller.set_visible(true);
         self.thread_pane.set_visible(true);
-        let w = self.conv_paned.width();
-        if w > 320 {
-            self.conv_paned.set_position(w - 380.min(w / 2));
-        }
+        self.split();
 
         while let Some(child) = self.side_list.first_child() {
             self.side_list.remove(&child);
@@ -2909,17 +2924,23 @@ impl App {
         self.follow.set_active(m.subscribed);
         self.refresh_follow_label();
         self.thread_pane.set_visible(true);
-        // Measured from the left, so the pane's own width has to be taken
-        // off the current split rather than set on it — and never more than
-        // half, or on a tiled window the thread squeezes the conversation it
-        // is a reply to down to a column of two words.
-        let w = self.conv_paned.width();
-        if w > 320 {
-            self.conv_paned.set_position(w - 380.min(w / 2));
-        }
+        self.split();
         self.active = Pane::Thread;
         self.send(Command::OpenThread(ch, parent));
         self.thread_composer.grab_focus();
+    }
+
+    /// Where to put the divider. The pane gets 380 pixels when there is
+    /// room for the conversation's own 340 as well, and half the width when
+    /// there is not — measured from the left, because that is how a
+    /// `GtkPaned` position is expressed.
+    fn split(&self) {
+        let w = self.conv_paned.width();
+        if w >= 560 {
+            self.conv_paned.set_position(w - 380.min(w - 300));
+        } else if w > 160 {
+            self.conv_paned.set_position(w / 2);
+        }
     }
 
     fn close_thread(&mut self) {
