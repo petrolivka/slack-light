@@ -1,0 +1,16 @@
+[package]
+name = "slk-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+slk-core = { path = "../slk-core" }
+anyhow.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
