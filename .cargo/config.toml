@@ -1,0 +1,10 @@
+# This machine has 24 cores, and cargo will happily run 24 rustc processes at
+# once. On the heavy dependencies here — rustls, a bundled SQLite, tokio — that
+# peaked at 17.6 GB of RAM and 33 GB of swap, at which point systemd-oomd killed
+# the whole cgroup. Because a terminal-launched build shares its cgroup with the
+# terminal, what died was not the build: it was the terminal window, three times.
+#
+# Six jobs keeps the peak in single-digit gigabytes and costs very little wall
+# clock, because the dependency graph is not 24 crates wide for most of it.
+[build]
+jobs = 6

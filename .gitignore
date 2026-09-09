@@ -1,0 +1,14 @@
+target/
+*.log
+auth.json
+cookies.txt
+
+# cargo-fuzz artefacts
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+
+# Captured Slack responses. Read and scrub before committing any of these.
+
+# Captured Slack responses. Read and scrub before committing any of these.
+fixtures/real/
