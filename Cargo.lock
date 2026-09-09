@@ -2405,14 +2405,28 @@ dependencies = [
  "gtk4",
  "jiff",
  "relm4",
+ "serde",
  "slk-api",
  "slk-config",
  "slk-core",
  "slk-store",
  "slk-sync",
  "tokio",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "spike-signin"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "reqwest",
+ "serde_json",
+ "slack-light",
+ "tokio",
 ]
 
 [[package]]

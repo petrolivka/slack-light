@@ -37,6 +37,7 @@ impl Names for Directory {
 /// pictures waiting for a texture, and a way to ask for one.
 pub struct Shared {
     pub names: RefCell<Directory>,
+    pub pal: RefCell<crate::theme::Semantic>,
     pub self_id: UserId,
     pub textures: RefCell<HashMap<String, gtk::gdk::Texture>>,
     pub pending: RefCell<HashMap<String, Vec<gtk::Picture>>>,
@@ -58,14 +59,23 @@ pub struct Init {
     pub runtime: tokio::runtime::Handle,
     pub media_dir: std::path::PathBuf,
     pub options: Options,
+    pub theme_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
 pub enum Msg {
+    ThemeChanged,
+    /// A keyboard action, by its `slk-config` name.
+    Action(String),
+    JumpChanged(String),
+    JumpAccept,
     Engine(Event),
     Open(usize),
     Send(String),
-    NeedImage { file_id: String, url: String },
+    NeedImage {
+        file_id: String,
+        url: String,
+    },
     Mapped,
     BenchScrollDone,
     IdleDone,
@@ -84,7 +94,14 @@ pub struct App {
     // handle to both and relm4 hands widgets to the view, not the model.
     sidebar: gtk::ListBox,
     scroller: gtk::ScrolledWindow,
+    composer: gtk::Entry,
+    jump: gtk::Entry,
+    jump_query: Rc<RefCell<String>>,
+    bindings: Vec<(String, String, bool)>,
     requested: HashSet<String>,
+    theme: crate::theme::Applied,
+    theme_file: Option<std::path::PathBuf>,
+    _theme_monitor: Option<gtk::gio::FileMonitor>,
     status: String,
     title: String,
     loaded_once: bool,
@@ -168,16 +185,34 @@ impl SimpleComponent for App {
                     set_shrink_start_child: false,
 
                     #[wrap(Some)]
-                    set_start_child = &gtk::ScrolledWindow {
+                    set_start_child = &gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        add_css_class: "sidebar",
+
+                        #[local_ref]
+                        jump -> gtk::Entry {
+                            set_visible: false,
+                            set_margin_all: 6,
+                            set_placeholder_text: Some("jump to…"),
+                            connect_changed[sender] => move |e| {
+                                sender.input(Msg::JumpChanged(e.text().to_string()));
+                            },
+                            connect_activate[sender] => move |_| sender.input(Msg::JumpAccept),
+                        },
+
+                        gtk::ScrolledWindow {
                         set_hscrollbar_policy: gtk::PolicyType::Never,
+                        set_vexpand: true,
                         #[local_ref]
                         sidebar -> gtk::ListBox {
                             add_css_class: "navigation-sidebar",
+                            add_css_class: "sidebar",
                             connect_row_selected[sender] => move |_, row| {
                                 if let Some(r) = row {
                                     sender.input(Msg::Open(r.index() as usize));
                                 }
                             },
+                        },
                         },
                     },
 
@@ -190,6 +225,7 @@ impl SimpleComponent for App {
                             set_markup: &format!("<b>{}</b>", gtk::glib::markup_escape_text(&model.title)),
                             set_xalign: 0.0,
                             set_margin_all: 8,
+                            add_css_class: "header",
                         },
                         gtk::Separator {},
 
@@ -203,7 +239,8 @@ impl SimpleComponent for App {
                             }
                         },
 
-                        gtk::Entry {
+                        #[local_ref]
+                        composer -> gtk::Entry {
                             set_margin_all: 8,
                             set_placeholder_text: Some("Message…  (Enter sends)"),
                             connect_activate[sender] => move |e| {
@@ -226,6 +263,7 @@ impl SimpleComponent for App {
                     set_margin_top: 2,
                     set_margin_bottom: 2,
                     add_css_class: "dim-label",
+                    add_css_class: "status",
                 },
             }
         }
@@ -238,7 +276,18 @@ impl SimpleComponent for App {
             runtime,
             media_dir,
             options,
+            theme_file,
         } = init;
+
+        let (palette, source) = crate::theme::load(theme_file.as_deref());
+        bench::report("theme_source", format!("{source:?}"));
+        let theme = crate::theme::Applied::new(&palette);
+        let monitor = {
+            let s = sender.input_sender().clone();
+            crate::theme::watch(move || {
+                let _ = s.send(Msg::ThemeChanged);
+            })
+        };
 
         // Events from the engine become input messages. The forwarder runs on
         // the runtime; `Sender::send` is the only thing that crosses threads.
@@ -255,6 +304,7 @@ impl SimpleComponent for App {
 
         let shared = Rc::new(Shared {
             names: RefCell::new(Directory::default()),
+            pal: RefCell::new(palette.semantic()),
             self_id: UserId::new("U0SELF"),
             textures: RefCell::new(HashMap::new()),
             pending: RefCell::new(HashMap::new()),
@@ -272,7 +322,14 @@ impl SimpleComponent for App {
             list: TypedListView::new(),
             sidebar: gtk::ListBox::new(),
             scroller: gtk::ScrolledWindow::new(),
+            composer: gtk::Entry::new(),
+            jump: gtk::Entry::new(),
+            jump_query: Rc::new(RefCell::new(String::new())),
+            bindings: Vec::new(),
             requested: HashSet::new(),
+            theme,
+            theme_file,
+            _theme_monitor: monitor,
             status: "starting".into(),
             title: String::new(),
             loaded_once: false,
@@ -282,21 +339,85 @@ impl SimpleComponent for App {
         let list_view = &model.list.view;
         let sidebar = &model.sidebar;
         let scroller = &model.scroller;
+        let composer = &model.composer;
+        let jump = &model.jump;
         let widgets = view_output!();
 
-        relm4::set_global_css(
-            ".conversation > row { border-bottom: 1px solid alpha(currentColor, 0.08); } \
-             .conversation { background: transparent; } \
-             .blockkit { padding: 6px 8px; border-left: 3px solid alpha(currentColor, 0.25); }",
-        );
+        // Keys: the preset's chords as accelerators on application actions.
+        let mut model = model;
+        model.bindings =
+            crate::keys::install(&relm4::main_application(), sender.input_sender().clone());
+        for (name, acc, from) in &model.bindings {
+            bench::report(
+                "binding",
+                format!(
+                    "{name}={acc}{}",
+                    if *from { "" } else { " (spike default)" }
+                ),
+            );
+        }
+        // The sidebar filters by the jump query; rows are (label, badge) boxes.
+        {
+            let q = model.jump_query.clone();
+            model.sidebar.set_filter_func(move |row| {
+                let q = q.borrow();
+                if q.is_empty() {
+                    return true;
+                }
+                row.child()
+                    .and_then(|b| b.first_child())
+                    .and_downcast::<gtk::Label>()
+                    .map(|l| l.text().to_lowercase().contains(q.to_lowercase().as_str()))
+                    .unwrap_or(true)
+            });
+        }
 
         ComponentParts { model, widgets }
     }
 
     fn update(&mut self, msg: Msg, sender: ComponentSender<Self>) {
         match msg {
+            Msg::ThemeChanged => {
+                let (palette, source) = crate::theme::load(self.theme_file.as_deref());
+                self.theme.replace(&palette);
+                *self.shared.pal.borrow_mut() = palette.semantic();
+                // Rows carry their colours in their markup, so they have to
+                // be bound again: detaching and reattaching the model does
+                // exactly that for the realised ones and nothing for the rest.
+                let model = self.list.selection_model.clone();
+                self.list.view.set_model(None::<&gtk::NoSelection>);
+                self.list.view.set_model(Some(&model));
+                self.rebuild_sidebar();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                bench::report("theme_reloaded_epoch_ms", now);
+                bench::report("theme_source", format!("{source:?}"));
+                self.status = format!("theme: {}", palette_name(&source));
+            }
+            Msg::Action(name) => self.action(&name),
+            Msg::JumpChanged(q) => {
+                *self.jump_query.borrow_mut() = q;
+                self.sidebar.invalidate_filter();
+            }
+            Msg::JumpAccept => {
+                // The first row the filter left visible.
+                let mut i = 0;
+                while let Some(row) = self.sidebar.row_at_index(i) {
+                    if row.is_child_visible() {
+                        self.sidebar.select_row(Some(&row));
+                        break;
+                    }
+                    i += 1;
+                }
+                self.close_jump();
+            }
             Msg::Mapped => {
                 bench::report("first_map_ms", bench::since_start().as_millis());
+                // Where the keyboard starts: writing. A window that opens
+                // with focus nowhere is one where the first keystroke is lost.
+                self.composer.grab_focus();
                 bench::report_memory("map");
             }
             Msg::Open(i) => {
@@ -380,12 +501,11 @@ impl App {
                 self.rebuild_sidebar();
                 if self.open.is_none() {
                     // Land where there is something to read, as the client did.
-                    let pick = self
-                        .convs
-                        .iter()
-                        .position(|c| c.mentions > 0 && !c.is_muted)
-                        .or_else(|| self.convs.iter().position(|c| c.unread > 0))
-                        .unwrap_or(0);
+                    let pick = crate::logic::landing(
+                        self.convs
+                            .iter()
+                            .map(|c| (&c.is_muted, &c.unread, &c.mentions)),
+                    );
                     if let Some(c) = self.convs.get(pick) {
                         let id = c.id.clone();
                         self.open_channel(id);
@@ -455,18 +575,27 @@ impl App {
                         _ => {}
                     }
                 }
-                let target = replaces.unwrap_or_else(|| message.ts.clone());
-                let existing = self.position(|r| r.msg.ts == target);
+                let rows: Vec<String> = self
+                    .list
+                    .iter()
+                    .map(|r| r.borrow().msg.ts.as_str().to_string())
+                    .collect();
+                let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+                let place = crate::logic::placement(
+                    &refs,
+                    message.ts.as_str(),
+                    replaces.as_ref().map(|t| t.as_str()),
+                );
                 let row = Row {
                     msg: *message,
                     shared: self.shared.clone(),
                 };
-                match existing {
-                    Some(pos) => {
-                        self.list.remove(pos);
-                        self.list.insert(pos, row);
+                match place {
+                    crate::logic::Placement::Replace(pos) => {
+                        self.list.remove(pos as u32);
+                        self.list.insert(pos as u32, row);
                     }
-                    None => {
+                    crate::logic::Placement::Append => {
                         self.list.append(row);
                         self.scroll_to_end();
                     }
@@ -500,6 +629,43 @@ impl App {
         }
     }
 
+    fn close_jump(&mut self) {
+        self.jump.set_text("");
+        self.jump.set_visible(false);
+        self.composer.grab_focus();
+    }
+
+    fn action(&mut self, name: &str) {
+        match name {
+            "jump_to" => {
+                self.jump.set_visible(true);
+                self.jump.grab_focus();
+            }
+            "normal" => self.close_jump(),
+            "next_conversation" | "prev_conversation" => {
+                let selected = self.sidebar.selected_row().map(|r| r.index() as usize);
+                let len = self.convs.len();
+                if let Some(i) = crate::logic::step(selected, len, name == "next_conversation") {
+                    if let Some(row) = self.sidebar.row_at_index(i as i32) {
+                        self.sidebar.select_row(Some(&row));
+                    }
+                }
+                self.composer.grab_focus();
+            }
+            "workspace_1" => self.status = "workspace 1 (the demo has one)".into(),
+            "clear_composer" => self.composer.set_text(""),
+            "help" | "palette" => {
+                self.status = self
+                    .bindings
+                    .iter()
+                    .map(|(n, a, _)| format!("{a} {n}"))
+                    .collect::<Vec<_>>()
+                    .join("   ");
+            }
+            other => self.status = format!("unbound action {other}"),
+        }
+    }
+
     fn rebuild_sidebar(&mut self) {
         // A plain ListBox: a dozen rows, not five thousand. Rebuilt
         // wholesale; the spike is not about the sidebar.
@@ -529,11 +695,8 @@ impl App {
             }
             row.append(&name);
             if c.mentions > 0 {
-                let b = gtk::Label::new(None);
-                b.set_markup(&format!(
-                    "<span background=\"#d33\" foreground=\"white\"> {} </span>",
-                    c.mentions
-                ));
+                let b = gtk::Label::new(Some(&c.mentions.to_string()));
+                b.add_css_class("badge");
                 row.append(&b);
             } else if c.unread > 0 {
                 row.append(&gtk::Label::new(Some(&c.unread.to_string())));
@@ -601,5 +764,17 @@ impl Drop for App {
         self.runtime.spawn(async move {
             let _ = tx.send(Command::Shutdown).await;
         });
+    }
+}
+
+fn palette_name(source: &crate::theme::Source) -> String {
+    match source {
+        crate::theme::Source::Omarchy(_) => {
+            std::fs::read_to_string(crate::theme::omarchy_state_dir().join("theme.name"))
+                .map(|s| format!("omarchy/{}", s.trim()))
+                .unwrap_or_else(|_| "omarchy".into())
+        }
+        crate::theme::Source::File(p) => p.display().to_string(),
+        crate::theme::Source::Builtin(n) => format!("built-in {n}"),
     }
 }

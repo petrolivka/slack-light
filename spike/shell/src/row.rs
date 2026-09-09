@@ -106,9 +106,11 @@ impl RelmListItem for Row {
     fn bind(&mut self, w: &mut Widgets, _root: &mut gtk::Box) {
         let m = &self.msg;
         let names = self.shared.names.borrow();
+        let pal = self.shared.pal.borrow();
         let ctx = markup::Ctx {
             names: &*names,
             self_id: self.shared.self_id.as_str(),
+            pal: &pal,
         };
 
         // Author, in a colour of their own; delivery state beside it.
@@ -126,12 +128,12 @@ impl RelmListItem for Row {
         };
         w.author.set_markup(&format!(
             "<span foreground=\"{}\"><b>{}</b></span>{mark}",
-            author_colour(&who),
+            author_colour(&who, &pal.authors),
             gtk::glib::markup_escape_text(&who)
         ));
         w.time.set_markup(&format!(
             "<span foreground=\"{}\"><small>{}</small></span>",
-            markup::PALETTE.dim,
+            pal.dim,
             hhmm(&m.ts)
         ));
 
@@ -140,7 +142,7 @@ impl RelmListItem for Row {
         if m.edited {
             body.push_str(&format!(
                 " <span foreground=\"{}\"><small>(edited)</small></span>",
-                markup::PALETTE.dim
+                pal.dim
             ));
         }
         w.body.set_visible(!body.is_empty());
@@ -162,7 +164,7 @@ impl RelmListItem for Row {
             l.set_xalign(0.0);
             l.set_markup(&format!(
                 "<span foreground=\"{}\">📎 {} ({} B)</span>",
-                markup::PALETTE.link,
+                pal.link,
                 gtk::glib::markup_escape_text(&f.name),
                 f.size
             ));
@@ -218,7 +220,11 @@ impl RelmListItem for Row {
                 .map(|r| {
                     let glyph = slk_core::emoji::shortcode(&r.name, None)
                         .unwrap_or_else(|| format!(":{}:", r.name));
-                    let bg = if r.by_me { "#4a90d9" } else { "#888888" };
+                    let bg = if r.by_me {
+                        pal.link.as_str()
+                    } else {
+                        pal.code_bg.as_str()
+                    };
                     format!(
                         "<span background=\"{bg}\" background_alpha=\"25%\"> {} {} </span>",
                         gtk::glib::markup_escape_text(&glyph),
@@ -229,7 +235,7 @@ impl RelmListItem for Row {
             if m.reply_count > 0 {
                 parts.push(format!(
                     "<span foreground=\"{}\">↳ {} repl{}</span>",
-                    markup::PALETTE.mention,
+                    pal.mention,
                     m.reply_count,
                     if m.reply_count == 1 { "y" } else { "ies" }
                 ));
@@ -265,15 +271,11 @@ fn hhmm(ts: &slk_core::Ts) -> String {
         .unwrap_or_default()
 }
 
-/// A stable colour per author, so the same name is the same colour in every
-/// row. Twelve hues, chosen to read on a light background.
-fn author_colour(name: &str) -> &'static str {
-    const PALETTE: [&str; 12] = [
-        "#a5243d", "#1f6f8b", "#2a7f62", "#7b4b94", "#b8651b", "#3d5a80", "#8a2d3b", "#2c7873",
-        "#6b4c3b", "#4a6fa5", "#8f5c2c", "#5b3758",
-    ];
+/// A stable colour per author, from the theme's own accents, so the same
+/// name is the same colour in every row and every theme.
+fn author_colour<'a>(name: &str, palette: &'a [String; 8]) -> &'a str {
     let h = name
         .bytes()
         .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
-    PALETTE[(h % 12) as usize]
+    &palette[(h % 8) as usize]
 }

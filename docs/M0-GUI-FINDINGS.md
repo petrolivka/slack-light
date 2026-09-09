@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| Status | Spike A complete, 2026-09-09; B–E pending |
+| Status | Spikes A–E complete, 2026-09-09; C's success path awaits a human sign-in |
 | Plan | [M0-GUI-SPIKE-PLAN.md](./M0-GUI-SPIKE-PLAN.md) |
 | Binary | `spike/shell` — relm4 0.11 over the real `slk-sync` engine against `MockBackend`, no network |
 | Environment | Rust 1.98.1, GTK 4.22.4, relm4 0.11.0 / gtk4-rs 0.11.4, Arch Linux 7.1.9, Hyprland on Wayland, Mesa (default GSK renderer), integrated GPU |
-| Verdict so far | **GO on R14 (relm4) and R17 (list performance). GO on R15 (memory) with NFR-4 restated — see §3.** R16 (browser sign-in) not yet spiked |
+| Verdict | **GO on all four risks.** R14 relm4, R15 memory (NFR-4 restated, §3), R16 browser sign-in (every automatic path proven, §7), R17 list performance. M1 can start |
 
 Every number below is printed by the binary itself (`spike-shell --bench`)
 from `/proc/self/status`, `/proc/self/schedstat` and the window's
@@ -165,9 +165,128 @@ than the threshold quietly raised.
   Replaced with translucent backgrounds (`background_alpha`) until spike B
   generates the palette from the theme.
 
-## 6. Still to do in M0-GUI
+## 6. Spike B — Omarchy theming
 
-Spike B (Omarchy theming), C (browser sign-in against `slk-dev` only),
-D (headless compositor and the accessibility tree), E (keyboard feel).
-Nothing in A argues against any of them; A's numbers are the baseline they
-will be measured against.
+| # | Criterion | Result |
+|---|---|---|
+| B1 | Read `colors.toml`, document the schema | ✅ Schema in §6.1. Read from `~/.local/state/omarchy/current/theme/colors.toml` |
+| B2 | Generate GTK CSS, apply at `APPLICATION` priority | ✅ ~30 rules from nine `@define-color` names; the message renderer takes a `Semantic` palette derived from the same file (link, mention, dim, code, eight author colours) |
+| B3 | Recolour live on `omarchy-theme-set`, within a second | ✅ **550 ms after the command started** — `omarchy-theme-set gruvbox` itself took 3.3 s (it retints waybar, the browser, VS Code…); the window had already changed. Restoring `tokyo-night` reloaded again |
+| B4 | The `themed/*.tpl` mechanism | Investigated, not used — §6.2 |
+| B5 | Off Omarchy: built-in dark and light, chosen by `color-scheme` | ✅ With `HOME` pointed at an empty directory the source is `Builtin("dark")`, decided by the settings portal's `color-scheme`; `--theme file.toml` loads any palette in the schema |
+| B6 | Decorations and `app_id` | ✅ Hyprland advertises both `zxdg_decoration_manager_v1` and `org_kde_kwin_server_decoration_manager`; GTK 4.22 binds the KDE one, receives `default_mode = Server`, and draws **no client-side titlebar** — the window appears as a bare surface with Hyprland's border, which is exactly what a tiled window should be. `app_id` is `dev.olivka.slack_light.spike` (the application id); the client's will be `dev.olivka.slack_light` |
+
+### 6.1 `colors.toml`, as it is
+
+```toml
+mode = "dark"                       # or "light"
+accent, selection, muted
+background, dark_background, darker_background, lighter_background
+foreground, dark_foreground, light_foreground, bright_foreground
+red, yellow, orange, green, cyan, blue, magenta, brown
+bright_red, bright_yellow, bright_green, bright_cyan, bright_blue, bright_magenta
+```
+
+Twenty-eight keys, all `#rrggbb`. `brown` is absent from older themes, so it
+has a default. The built-in dark and light palettes are written in the same
+schema, which is what makes one generator enough.
+
+### 6.2 How Omarchy actually applies a theme
+
+Read from `/usr/share/omarchy/bin/omarchy-theme-set` rather than assumed:
+
+- **`current/theme` is a directory, not a symlink.** The next theme is
+  staged beside it as `next-theme`, then `rm -rf current/theme` and `mv`.
+  A file monitor on the directory itself fires once and then watches a
+  path that no longer exists. The monitor is on the *parent*
+  (`~/.local/state/omarchy/current/`), filtered to the `theme` and
+  `theme.name` entries, debounced 250 ms because the swap is several events.
+- **Templates** (`~/.config/omarchy/themed/*.tpl`, over
+  `/usr/share/omarchy/default/themed/*.tpl`) are rendered by
+  `omarchy-theme-set-templates` with `sed` substitutions of `{{ key }}`,
+  `{{ key_rgb }}`, `{{ key_strip }}` — and the output lands **inside the
+  theme directory** as `current/theme/<name>`. So a `slack-light.css.tpl`
+  would give the application a ready CSS file on every theme change. Not
+  used, because the application has to work off Omarchy anyway, and one
+  generator over one schema is simpler than two paths; the template is
+  what a user who wants to override the mapping would write, and the
+  `@define-color` names are what it would target.
+- **Hooks** (`~/.config/omarchy/hooks/theme-set.d/*`) run after the swap
+  with the theme name as `$1`. Not needed: the monitor sees the swap first.
+- **`omarchy-theme-set-gnome`** sets gsettings `color-scheme` and
+  `gtk-theme` (`Adwaita` / `Adwaita-dark`) from the palette's `mode`. That
+  is why spike A's window came up dark without being told — and why a light
+  palette over the desktop's dark GTK theme left the buttons dark: the
+  application now sets its own `gtk-theme-name` from the palette's `mode`
+  rather than trusting the desktop's.
+
+## 7. Spike C — browser sign-in
+
+| # | Criterion | Result |
+|---|---|---|
+| C1 | Launch a Chromium-family browser in a throwaway profile over `--remote-debugging-pipe` | ✅ Chromium 151 found on PATH (Chrome 152 also present); handshake `Browser.getVersion` answers in well under a second |
+| C2 | Read the `d` cookie and the `xoxc` tokens over CDP | Built: `Storage.getCookies` polled each second for `d=xoxd-…` on `slack.com`; then `Target.attachToTarget` on the `app.slack.com` page and `Runtime.evaluate` of `localStorage.localConfig_v2` for the teams and tokens. **Not yet exercised: it needs a person to sign in** — see below |
+| C3 | Refuse `slack://` deep links | ✅ `Default/Preferences` seeded with `protocol_handler.excluded_schemes.slack = true` before launch |
+| C4 | Wipe the profile on every path | ✅ Verified after the timeout run: no `/tmp/slack-light-signin-*`, no browser process left |
+| C5 | Store through `auth::add`, `auth.test` against `slk-dev` only | Built with a hard guard: any team whose domain is not `slk-dev` is skipped with a reason, and nothing is written until `auth.test` says yes. **Awaits C2** |
+| C6 | Failure modes named | ✅ `no_browser` (0 ms, with `--browser /nonexistent`), `timeout` (12.5 s with `--timeout 12`), and — found by accident — `no_devtools` |
+
+**The accident is the finding.** The first run reported `no_devtools` in
+27 ms. The pipe ends are numbered 3–6 in the parent, so a naive
+`dup2(child_write, 4)` in the child landed on top of the parent's own write
+end, which the next line then closed — taking the browser's fd 4 with it.
+Both ends are now moved above 10 with `F_DUPFD` before being placed on 3
+and 4. Worth writing down because every DevTools-pipe implementation has
+to get this right and none of the documentation says so.
+
+**What remains is a human.** `spike-signin` opens the browser at Slack's
+sign-in page and waits five minutes; C2 and C5 complete the moment
+someone signs in to `slk-dev` in that window. Run:
+
+```
+target/release/spike-signin --save
+```
+
+It prints the team and a five-character token prefix, never the token, and
+saves only for `slk-dev`. The `d` cookie it obtains reaches every workspace
+on the account, as it always has; the spike stores it exactly where
+`auth add` does and nowhere else.
+
+## 8. Spike D — testing without a human
+
+| # | Criterion | Result |
+|---|---|---|
+| D1 | Start under a headless compositor in CI | ⚠️ **Not on this machine.** No `weston`, `cage`, `sway` or `Xvfb` is installed and the job cannot install packages. `gtk4-broadwayd` *is* installed and the shell runs under it headlessly (window mapped in 33 ms) — but GTK's AT-SPI backend is compiled for X11 and Wayland displays only, so under Broadway nothing appears on the accessibility bus, even with `GTK_A11Y=atspi`. **CI needs `weston --backend=headless` (Debian/Arch package `weston`)**; on the developer's machine the suite runs against the live Hyprland, which is what it did here |
+| D2 | The accessibility tree, walked and asserted | ✅ `spike/a11y/tree.py` — PyGObject over the a11y bus (address from `org.a11y.Bus`), no pyatspi, no Rust crate. 87 nodes for a twelve-row conversation: `application → window → list → list item → label`, the composer as a text entry. Names are what GTK gives by default (label text, window title); the sidebar rows have no accessible name beyond their labels — M1 should set `accessible-role`/labels on rows so a reader says "engineering, 1 mention" rather than two labels |
+| D3 | Component logic tested without widgets | ✅ Confirmed the shape: relm4's `ComponentSender` cannot be constructed outside a running component, so `update()` cannot be driven from a test. The answer is `logic.rs`: the landing pick, upsert placement, keyboard stepping and chord-to-accelerator conversion are plain functions with six tests, and `update()` calls them. That is the rule for `slk-ui`: **decisions in plain modules, `update()` a dispatcher** |
+| D4 | End to end: open, send, confirmed — through the tree | ✅ `spike/a11y/e2e.sh`: 8 checks, all passing, driven by `wtype` and read from the tree (§9) |
+
+**Input injection.** `wtype` (the Wayland virtual-keyboard protocol) types
+into the focused window; focus is set with Hyprland's dispatcher, whose
+syntax changed in 0.56 to a Lua form — `hl.dsp.focus({ window = "class:…" })`;
+the legacy `focuswindow class:…` is refused, including over the IPC socket.
+Recorded because it cost an hour.
+
+## 9. Spike E — the keyboard
+
+| # | Criterion | Result |
+|---|---|---|
+| E1 | `slk-config` actions bound as GTK shortcuts | ✅ `keys.rs`: each `Action` becomes a `gio::SimpleAction` on the application with the preset's chord as its accelerator, converted from the rendered form (`ctrl+k` → `<Control>k`). Eight actions bound; four came from the `slack` preset, four fell back to spike defaults because the preset does not bind them (`next/prev_conversation`, `normal`, `workspace_1`) — a gap in the preset to close in M1 |
+| E2 | Focus visible and sensible | ✅ The composer takes focus on map; `ctrl-k` moves it to the jump entry; Enter or Escape there returns it. Before the fix, `wtype` after focusing the window typed into nothing — GTK gives a new window no focus widget, and the first keystroke was lost. E2 is a rule now: **every action ends with focus somewhere named** |
+| E3 | Everything without the mouse, tiled | ✅ The e2e run: `ctrl-k`, `des`, Enter opens `#design`; typing sends; `alt-Up` moves to `#leads`; `ctrl-u` clears; Escape returns; F1 lists the bindings. All from `wtype`, the window tiled on Hyprland |
+
+## 10. Still to do in M0-GUI
+
+Only the human half of spike C: sign in to `slk-dev` in the window
+`spike-signin --save` opens. Everything else in the plan has a result
+above. M1 starts from these decisions:
+
+1. `slk-ui`: relm4, `TypedListView`, one Pango label per message, Block
+   Kit as vertical widget trees, decisions in plain modules.
+2. `slk-theme`: the generator in `theme.rs`, the parent-directory monitor,
+   the palette's `mode` driving `gtk-theme-name`.
+3. `slk-auth`: `spike/signin` promoted, with the same guard until the real
+   client's own confirmation dialog replaces it.
+4. Tests: `logic`-style unit tests; the a11y tree as the instrument;
+   `weston --backend=headless` in CI; `wtype` for input.
+5. Focus is a stated post-condition of every action.

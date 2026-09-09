@@ -9,15 +9,16 @@ use crate::markup;
 use gtk::prelude::*;
 use slk_core::blocks::{Accessory, Block, Button};
 
-fn label(markup: &str, dim: bool) -> gtk::Label {
+fn esc(s: &str) -> gtk::glib::GString {
+    gtk::glib::markup_escape_text(s)
+}
+
+fn label(markup: &str, dim: bool, ctx: &markup::Ctx) -> gtk::Label {
     let l = gtk::Label::new(None);
     l.set_use_markup(true);
     let dimmed;
     l.set_markup(if dim {
-        dimmed = format!(
-            "<span foreground=\"{}\">{markup}</span>",
-            markup::PALETTE.dim
-        );
+        dimmed = format!("<span foreground=\"{}\">{markup}</span>", ctx.pal.dim);
         &dimmed
     } else {
         markup
@@ -73,11 +74,7 @@ pub fn widgets(blocks: &[Block], ctx: &markup::Ctx) -> gtk::Box {
     for b in blocks {
         match b {
             Block::Header(t) => {
-                let l = label(
-                    &format!("<big><b>{}</b></big>", gtk::glib::markup_escape_text(t)),
-                    false,
-                );
-                root.append(&l);
+                root.append(&label(&format!("<big><b>{}</b></big>", esc(t)), false, ctx));
             }
             Block::Section {
                 text,
@@ -92,14 +89,14 @@ pub fn widgets(blocks: &[Block], ctx: &markup::Ctx) -> gtk::Box {
                 // how Slack lays it out on a narrow screen anyway.
                 let col = gtk::Box::new(gtk::Orientation::Vertical, 6);
                 if let Some(d) = text {
-                    col.append(&label(&markup::doc(d, ctx), false));
+                    col.append(&label(&markup::doc(d, ctx), false, ctx));
                 }
                 if !fields.is_empty() {
                     let grid = gtk::Grid::new();
                     grid.set_column_spacing(18);
                     grid.set_row_spacing(4);
                     for (i, f) in fields.iter().enumerate() {
-                        let l = label(&markup::doc(f, ctx), false);
+                        let l = label(&markup::doc(f, ctx), false, ctx);
                         l.set_hexpand(true);
                         grid.attach(&l, (i % 2) as i32, (i / 2) as i32, 1, 1);
                     }
@@ -111,14 +108,12 @@ pub fn widgets(blocks: &[Block], ctx: &markup::Ctx) -> gtk::Box {
                         w.set_halign(gtk::Align::Start);
                         col.append(&w);
                     }
-                    Some(Accessory::Image { alt, .. }) => col.append(&label(
-                        &format!("[image: {}]", gtk::glib::markup_escape_text(alt)),
-                        true,
-                    )),
-                    Some(Accessory::Other(t)) => col.append(&label(
-                        &format!("[{}]", gtk::glib::markup_escape_text(t)),
-                        true,
-                    )),
+                    Some(Accessory::Image { alt, .. }) => {
+                        col.append(&label(&format!("[image: {}]", esc(alt)), true, ctx))
+                    }
+                    Some(Accessory::Other(t)) => {
+                        col.append(&label(&format!("[{}]", esc(t)), true, ctx))
+                    }
                     None => {}
                 }
                 root.append(&col);
@@ -129,20 +124,14 @@ pub fn widgets(blocks: &[Block], ctx: &markup::Ctx) -> gtk::Box {
                     .map(|d| markup::doc(d, ctx).replace('\n', " "))
                     .collect::<Vec<_>>()
                     .join(" · ");
-                root.append(&label(&format!("<small>{joined}</small>"), true));
+                root.append(&label(&format!("<small>{joined}</small>"), true, ctx));
             }
             Block::Divider => root.append(&gtk::Separator::new(gtk::Orientation::Horizontal)),
             Block::Image { alt, title, .. } => {
                 if let Some(t) = title {
-                    root.append(&label(
-                        &format!("<b>{}</b>", gtk::glib::markup_escape_text(t)),
-                        false,
-                    ));
+                    root.append(&label(&format!("<b>{}</b>", esc(t)), false, ctx));
                 }
-                root.append(&label(
-                    &format!("[image: {}]", gtk::glib::markup_escape_text(alt)),
-                    true,
-                ));
+                root.append(&label(&format!("[image: {}]", esc(alt)), true, ctx));
             }
             Block::Actions(bs) => {
                 let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -151,13 +140,11 @@ pub fn widgets(blocks: &[Block], ctx: &markup::Ctx) -> gtk::Box {
                 }
                 root.append(&row);
             }
-            Block::RichText(d) => root.append(&label(&markup::doc(d, ctx), false)),
+            Block::RichText(d) => root.append(&label(&markup::doc(d, ctx), false, ctx)),
             Block::Unsupported(t) => root.append(&label(
-                &format!(
-                    "<i>[unsupported block: {}]</i>",
-                    gtk::glib::markup_escape_text(t)
-                ),
+                &format!("<i>[unsupported block: {}]</i>", esc(t)),
                 true,
+                ctx,
             )),
         }
     }

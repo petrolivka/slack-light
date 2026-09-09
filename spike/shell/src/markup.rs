@@ -10,35 +10,19 @@ use gtk::glib;
 use slk_core::ast::{BlockNode, Doc, Inline, ListStyle, Style};
 use slk_core::Names;
 
-/// Colours the markup refers to. Hex, because Pango markup takes hex; the
-/// real client generates these from the theme (spike B), the spike hard-codes
-/// a readable set.
-pub struct Palette {
-    pub link: &'static str,
-    pub mention: &'static str,
-    pub mention_self_bg: &'static str,
-    pub dim: &'static str,
-    pub code_bg: &'static str,
-}
-
-pub const PALETTE: Palette = Palette {
-    link: "#4a90d9",
-    mention: "#1264a3",
-    mention_self_bg: "#fff3c4",
-    dim: "#777777",
-    code_bg: "#888888",
-};
+pub use crate::theme::Semantic as Palette;
 
 pub struct Ctx<'a> {
     pub names: &'a dyn Names,
     pub self_id: &'a str,
+    pub pal: &'a Palette,
 }
 
 fn esc(s: &str) -> String {
     glib::markup_escape_text(s).to_string()
 }
 
-fn styled(text: &str, style: Style) -> String {
+fn styled(text: &str, style: Style, ctx: &Ctx) -> String {
     let mut open = String::new();
     let mut close = String::new();
     if style.code {
@@ -47,7 +31,7 @@ fn styled(text: &str, style: Style) -> String {
         // palette the theme's.
         open.push_str(&format!(
             "<span font_family=\"monospace\" background=\"{}\" background_alpha=\"20%\">",
-            PALETTE.code_bg
+            ctx.pal.code_bg
         ));
         close.insert_str(0, "</span>");
     }
@@ -70,14 +54,14 @@ pub fn inlines(xs: &[Inline], ctx: &Ctx) -> String {
     let mut out = String::new();
     for x in xs {
         match x {
-            Inline::Text { text, style } => out.push_str(&styled(text, *style)),
+            Inline::Text { text, style } => out.push_str(&styled(text, *style, ctx)),
             Inline::Link { url, text, style } => {
                 let label = text.as_deref().unwrap_or(url);
                 out.push_str(&format!(
                     "<a href=\"{}\"><span foreground=\"{}\">{}</span></a>",
                     esc(url),
-                    PALETTE.link,
-                    styled(label, *style)
+                    ctx.pal.link,
+                    styled(label, *style, ctx)
                 ));
             }
             Inline::User { id, label } => {
@@ -91,14 +75,14 @@ pub fn inlines(xs: &[Inline], ctx: &Ctx) -> String {
                 if id == ctx.self_id {
                     out.push_str(&format!(
                         "<span background=\"{}\" foreground=\"{}\"><b>@{}</b></span>",
-                        PALETTE.mention_self_bg,
-                        PALETTE.mention,
+                        ctx.pal.mention_self_bg,
+                        ctx.pal.mention,
                         esc(&name)
                     ));
                 } else {
                     out.push_str(&format!(
                         "<span foreground=\"{}\">@{}</span>",
-                        PALETTE.mention,
+                        ctx.pal.mention,
                         esc(&name)
                     ));
                 }
@@ -112,7 +96,7 @@ pub fn inlines(xs: &[Inline], ctx: &Ctx) -> String {
                     .unwrap_or_else(|| id.clone());
                 out.push_str(&format!(
                     "<span foreground=\"{}\">@{}</span>",
-                    PALETTE.mention,
+                    ctx.pal.mention,
                     esc(name.trim_start_matches('@'))
                 ));
             }
@@ -125,14 +109,14 @@ pub fn inlines(xs: &[Inline], ctx: &Ctx) -> String {
                     .unwrap_or_else(|| id.clone());
                 out.push_str(&format!(
                     "<span foreground=\"{}\">#{}</span>",
-                    PALETTE.link,
+                    ctx.pal.link,
                     esc(&name)
                 ));
             }
             Inline::Broadcast(b) => out.push_str(&format!(
                 "<span background=\"{}\" foreground=\"{}\"><b>@{}</b></span>",
-                PALETTE.mention_self_bg,
-                PALETTE.mention,
+                ctx.pal.mention_self_bg,
+                ctx.pal.mention,
                 b.as_str()
             )),
             Inline::Emoji {
@@ -148,7 +132,7 @@ pub fn inlines(xs: &[Inline], ctx: &Ctx) -> String {
             }
             Inline::Date { fallback, .. } => out.push_str(&format!(
                 "<span foreground=\"{}\">{}</span>",
-                PALETTE.dim,
+                ctx.pal.dim,
                 esc(fallback)
             )),
             Inline::Break => out.push('\n'),
@@ -176,13 +160,13 @@ pub fn doc(d: &Doc, ctx: &Ctx) -> String {
                     }
                     out.push_str(&format!(
                         "<span foreground=\"{}\">┃</span> <i>{line}</i>",
-                        PALETTE.dim
+                        ctx.pal.dim
                     ));
                 }
             }
             BlockNode::Preformatted(code) => out.push_str(&format!(
                 "<span font_family=\"monospace\" background=\"{}\" background_alpha=\"20%\">{}</span>",
-                PALETTE.code_bg,
+                ctx.pal.code_bg,
                 esc(code)
             )),
             BlockNode::List {

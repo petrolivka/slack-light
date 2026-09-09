@@ -18,12 +18,14 @@ your desktop.
 Built for Wayland, verified on Hyprland, themed by
 [Omarchy](https://omarchy.org) when it is there.
 
-> **Status: pre-M0.** This is the successor to a terminal client that reached
-> parity and turned out to be the wrong shape for a medium full of images and
-> threads. The Slack layer — session route, websocket, cache, sync engine —
-> carries over intact and verified; the interface is being rebuilt as a
-> native window. See [ADR-001](docs/ADR-001-native-gui.md) for why and
-> [the spike plan](docs/M0-GUI-SPIKE-PLAN.md) for what has to be proved first.
+> **Status: M0-GUI spikes done, M1 next.** This is the successor to a
+> terminal client that reached parity and turned out to be the wrong shape
+> for a medium full of images and threads. The Slack layer — session route,
+> websocket, cache, sync engine — carries over intact and verified. The GTK
+> shell has been spiked and measured: 60 fps over 5 000 rows, 0.08 % idle,
+> themed live from Omarchy, driven from the keyboard and asserted through
+> the accessibility tree. See [ADR-001](docs/ADR-001-native-gui.md) for why
+> and [the findings](docs/M0-GUI-FINDINGS.md) for the numbers.
 
 ---
 

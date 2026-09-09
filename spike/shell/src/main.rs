@@ -18,8 +18,11 @@
 mod app;
 mod bench;
 mod blockkit;
+mod keys;
+mod logic;
 mod markup;
 mod row;
+mod theme;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -87,6 +90,11 @@ fn main() {
         runtime: runtime.handle().clone(),
         media_dir: media_dir.clone(),
         options,
+        theme_file: args
+            .iter()
+            .position(|a| a == "--theme")
+            .and_then(|i| args.get(i + 1))
+            .map(std::path::PathBuf::from),
     };
 
     // GTK would otherwise try to parse `--bench` itself and refuse it.
