@@ -5,10 +5,11 @@ listed with a reason.** This is that list. The rule M2 was accepted under
 applies unchanged — *the requirements table in §6 is the checklist, not the
 roadmap* — so the audit below walks §6, not the milestone description.
 
-Eleven commits, `a0630ab` … the run that closes this document. 91 unit and
-scenario tests (from 71), **70 accessibility checks passing** in
-`tests/a11y/e2e.sh` (from 45), clippy clean, `cargo fmt` applied, every
-automated run against `--anonymous`.
+Twelve commits, `a0630ab` … the run that closes this document. 95 unit and
+scenario tests (from 71), **71 accessibility checks passing** in
+`tests/a11y/e2e.sh` (from 45), clippy clean, `cargo fmt` applied. Every
+automated run is against `--anonymous`; the client was additionally driven
+by hand against the live `slk-dev` workspace, which is §3b.
 
 ---
 
@@ -175,6 +176,52 @@ worth fixing rather than working around:
   this milestone are keyless on purpose and the check did not know.
 
 Two runs back to back, 70 for 70 both times.
+
+## 3b. What a real workspace found that the demo could not
+
+The client was then run against `slk-dev` — a live account, `--read-only`,
+one workspace, the employer's not configured. Five more defects, none of
+which the demo could have shown:
+
+**`--read-only` was writing.** The mode was implemented in the window —
+composer, reactions, uploads all refused — and marking a conversation read
+walked past all of it, because nothing in the interface *calls* that a
+write. `maybe_mark` just happens, on focus, quietly, and it is a
+`conversations.mark` that moves the unread state on every device the person
+owns. The guarantee now lives in `slk_api::ReadOnly`, a backend that wraps
+another and refuses every write, so code added later is covered by
+construction rather than by remembering. This one had already happened: the
+diagnostic session marked conversations read on the real account before the
+defect was found.
+
+**`--anonymous` was writing the demo into the real cache** — 174 fabricated
+messages, counted by `cache stats`, kept by retention, and summed by
+`slack-light unread`'s cache fallback. The flag meant "no credentials"; it
+should always have meant "nothing left behind". The client now sweeps out
+what earlier versions left, and rebuilds the FTS index, which is
+content-backed and would otherwise point at rows that are gone.
+
+**The `workspace` table had been in the schema since M1 with nothing writing
+to it**, so `teams()` answered "none" and `slack-light unread` from the cache
+always reported zero however much was unread.
+
+**Direct messages had no name.** `ims` carry the other person's id and
+nothing else, so the sidebar was a column of bare presence dots. The mock
+gave its direct message a name that real Slack never sends, which is why the
+client had never had to resolve one.
+
+**The control socket published those empty names**, so `slack-light send
+@somebody` refused every person in the workspace.
+
+Two things looked wrong and were not: a message with no author header
+(correctly grouped with the one before it), and a quote whose second line
+carries an extra space — that space is in Slack's own `rich_text_quote`, and
+rendering what was sent is the right answer.
+
+The pattern in four of the five: **the mock was kinder than Slack.** A demo
+workspace that names its direct messages, accepts a post to a channel that
+does not exist, or shares the real cache is a demo that answers questions
+the real thing would not. That is now a rule the fixtures are held to.
 
 ## 4. Decided against, with the reason
 
