@@ -55,6 +55,8 @@ pub struct MockBackend {
     typed: Mutex<Vec<ChannelId>>,
     /// When set, every send fails as a transport error. For the outbox.
     unreachable: std::sync::atomic::AtomicBool,
+    /// Conversations this client has told Slack it has read.
+    marked: Mutex<Vec<ChannelId>>,
 }
 
 impl MockBackend {
@@ -94,6 +96,7 @@ impl MockBackend {
             me_snoozed: Mutex::new(0),
             typed: Mutex::new(Vec::new()),
             unreachable: std::sync::atomic::AtomicBool::new(false),
+            marked: Mutex::new(Vec::new()),
             users: Vec::new(),
             messages: Mutex::new(HashMap::new()),
             uploaded: Mutex::new(HashMap::new()),
@@ -105,6 +108,39 @@ impl MockBackend {
     }
 
     /// Emit a scripted message every `secs` seconds, for `--demo`.
+    /// Which conversations this client has told Slack it has read.
+    ///
+    /// A mark is a write — it moves the unread state on every device the
+    /// person owns — and it is the one write nothing in the interface calls
+    /// by that name, so it is the one that walked past `--read-only`.
+    pub fn marks(&self) -> Vec<ChannelId> {
+        self.marked.lock().unwrap().clone()
+    }
+
+    /// What a conversation holds, for a test that has to prove nothing was
+    /// written to it.
+    pub fn messages_in(&self, ch: &ChannelId) -> Vec<Message> {
+        self.messages
+            .lock()
+            .unwrap()
+            .get(ch.as_str())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn conversation(&self, ch: &ChannelId) -> Option<Conversation> {
+        self.convs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.id == *ch)
+            .cloned()
+    }
+
+    pub fn typed_in(&self) -> Vec<ChannelId> {
+        self.typed.lock().unwrap().clone()
+    }
+
     /// Make sends fail as if the network were down, or stop.
     pub fn set_unreachable(&self, on: bool) {
         self.unreachable
@@ -302,7 +338,12 @@ impl MockBackend {
             kind: ConversationKind::Dm {
                 peer: UserId::new("U0ALICE"),
             },
-            name: "alice".into(),
+            // Nameless, the way Slack sends one. `client.userBoot` puts direct
+            // messages in `ims`, which carry the other person's id and nothing
+            // else — giving the demo's a name meant the client never had to
+            // resolve one, and a real workspace's sidebar was a column of bare
+            // presence dots for a whole milestone before anybody looked.
+            name: String::new(),
             topic: String::new(),
             purpose: String::new(),
             is_member: true,
@@ -746,7 +787,11 @@ impl SlackBackend for MockBackend {
         Ok(ts)
     }
 
-    async fn mark(&self, _ch: &ChannelId, _ts: &Ts) -> Result<()> {
+    async fn mark(&self, ch: &ChannelId, _ts: &Ts) -> Result<()> {
+        // Counted, because "did anything write?" is the whole question
+        // `--read-only` exists to answer, and a mark that does nothing
+        // observable is a mark no test can see.
+        self.marked.lock().unwrap().push(ch.clone());
         Ok(())
     }
 

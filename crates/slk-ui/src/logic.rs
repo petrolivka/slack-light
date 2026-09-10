@@ -304,6 +304,29 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/pins", "What is pinned here"),
 ];
 
+/// What a conversation is called, given what the store holds and what the
+/// user directory knows.
+///
+/// A direct message has no name of its own. `client.userBoot` puts them in
+/// `ims`, which carry the other person's id and nothing else, so the name has
+/// to come from the directory — and the directory usually arrives *after* the
+/// conversations do, which is why this has to cope with not knowing yet.
+///
+/// The id is the last resort rather than an empty string: a row reading
+/// `U0BV61H04S3` is at least a row you can click, and a bare presence dot
+/// followed by nothing is what a real workspace looked like for a whole
+/// milestone.
+pub fn name_of(name: &str, peer: Option<&str>, from_directory: Option<&str>) -> String {
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    from_directory
+        .filter(|d| !d.is_empty())
+        .or(peer)
+        .unwrap_or("")
+        .to_string()
+}
+
 /// How the sidebar's options rearrange one section's conversations.
 ///
 /// Takes what each row is — its index, whether it has unread, whether it is
@@ -610,6 +633,23 @@ pub fn accel(rendered: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_direct_message_is_named_after_the_person_in_it() {
+        use super::name_of;
+        // A channel names itself.
+        assert_eq!(name_of("fixtures", None, None), "fixtures");
+        // A direct message does not: Slack's `ims` carry a user id and no
+        // name at all, so it comes from the directory.
+        assert_eq!(
+            name_of("", Some("U0BV61H04S3"), Some("petr.olivka")),
+            "petr.olivka"
+        );
+        // The directory arrives after the conversations do. Until it does,
+        // the id — never an empty row, which is what this actually shipped as.
+        assert_eq!(name_of("", Some("U0BV61H04S3"), None), "U0BV61H04S3");
+        assert_eq!(name_of("", Some("U0BV61H04S3"), Some("")), "U0BV61H04S3");
+    }
+
     #[test]
     fn hiding_read_conversations_never_hides_the_one_on_screen() {
         use super::arrange;

@@ -176,3 +176,90 @@ fn drafts_are_kept_per_thread_as_well_as_per_conversation() {
         Some("for the thread")
     );
 }
+
+/// The demo workspace must leave nothing in a real cache.
+///
+/// `--anonymous` shared the store until this was found: a client that had
+/// ever been run against the demo carried 174 fabricated messages in its
+/// real cache, where `cache stats` counted them and `slack-light unread`
+/// would have summed their badges. The leak is fixed at the source; this is
+/// the mop, and it has to be safe to run on every start.
+#[test]
+fn demo_rows_are_swept_out_and_real_ones_are_not() {
+    let mut store = slk_store::Store::open(None).expect("in-memory");
+    let real = slk_core::TeamId::new("T0C099XGRMF");
+    let demo = slk_core::TeamId::new("T0MOCK");
+    let ch = slk_core::ChannelId::new("C1");
+
+    let msg = |team: &slk_core::TeamId, ts: &str, text: &str| {
+        let raw = serde_json::json!({
+            "type": "message", "user": "U1", "ts": ts, "text": text
+        });
+        let m = slk_core::Message::parse(team, &ch, &slk_core::UserId::new("U2"), &raw)
+            .expect("a message");
+        (m, raw.to_string())
+    };
+    store
+        .upsert_messages(&[
+            msg(&real, "1788854344.000100", "a real one"),
+            msg(&demo, "1725701100.000100", "a demo one"),
+        ])
+        .unwrap();
+
+    let gone = store.forget_demo().unwrap();
+    assert!(gone >= 1, "the demo's message should have been removed");
+
+    let left = store
+        .latest_messages(&real, &ch, &slk_core::UserId::new("U2"), 50)
+        .unwrap();
+    assert_eq!(left.len(), 1, "the real workspace keeps its messages");
+    assert_eq!(left[0].text, "a real one");
+    assert!(
+        store
+            .latest_messages(&demo, &ch, &slk_core::UserId::new("U2"), 50)
+            .unwrap()
+            .is_empty(),
+        "and the demo keeps none"
+    );
+    // Search goes through the FTS index, which is content-backed by `message`:
+    // a delete that went around it would leave the index pointing at rows
+    // that are no longer there.
+    assert!(store.search("demo", 10).unwrap().is_empty());
+    // Idempotent, because it runs on every start.
+    assert_eq!(store.forget_demo().unwrap(), 0);
+}
+
+/// A table nobody writes is a table whose readers are wrong.
+///
+/// `workspace` was in the schema from M1 and nothing ever inserted into it,
+/// so `teams()` answered "none" and `slack-light unread` reading the cache
+/// with no client running always reported zero — however much was unread.
+#[test]
+fn a_workspace_is_recorded_so_the_cache_can_be_read_without_a_client() {
+    let store = slk_store::Store::open(None).expect("in-memory");
+    assert!(store.teams().unwrap().is_empty());
+
+    let team = slk_core::TeamId::new("T0C099XGRMF");
+    store
+        .remember_workspace(
+            &team,
+            "slk-dev",
+            "slk-dev",
+            &slk_core::UserId::new("U0BV61H04S3"),
+            "session",
+        )
+        .unwrap();
+    assert_eq!(store.teams().unwrap(), vec![team.clone()]);
+
+    // Booting again updates rather than duplicates.
+    store
+        .remember_workspace(
+            &team,
+            "slk-dev renamed",
+            "slk-dev",
+            &slk_core::UserId::new("U0BV61H04S3"),
+            "session",
+        )
+        .unwrap();
+    assert_eq!(store.teams().unwrap().len(), 1);
+}

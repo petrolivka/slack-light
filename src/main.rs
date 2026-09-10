@@ -372,7 +372,13 @@ fn main() -> Result<()> {
         }
     }
 
-    let store_path = if cli.no_cache || !config.store.enabled {
+    // `--anonymous` never writes to the cache either. It is not only about
+    // credentials: the demo workspace's messages were landing in the real
+    // `store.sqlite`, where `cache stats` counted them, retention kept them,
+    // and `slack-light unread`'s cache fallback would have reported the
+    // demo's unread badges as somebody's own. Found by looking at a real
+    // workspace's cache and finding 174 fabricated messages in it.
+    let store_path = if cli.anonymous || cli.no_cache || !config.store.enabled {
         None
     } else {
         Some(slk_config::data_dir().join("store.sqlite"))
@@ -382,6 +388,13 @@ fn main() -> Result<()> {
     // moment nothing else is touching the store.
     if let Some(p) = &store_path {
         if let Ok(mut store) = Store::open(Some(p)) {
+            match store.forget_demo() {
+                Ok(n) if n > 0 => {
+                    tracing::info!("removed {n} rows the demo workspace left in the cache")
+                }
+                Err(e) => tracing::warn!("clearing demo rows: {e}"),
+                _ => {}
+            }
             match store.trim(
                 config.store.max_messages_per_channel,
                 config.store.max_age_days,
@@ -405,6 +418,14 @@ fn main() -> Result<()> {
     {
         let _guard = runtime.enter();
         for (name, backend) in backends {
+            // The guarantee is applied here, once, around the thing that
+            // actually talks to Slack — not in the window, where it was, and
+            // where marking a conversation read walked straight past it.
+            let backend = if cli.read_only {
+                slk_api::ReadOnly::wrap(backend)
+            } else {
+                backend
+            };
             let team = backend.team().clone();
             let store = Store::open(store_path.as_deref()).context("opening the message cache")?;
             let (cmd_tx, mut rx) = Engine::spawn(

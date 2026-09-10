@@ -702,6 +702,25 @@ impl Engine {
     }
 
     async fn boot(&mut self) {
+        // Who this workspace is, written down where anything reading the
+        // cache without a running client can find it — `slack-light unread`
+        // from a status bar, most of all.
+        if let Ok(ws) = self.backend.whoami().await {
+            let route = if self.backend.capabilities().counts {
+                "session"
+            } else {
+                "oauth"
+            };
+            if let Err(e) = self.store.remember_workspace(
+                &self.team,
+                &ws.name,
+                &ws.domain,
+                &self.self_id,
+                route,
+            ) {
+                warn!("recording the workspace: {e:#}");
+            }
+        }
         match self.backend.boot().await {
             Ok(boot) => {
                 let mut convs = boot.conversations;

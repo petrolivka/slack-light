@@ -2005,9 +2005,20 @@ impl App {
                 self.notice(format!("Slack asked us to wait {seconds}s"), sender);
             }
             Event::Users(users) => {
-                let mut d = self.shared.names.borrow_mut();
-                for u in users {
-                    d.add_user(u.id.as_str().to_string(), u.label);
+                {
+                    let mut d = self.shared.names.borrow_mut();
+                    for u in users {
+                        d.add_user(u.id.as_str().to_string(), u.label);
+                    }
+                }
+                // A direct message is named after the person in it, and the
+                // directory is what knows their name. Conversations usually
+                // arrive first, so without this the sidebar keeps whatever it
+                // could say at the time — an id, or a bare presence dot —
+                // until something else happens to rebuild it.
+                if is_current {
+                    self.rebuild_sidebar();
+                    self.refresh_header();
                 }
             }
             Event::CustomEmoji(all) => {
@@ -2456,6 +2467,27 @@ impl App {
 
     /// The right-hand end of the status bar: what is waiting, and the two
     /// keys worth knowing.
+    /// What a conversation is called, on screen.
+    ///
+    /// A direct message has no name of its own. `client.userBoot` puts them in
+    /// `ims`, which carry the other person's id and nothing else — the
+    /// official client resolves the name from the user directory, and so does
+    /// this. Without it every direct message in the sidebar was a presence dot
+    /// followed by nothing, which is what a real workspace looked like and the
+    /// demo never did: the mock gives its direct messages a name, so this was
+    /// invisible until the client met an actual `ims` array.
+    ///
+    /// The id is the last resort rather than an empty string: a row that says
+    /// `U0BV61H04S3` is at least a row you can click.
+    fn conv_name(&self, c: &SidebarEntry) -> String {
+        let names = self.shared.names.borrow();
+        crate::logic::name_of(
+            &c.name,
+            c.peer.as_ref().map(|u| u.as_str()),
+            c.peer.as_ref().and_then(|u| names.user(u.as_str())),
+        )
+    }
+
     /// The conversation header: name, star, mute, member count, topic.
     ///
     /// A method rather than three lines in `open_conversation`, because the
@@ -2474,7 +2506,7 @@ impl App {
             .as_ref()
             .map(|c| {
                 let name = if c.is_dm() {
-                    c.name.clone()
+                    self.conv_name(c)
                 } else if c.is_private() {
                     format!("🔒 {}", c.name)
                 } else {
@@ -2541,10 +2573,15 @@ impl App {
             snap.unread += unread;
             snap.mentions += mentions;
             for c in &w.convs {
+                // Through `conv_name`, not `c.name`: a direct message has no
+                // name of its own, and publishing a bare `@` made
+                // `slack-light send @somebody` answer "no conversation called
+                // that" for every person in the workspace.
+                let name = self.conv_name(c);
                 snap.names.push(if c.is_dm() {
-                    format!("@{}", c.name)
+                    format!("@{name}")
                 } else {
-                    format!("#{}", c.name)
+                    format!("#{name}")
                 });
             }
             snap.workspaces.push(slk_sync::WorkspaceCount {
@@ -4413,11 +4450,11 @@ impl App {
                         .peer
                         .as_ref()
                         .is_some_and(|u| self.shared.names.borrow().active.contains(u.as_str()));
-                    format!("{} {}", if here { "●" } else { "○" }, c.name)
+                    format!("{} {}", if here { "●" } else { "○" }, self.conv_name(c))
                 } else if c.is_private() {
-                    format!("🔒 {}", c.name)
+                    format!("🔒 {}", self.conv_name(c))
                 } else {
-                    format!("#  {}", c.name)
+                    format!("#  {}", self.conv_name(c))
                 };
                 name.set_label(&label);
                 if c.has_unread() {

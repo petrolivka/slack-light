@@ -156,6 +156,77 @@ impl Store {
     }
 
     /// Every conversation we know about, newest activity first, for the sidebar.
+    /// Remove anything the demo workspace left behind.
+    ///
+    /// `--anonymous` used to share the real cache, so a client that had ever
+    /// been run against the demo has fabricated messages in it — counted by
+    /// `cache stats`, kept by retention, and summed by `slack-light unread`
+    /// when it falls back to the cache. Fixing the leak does not clean up
+    /// after it, and asking somebody to purge their whole cache to be rid of
+    /// something this client put there is the wrong way round.
+    ///
+    /// Safe to run always: `T0MOCK` and `T1MOCK` are ids the mock invents and
+    /// Slack never issues — a real team id is `T` followed by a base-36
+    /// string that has never been either of these.
+    pub fn forget_demo(&self) -> Result<usize> {
+        let mut gone = 0;
+        for team in ["T0MOCK", "T1MOCK"] {
+            for table in [
+                "message",
+                "conversation",
+                "user",
+                "history_span",
+                "draft",
+                "outbox",
+            ] {
+                gone += self.db.execute(
+                    &format!("DELETE FROM {table} WHERE team = ?1"),
+                    params![team],
+                )?;
+            }
+        }
+        if gone > 0 {
+            // The full-text index is content-backed by `message`, so a delete
+            // that goes around it leaves the index pointing at rows that are
+            // no longer there.
+            self.db
+                .execute_batch("INSERT INTO message_fts(message_fts) VALUES('rebuild')")?;
+        }
+        Ok(gone)
+    }
+
+    /// Record that this workspace exists, and what it is called.
+    ///
+    /// The `workspace` table has been in the schema since M1 and nothing ever
+    /// wrote to it, so `teams()` — and therefore `slack-light unread` reading
+    /// the cache with no client running — always answered "no workspaces, no
+    /// unread". A table nobody writes is a table whose readers are wrong.
+    pub fn remember_workspace(
+        &self,
+        team: &TeamId,
+        name: &str,
+        domain: &str,
+        self_id: &UserId,
+        backend: &str,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO workspace (team, name, domain, self_id, backend, booted_at)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(team) DO UPDATE SET
+               name=excluded.name, domain=excluded.domain, self_id=excluded.self_id,
+               backend=excluded.backend, booted_at=excluded.booted_at",
+            params![
+                team.as_str(),
+                name,
+                domain,
+                self_id.as_str(),
+                backend,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Every workspace the cache knows about.
     ///
     /// For reading counts without connecting: `slack-light unread` runs from

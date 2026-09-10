@@ -73,6 +73,11 @@ focus
 t=$(tree)
 check "the window is on the a11y bus with its rows" "$( [ "$(echo "$t" | grep -c 'list item')" -gt 5 ] && echo 1 || echo 0 )"
 check "the composer is a text field in the tree" "$( echo "$t" | grep -qE '^ *(text|entry)' && echo 1 || echo 0 )"
+# A direct message has no name of its own — Slack's `ims` carry the other
+# person's id and nothing else — so the sidebar has to resolve one from the
+# user directory. Against a real workspace this row was a presence dot
+# followed by nothing, and the demo hid it by inventing a name.
+check "a direct message is named after the person in it" "$( echo "$t" | grep -qE "label '[●○] [a-z]" && echo 1 || echo 0 )" "$(echo "$t" | grep -oE "label '[●○][^']*'" | head -2 | tr '\n' ' ')"
 
 # E1: ctrl-k, type, Enter → the conversation opens.
 w -M ctrl k -m ctrl; sleep 0.4
