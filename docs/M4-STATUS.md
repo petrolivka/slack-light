@@ -30,8 +30,8 @@ passing** in `tests/a11y/e2e.sh` (from 72), clippy clean with `-D warnings`,
 |---|---|---|
 | FR-C2 | Create channel (public/private), archive, rename; create group DM | **Met** |
 | FR-C3 | Bookmarks list in the conversation header | **Met** for link bookmarks; the other kinds are §4 |
-| FR-N6 | Slack's own sidebar sections, when the backend provides them | **Built.** The session route's answer has never been captured — §5 |
-| FR-M7 | Drafts synced with Slack's drafts (the `C` half) | **Built.** Same — §5 |
+| FR-N6 | Slack's own sidebar sections, when the backend provides them | **Built**, and read correctly from `slk-dev`'s real answer — for Slack's built-in sections; no made one exists there yet. §5 |
+| FR-M7 | Drafts synced with Slack's drafts (the `C` half) | **Built.** `drafts.list` answers for the session; no real draft has been read yet. §5 |
 | FR-M11 | Schedule a message; list and cancel | **Not chosen for M4.** Open |
 | FR-F6 | Custom emoji as inline images | **Refused in M3; the refusal stands** |
 | FR-B4 | Interactive Block Kit | `W`, and stays `W` |
@@ -191,11 +191,19 @@ The palette reaches all four by name.
 
 ## 5. What is built but not proven
 
-**`users.channelSections.list` and `drafts.*` have never answered this
-client.** Every line is written to the shapes in §2, and every parser
-degrades, but no real answer has been read. The first run against `slk-dev`
-should be under `--read-only`, which reads sections and drafts and writes
-nothing — and the fixture capture M5 plans should include both.
+**The first run against `slk-dev`, under `--read-only`.** Only
+`slk-dev.slack.com` was contacted, and the one write the client tried — a
+read mark — was refused at the backend. `users.channelSections.list`
+answered with eight sections: three of Slack's built-ins recognised as
+such, five of kinds this client does not draw, none made by the person. The
+chain and the type names hold against a real answer. `drafts.list` and
+`bookmarks.list` answered without error and with nothing a composer or a bar
+could use: `slk-dev` has no drafts or bookmarks yet, so those two parsers
+have still not read a real one. The engine now logs these counts at debug
+level — counts only, never names or words — because a sidebar that looks
+ordinary cannot tell "Slack sent none" from "the parser kept none". A
+section, a bookmark and an unsent draft made in the official client would
+close this; the fixture capture M5 plans should include all three.
 
 **A mention in a draft typed on the phone** is turned back into `@name`
 through the directory. If the directory has not loaded when the sync runs,

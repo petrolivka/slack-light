@@ -2134,6 +2134,10 @@ impl Engine {
                 return;
             }
         };
+        debug!(
+            "drafts: {} from Slack that a composer can hold",
+            remote.len()
+        );
         let known: std::collections::HashSet<String> = self
             .store
             .conversations(&self.team)
@@ -2329,6 +2333,31 @@ impl Engine {
                 return;
             }
         };
+        // Counts, never names. Slack always sends its built-in sections, so
+        // "none built in" read from a real workspace's log means the parser
+        // and not the person — the one question an ordinary-looking sidebar
+        // cannot answer.
+        debug!(
+            "sections: {} from Slack — {} made by the person, {} built in, {} of kinds not drawn",
+            fresh.len(),
+            fresh
+                .iter()
+                .filter(|s| s.kind == slk_core::SectionKind::Custom)
+                .count(),
+            fresh
+                .iter()
+                .filter(|s| matches!(
+                    s.kind,
+                    slk_core::SectionKind::Starred
+                        | slk_core::SectionKind::Channels
+                        | slk_core::SectionKind::Dms
+                ))
+                .count(),
+            fresh
+                .iter()
+                .filter(|s| s.kind == slk_core::SectionKind::Other)
+                .count(),
+        );
         let had = self.store.sections(&self.team).unwrap_or_default();
         if had == fresh {
             return;
@@ -2362,6 +2391,7 @@ impl Engine {
                 return;
             }
         };
+        debug!("bookmarks: {} link(s) for {}", fresh.len(), ch.as_str());
         self.bookmarks_checked
             .insert(ch.as_str().to_string(), Instant::now());
         let had = self.store.bookmarks(&self.team, ch).unwrap_or_default();
