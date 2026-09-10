@@ -357,6 +357,10 @@ pub struct App {
     /// Held so the bar can be rebuilt without asking again — on a theme
     /// change, for instance.
     bookmarks: Vec<slk_core::Bookmark>,
+    /// Where the person left this workspace, held until the sidebar can say
+    /// whether that conversation is still there. The engine offers it before
+    /// the first sidebar, because the window lands the moment it has one.
+    pending_restore: Option<ChannelId>,
     /// A message on its way to another conversation: which one it is, and its
     /// link once Slack has minted one. Cleared when the target is chosen or
     /// the picker is dismissed.
@@ -565,6 +569,17 @@ impl App {
         if self.open.is_some() {
             return;
         }
+        // Where the person left it beats where the rules would land, if it
+        // is still in the sidebar. One the sidebar does not have — the cache
+        // was trimmed — is dropped rather than kept: the rules land somewhere
+        // now, and a restore that took effect later would move the window
+        // out from under the person reading it.
+        if let Some(id) = self.pending_restore.take() {
+            if self.convs().iter().any(|c| c.id == id) {
+                self.restore_to(id);
+                return;
+            }
+        }
         let pick = crate::logic::landing(
             self.convs()
                 .iter()
@@ -573,6 +588,23 @@ impl App {
         if let Some(c) = self.convs().get(pick) {
             let id = c.id.clone();
             self.open_channel(id);
+        }
+    }
+
+    /// Open where the person left off, and the thread they had open there.
+    ///
+    /// The conversation first, synchronously, and the thread after it:
+    /// opening a conversation closes whatever thread is open, so the other
+    /// order — which is what this did when it ran at all — opens the thread
+    /// and then closes it. The thread is read before either, because closing
+    /// one forgets it.
+    fn restore_to(&mut self, channel: ChannelId) {
+        let want = self.session.borrow().thread.clone();
+        self.open_channel(channel.clone());
+        if let Some((ch, ts)) = want.split_once('/') {
+            if ch == channel.as_str() {
+                self.show_thread(channel, slk_core::Ts::new(ts));
+            }
         }
     }
 
@@ -1208,6 +1240,7 @@ impl SimpleComponent for App {
             inserting: Rc::new(std::cell::Cell::new(false)),
             drafts: HashMap::new(),
             bookmarks: Vec::new(),
+            pending_restore: None,
             forwarding: None,
             forward_link: None,
             typing: Vec::new(),
@@ -2013,22 +2046,18 @@ impl App {
                 }
             }
             Event::Restore(channel) => {
-                // Offered once, at boot, and only taken if nothing has been
-                // opened yet: a restore that fires after the user has clicked
-                // somewhere is a client that will not stay where it is put.
+                // Offered once, before the first sidebar, and only taken if
+                // nothing has been opened yet: a restore that fires after the
+                // user has clicked somewhere is a client that will not stay
+                // where it is put. Without a sidebar to find it in yet, it is
+                // held, and `land` takes it when the sidebar comes.
                 if !is_current || self.open.is_some() {
                     return;
                 }
-                // Read before opening: opening a conversation closes whatever
-                // thread was open, and closing one forgets it.
-                let want = self.session.borrow().thread.clone();
-                if let Some(i) = self.convs().iter().position(|c| c.id == channel) {
-                    self.select_conv(i);
-                }
-                if let Some((ch, ts)) = want.split_once('/') {
-                    if ch == channel.as_str() {
-                        self.show_thread(channel, slk_core::Ts::new(ts));
-                    }
+                if self.convs().iter().any(|c| c.id == channel) {
+                    self.restore_to(channel);
+                } else {
+                    self.pending_restore = Some(channel);
                 }
             }
             Event::Notice(t) => {

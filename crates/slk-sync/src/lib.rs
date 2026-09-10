@@ -435,6 +435,18 @@ impl Engine {
     async fn run(&mut self, mut cmds: mpsc::Receiver<Command>) -> Result<()> {
         // The sidebar comes from the cache first, so the first frame is
         // instant and correct-as-of-last-time rather than empty.
+        // Where this workspace was left, offered before anything else. The
+        // window lands somewhere the moment it has a sidebar, so a restore
+        // that arrives after the first one is a restore that never happens —
+        // which is what this was from M3 until the first run against a real
+        // workspace: offered at the end of boot, a network round trip after
+        // the cached sidebar had been landed on. The window holds it until
+        // it has a sidebar to find the conversation in.
+        if let Ok(Some(id)) = self.store.kv(&format!("last_open:{}", self.team.as_str())) {
+            if !id.is_empty() {
+                self.emit(Event::Restore(ChannelId::new(id))).await;
+            }
+        }
         self.push_sidebar().await;
         self.emit(Event::Ready {
             team: self.team.clone(),
@@ -883,15 +895,6 @@ impl Engine {
         self.push_users().await;
         self.push_usergroups().await;
         self.push_custom_emoji().await;
-
-        // Where this workspace was left, offered once and only once. Emitted
-        // after the sidebar, so the interface has the conversation to open by
-        // the time it is asked to.
-        if let Ok(Some(id)) = self.store.kv(&format!("last_open:{}", self.team.as_str())) {
-            if !id.is_empty() {
-                self.emit(Event::Restore(ChannelId::new(id))).await;
-            }
-        }
     }
 
     /// Fetch the users a name is needed for but the directory does not have.
