@@ -18,20 +18,22 @@ your desktop.
 Built for Wayland, verified on Hyprland, themed by
 [Omarchy](https://omarchy.org) when it is there.
 
-> **Status: M2b — parity core.** `slack-light --anonymous`
-> opens a themed window on a demo workspace; with a session it follows a
-> conversation, replies in a thread, reacts, edits, pins and saves. This is
-> the successor to a terminal client that reached parity and turned out to
-> be the wrong shape for a medium full of images and threads. The Slack
-> layer — session route, websocket, cache, sync engine — carries over
-> intact and verified. The GTK shell was spiked and measured — no dropped
-> frame scrolling 5 000 rows, 65 MB of private memory holding them, an idle
-> window that paints nothing at all, themed live from Omarchy, driven from
-> the keyboard and asserted through the accessibility tree — and then
-> built. See [ADR-001](docs/ADR-001-native-gui.md)
-> for why, [the findings](docs/M0-GUI-FINDINGS.md) for the spike numbers,
-> and [M3-STATUS.md](docs/M3-STATUS.md) for what works today and what does
-> not — including one measurement that had to be taken back.
+> **Status: M4 — delight.** `slack-light --anonymous` opens a themed window
+> on a demo workspace; with a session it is a working day's Slack — threads,
+> reactions, edits, search, files, notifications, presence and status — and
+> M4 added what people arrange for themselves: the sidebar sections they
+> made in Slack, the bookmark bar on a channel, drafts that follow them
+> between phone and laptop, and making, renaming and archiving channels and
+> groups. This is the successor to a terminal client that reached parity and
+> turned out to be the wrong shape for a medium full of images and threads.
+> The Slack layer — session route, websocket, cache, sync engine — carries
+> over intact and verified. The GTK shell was spiked and measured — no
+> dropped frame scrolling 5 000 rows, 65 MB of private memory holding them,
+> an idle window that paints nothing at all, themed live from Omarchy,
+> driven from the keyboard and asserted through the accessibility tree — and
+> then built. See [ADR-001](docs/ADR-001-native-gui.md) for why,
+> [the findings](docs/M0-GUI-FINDINGS.md) for the spike numbers, and
+> [M4-STATUS.md](docs/M4-STATUS.md) for what works today and what does not.
 
 ---
 
@@ -146,7 +148,7 @@ Needs GTK 4.14+ development files (`gtk4` on Arch). No libadwaita.
 | [docs/SLACK-ACCESS-STRATEGY.md](docs/SLACK-ACCESS-STRATEGY.md) | Session token vs official app: coverage, stability, rate limits, risk |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crates, data model, storage, sync engine, the GTK runtime, theming, config |
 | [docs/M0-GUI-SPIKE-PLAN.md](docs/M0-GUI-SPIKE-PLAN.md) | What the GTK client must prove before anything else is built |
-| [docs/M0-GUI-FINDINGS.md](docs/M0-GUI-FINDINGS.md) · [docs/M1-STATUS.md](docs/M1-STATUS.md) · [docs/M2-STATUS.md](docs/M2-STATUS.md) · [docs/M3-STATUS.md](docs/M3-STATUS.md) | What the GTK spikes measured; what the skeleton delivered; where parity stands; what polish added, and what it decided against |
+| [docs/M0-GUI-FINDINGS.md](docs/M0-GUI-FINDINGS.md) · [docs/M1-STATUS.md](docs/M1-STATUS.md) · [docs/M2-STATUS.md](docs/M2-STATUS.md) · [docs/M3-STATUS.md](docs/M3-STATUS.md) · [docs/M4-STATUS.md](docs/M4-STATUS.md) | What the GTK spikes measured; what the skeleton delivered; where parity stands; what polish added, and what it decided against; what M4 added, and what it left for M5 |
 | [docs/M0-SPIKE-PLAN.md](docs/M0-SPIKE-PLAN.md) · [docs/M0-FINDINGS.md](docs/M0-FINDINGS.md) | The original spike: what was proved about Slack's API, measured against a live workspace |
 
 ## Licence
