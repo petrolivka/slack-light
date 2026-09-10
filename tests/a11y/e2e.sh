@@ -79,11 +79,21 @@ check "the composer is a text field in the tree" "$( echo "$t" | grep -qE '^ *(t
 # followed by nothing, and the demo hid it by inventing a name.
 check "a direct message is named after the person in it" "$( echo "$t" | grep -qE "label '[●○] [a-z]" && echo 1 || echo 0 )" "$(echo "$t" | grep -oE "label '[●○][^']*'" | head -2 | tr '\n' ' ')"
 
+# M4. The bookmark bar is buttons with names a screen reader can use: the
+# title alone does not say where it goes, and a tooltip is not announced on
+# focus. The client lands on #engineering, the demo channel that has a bar.
+check "a bookmark says where it goes" "$( echo "$t" | grep -q "label 'Runbook, opens https://example.invalid/runbook'" && echo 1 || echo 0 )" "$(echo "$t" | grep -oE "label '[^']*opens[^']*'" | head -2 | tr '\n' ' ')"
+# The person's own Slack section, with its emoji, as a heading in the sidebar.
+check "a section made in Slack is a sidebar heading" "$( echo "$t" | grep -q "label '🚀 Projects'" && echo 1 || echo 0 )"
+
 # E1: ctrl-k, type, Enter → the conversation opens.
 w -M ctrl k -m ctrl; sleep 0.4
 w "des"; sleep 0.3
 w -k Return; sleep 1.2
 check "ctrl-k, 'des', Enter opens #design" "$( tree | grep -q "label '# design'" && echo 1 || echo 0 )" "$(tree | grep "label '#" | head -2 | tr '\n' ' ')"
+# The bar belongs to the conversation it was fetched for: #design has none,
+# and a bar left over from #engineering would sit above the wrong messages.
+check "a conversation with no bookmarks shows no bar" "$( tree | grep -q "opens https://example.invalid" && echo 0 || echo 1 )"
 
 # E2: after the jump, focus is back on the composer: typing lands there.
 w "keyboard test"; sleep 0.2; w -k Return; sleep 2.5
@@ -109,6 +119,12 @@ w -k Return; sleep 2.0
 check "a draft survives leaving the conversation" "$( tree | grep -q 'hi @alice :roc' && echo 1 || echo 0 )" "$(tree | grep -oE "'hi @alice[^']*'" | head -1)"
 
 # E1: alt-Up moves to the previous conversation without the mouse.
+# From the direct message with alice, whose neighbour above is #leads. Not
+# from #design any more: since M4, #design sits in the demo's own "Projects"
+# section, so the row above it is #engineering — and everything this run
+# types from here on has to land in #leads, because #engineering is the one
+# conversation it keeps untouched for the checks further down.
+w -M ctrl k -m ctrl; sleep 0.4; w "ali"; sleep 0.3; w -k Return; sleep 1.2
 w -M alt -k Up -m alt; sleep 1.2
 check "alt-Up moves to the previous conversation" "$( tree | grep -q "label '🔒 leads'" && echo 1 || echo 0 )" "$(tree | grep -E "label '(#|🔒)" | head -2 | tr '\n' ' ')"
 
@@ -314,6 +330,60 @@ check "hide_read hides the conversations with nothing unread" "$( [ "$after" -lt
 check "and the open conversation is still there" "$( tree | grep -q 'engineering' && echo 1 || echo 0 )"
 w -M ctrl p -m ctrl; sleep 0.6
 w "hide_read"; sleep 0.5; w -k Return; sleep 1.2
+
+# M4 through the window. Last in this run on purpose: these change which
+# conversation is open, and nothing after them cares.
+
+# Folding from the keyboard. `toggle_section` was in the palette since M2
+# and answered "unbound action". #engineering was unstarred above, so it is
+# in CHANNELS now; alt-z folds the section the open conversation is in, and
+# the same key has to open it again — folding takes the selected row with
+# it, and a key that can close a section and not reopen it is a trap.
+check "CHANNELS is open to begin with" "$( tree | grep -q '#  general' && echo 1 || echo 0 )"
+w -M alt z -m alt; sleep 0.8
+check "alt-z folds the section the open conversation is in" "$( tree | grep -q '#  general' && echo 0 || echo 1 )"
+w -M alt z -m alt; sleep 0.8
+check "and the same key unfolds it" "$( tree | grep -q '#  general' && echo 1 || echo 0 )"
+
+# A draft typed on the phone. The demo's Slack holds one for #general, and
+# it has to be in that composer — read through the text interface, which is
+# what a screen reader reads too.
+w -M ctrl k -m ctrl; sleep 0.4; w "gene"; sleep 0.3; w -k Return; sleep 2.0
+check "a draft typed on the phone is in the composer" "$( tree | grep -q 'half a thought from the phone' && echo 1 || echo 0 )" "$(tree | grep -oE "'half a thought[^']*'" | head -1)"
+w -M ctrl u -m ctrl; sleep 0.3
+
+# Making, renaming and archiving a channel, all from the composer. The name
+# is normalised the way Slack would store it before anything is sent.
+w "/create a11y room"; sleep 0.3; w -k Return; sleep 2.0
+check "/create makes the channel and opens it" "$( tree | grep -q "label '# a11y-room'" && echo 1 || echo 0 )" "$(tree | grep -oE "label '# [^']*'" | head -2 | tr '\n' ' ')"
+w "/rename a11y renamed"; sleep 0.3; w -k Return; sleep 2.0
+check "/rename renames it, and the header follows" "$( tree | grep -q "label '# a11y-renamed'" && echo 1 || echo 0 )" "$(tree | grep -oE "label '# [^']*'" | head -2 | tr '\n' ' ')"
+# The run of M4's first draft passed the two checks above while renaming the
+# demo's #general: the window had not opened the new channel, so /rename
+# went to the conversation still on screen. #general has to be where it was.
+check "and the conversation it came from is untouched" "$( tree | grep -q '#  general' && echo 1 || echo 0 )" "$(tree | grep -oE "label '#  [^']*'" | tr '\n' ' ')"
+# Archiving always asks. A complete command name has the completion popup
+# open, so Escape first and then Return, as for /upload.
+w "/archive"; sleep 0.6; w -k Escape; sleep 0.3; w -k Return; sleep 1.5
+check "/archive asks first, and says for whom" "$( tree | grep -q 'Archive for everybody' && echo 1 || echo 0 )"
+w -k Escape; sleep 1.0
+check "cancelling it archives nothing" "$( tree | grep -q "label '# a11y-renamed'" && echo 1 || echo 0 )"
+w "/archive"; sleep 0.6; w -k Escape; sleep 0.3; w -k Return; sleep 1.5
+# Cancel is the default button, so Return alone would cancel: Tab to the
+# other one, which is what a person has to do too.
+w -k Tab; sleep 0.3; w -k Return; sleep 2.0
+check "confirming it takes the channel out of the sidebar" "$( tree | grep -q 'a11y-renamed' && echo 0 || echo 1 )" "$(tree | grep -oE "'[^']*a11y[^']*'" | head -2 | tr '\n' ' ')"
+check "and archives nothing else" "$( tree | grep -q '#  general' && echo 1 || echo 0 )"
+# A dialog left open takes all input from the window behind it, and every
+# check after this one would fail for that reason alone.
+if tree | grep -q 'Archive for everybody'; then w -k Escape; sleep 0.8; fi
+
+# A group, by the people in it. Slack names one `mpdm-alice--bob--petr-1`;
+# on screen it has to be the people. Escape closes the mention completion
+# that `@bob` opened, or Return would take the completion instead.
+w "/group @alice @bob"; sleep 0.8; w -k Escape; sleep 0.3; w -k Return; sleep 2.0
+check "/group opens a conversation named by its people" "$( tree | grep -E "label '[^']*alice[^']*bob[^']*'" | grep -vq 'mpdm' && echo 1 || echo 0 )" "$(tree | grep -oE "label '[^']*(alice|mpdm)[^']*'" | head -3 | tr '\n' ' ')"
+check "and Slack's own name for it is nowhere on screen" "$( tree | grep -q 'mpdm-' && echo 0 || echo 1 )"
 
 # F1 is the shortcuts window, generated from the live keymap: an action with
 # no key has to say so rather than be missing.

@@ -31,6 +31,9 @@ pub struct Directory {
     pub channel_ids: HashMap<String, String>,
     /// Handle → id, for `@design-team`.
     pub groups: HashMap<String, String>,
+    /// User id → handle. Slack names a group direct message by its members'
+    /// handles, and leaving the person looking out of that name needs theirs.
+    pub handles: HashMap<String, String>,
     /// Who is online. A direct message with a dot beside it is the only
     /// place presence is worth the pixels.
     pub active: HashSet<String>,
@@ -78,6 +81,16 @@ pub struct Shared {
     pub sender: relm4::Sender<Msg>,
     pub pal: RefCell<slk_theme::Semantic>,
     pub self_id: RefCell<UserId>,
+    /// Set while the window moves the sidebar's selection itself, so the
+    /// selection signal does not read it as the person choosing a row.
+    ///
+    /// The sidebar opens whatever row is selected, and it re-selects the
+    /// open conversation at the end of every rebuild. That re-selection
+    /// queued an "open" of its own, which was harmless while it named the
+    /// conversation already open — and undid the switch whenever the engine
+    /// sent a new sidebar and "open this" in one burst, which is what
+    /// `/create` and joining a channel both do.
+    pub quiet_select: std::cell::Cell<bool>,
     pub textures: RefCell<HashMap<String, gtk::gdk::Texture>>,
     /// The workspace's own emoji: name to image URL. Empty until boot answers,
     /// and empty for ever on a backend that cannot ask — in both cases a
@@ -505,6 +518,9 @@ impl App {
         self.marked = None;
         self.close_completions();
         self.open = Some(id.clone());
+        // The sidebar's highlight follows whatever opened this — a click, a
+        // jump, the engine after `/create` — so the two never disagree.
+        self.highlight(&id);
         // The previous conversation's bar goes with the previous
         // conversation. It comes back from the cache within the same
         // `Open`, so this is a blink and not a gap.
@@ -772,13 +788,7 @@ impl SimpleComponent for App {
                                 set_hscrollbar_policy: gtk::PolicyType::External,
                                 set_vexpand: true,
                                 #[local_ref]
-                                sidebar -> gtk::ListBox {
-                                    connect_row_selected[sender] => move |_, row| {
-                                        if let Some(r) = row {
-                                            sender.input(Msg::Open(r.index() as usize));
-                                        }
-                                    },
-                                },
+                                sidebar -> gtk::ListBox {},
                             },
                         },
 
@@ -1110,6 +1120,7 @@ impl SimpleComponent for App {
             names: RefCell::new(Directory::default()),
             pal: RefCell::new(palette.semantic()),
             self_id: RefCell::new(UserId::new("")),
+            quiet_select: std::cell::Cell::new(false),
             textures: RefCell::new(HashMap::new()),
             custom: RefCell::new(HashMap::new()),
             pending: RefCell::new(HashMap::new()),
@@ -1554,6 +1565,21 @@ impl SimpleComponent for App {
                 format!("{}={} ({})", b.action.name(), b.accel, b.source),
             );
         }
+        // Choosing a row opens it — but only a row the person chose. See
+        // `Shared::quiet_select` for the one that was not.
+        {
+            let s = model.shared.sender.clone();
+            let shared = model.shared.clone();
+            model.sidebar.connect_row_selected(move |_, row| {
+                if shared.quiet_select.get() {
+                    return;
+                }
+                if let Some(r) = row {
+                    let _ = s.send(Msg::Open(r.index() as usize));
+                }
+            });
+        }
+
         // The sidebar filters by the jump query; rows are (label, badge) boxes.
         {
             let q = model.jump_query.clone();
@@ -2017,6 +2043,10 @@ impl App {
                 {
                     let mut d = self.shared.names.borrow_mut();
                     for u in users {
+                        if !u.handle.is_empty() {
+                            d.handles
+                                .insert(u.id.as_str().to_string(), u.handle.clone());
+                        }
                         d.add_user(u.id.as_str().to_string(), u.label);
                     }
                 }
@@ -2531,6 +2561,16 @@ impl App {
     /// `U0BV61H04S3` is at least a row you can click.
     fn conv_name(&self, c: &SidebarEntry) -> String {
         let names = self.shared.names.borrow();
+        // A group is called by the people in it, not by the `mpdm-…` string
+        // Slack stores for it — which is what the sidebar showed for the first
+        // group `/group` ever made, because the demo had never had one.
+        if c.kind.starts_with("Mpim") {
+            let me = self.shared.self_id.borrow();
+            let mine = names.handles.get(me.as_str()).map(String::as_str);
+            if let Some(label) = crate::logic::group_label(&c.name, mine) {
+                return label;
+            }
+        }
         crate::logic::name_of(
             &c.name,
             c.peer.as_ref().map(|u| u.as_str()),
@@ -2596,6 +2636,21 @@ impl App {
             .unwrap_or_default();
     }
 
+    /// Put the sidebar's selection on this conversation without opening it —
+    /// it is open already, or about to be. A folded or filtered-out row has
+    /// no place to put it, and then the selection is simply cleared.
+    fn highlight(&self, id: &ChannelId) {
+        let row = self
+            .convs()
+            .iter()
+            .position(|c| &c.id == id)
+            .and_then(|i| self.row_map.iter().position(|m| *m == Some(i)))
+            .and_then(|r| self.sidebar.row_at_index(r as i32));
+        self.shared.quiet_select.set(true);
+        self.sidebar.select_row(row.as_ref());
+        self.shared.quiet_select.set(false);
+    }
+
     /// The sidebar section the open conversation is drawn in.
     fn section_of_open(&self) -> Option<String> {
         let open = self.open.as_ref()?;
@@ -2646,18 +2701,24 @@ impl App {
             } else {
                 format!("{glyph} {}", b.title)
             };
-            let button = gtk::Button::with_label(&label);
+            // The link in the accessible name as well as in the tooltip:
+            // "Runbook" alone does not say where it goes, and a tooltip is
+            // not something a screen reader announces on focus. On the
+            // child label, not the button — GTK names a button after what is
+            // inside it and ignores a name set on the button itself. The
+            // first build set it on the button, and the accessibility suite
+            // read back "📚 Runbook" and nothing more.
+            let text = gtk::Label::new(Some(&label));
+            text.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{}, opens {}",
+                b.title, b.link
+            ))]);
+            let button = gtk::Button::new();
+            button.set_child(Some(&text));
             button.add_css_class("flat");
             button.add_css_class("bookmark");
             button.set_can_focus(true);
             button.set_tooltip_text(Some(&b.link));
-            // The link in the accessible name as well as in the tooltip:
-            // "Runbook" alone does not say where it goes, and a tooltip is
-            // not something a screen reader announces on focus.
-            button.update_property(&[gtk::accessible::Property::Label(&format!(
-                "{}, opens {}",
-                b.title, b.link
-            ))]);
             let sender = self.shared.sender.clone();
             let link = b.link.clone();
             button.connect_clicked(move |_| {
@@ -4738,15 +4799,10 @@ impl App {
         }
 
         // Keep the open conversation selected across a rebuild, or the
-        // sidebar loses its place every time a badge changes.
-        if let Some(open) = &self.open {
-            if let Some(conv_i) = convs.iter().position(|c| &c.id == open) {
-                if let Some(row_i) = self.row_map.iter().position(|m| *m == Some(conv_i)) {
-                    if let Some(row) = self.sidebar.row_at_index(row_i as i32) {
-                        self.sidebar.select_row(Some(&row));
-                    }
-                }
-            }
+        // sidebar loses its place every time a badge changes. Quietly: this
+        // is the window keeping its place, not the person choosing a row.
+        if let Some(open) = self.open.clone() {
+            self.highlight(&open);
         }
         self.refresh_status_right();
     }

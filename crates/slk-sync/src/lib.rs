@@ -957,7 +957,17 @@ impl Engine {
     /// person; anything else reaches nobody, which is better than inviting
     /// the wrong one.
     fn resolve_user(&self, who: &str) -> Option<UserId> {
-        let want = who.trim().trim_start_matches('@');
+        // Slack's own form as well as a person's: `<@U0ALICE>` and
+        // `<@U0ALICE|alice>` are what a mention looks like once it has been
+        // through the outgoing encoder, and a command argument that went
+        // that way must still reach the person it named.
+        let who = who.trim();
+        let who = who
+            .strip_prefix("<@")
+            .and_then(|x| x.strip_suffix('>'))
+            .map(|x| x.split('|').next().unwrap_or(x))
+            .unwrap_or(who);
+        let want = who.trim_start_matches('@');
         if want.is_empty() {
             return None;
         }
@@ -1777,9 +1787,9 @@ impl Engine {
                     self.emit(Event::Notice("that is only you".into())).await;
                     return;
                 }
-                // Slack caps a group direct message at nine people besides
-                // you. Past that it wants a channel, and says so after the
-                // request; saying it before is kinder.
+                // Slack caps a group direct message at nine people, you
+                // included — eight others. Past that it wants a channel, and
+                // says so after the request; saying it before is kinder.
                 if ids.len() > 8 {
                     self.emit(Event::Notice(
                         "a group holds at most nine people — make a channel instead".into(),

@@ -407,7 +407,7 @@ impl Store {
             "SELECT id, CASE WHEN display_name != '' THEN display_name
                              WHEN real_name != '' THEN real_name
                              ELSE name END,
-                    coalesce(is_external, 0), coalesce(is_deleted, 0)
+                    coalesce(is_external, 0), coalesce(is_deleted, 0), coalesce(name, '')
              FROM user WHERE team = ?1",
         )?;
         let rows = st
@@ -417,6 +417,7 @@ impl Store {
                     label: r.get(1)?,
                     external: r.get(2)?,
                     deactivated: r.get(3)?,
+                    handle: r.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1265,6 +1266,10 @@ impl Store {
 pub struct UserLabel {
     pub id: UserId,
     pub label: String,
+    /// The handle — `petr`, where the label is "Petr Olivka". Slack builds a
+    /// group direct message's name out of handles, so telling which of them
+    /// is the person looking needs theirs.
+    pub handle: String,
     /// A Slack Connect guest, from another workspace entirely.
     pub external: bool,
     pub deactivated: bool,

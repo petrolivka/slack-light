@@ -601,3 +601,30 @@ async fn sections_arrive_once_and_not_with_every_sidebar_change() {
         "a sidebar push is not a reason to resend sections"
     );
 }
+
+/// A mention that has already been through the outgoing encoder still names
+/// its person: `/group` and `/invite` take whatever the composer sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_can_be_named_in_slacks_own_mention_form() {
+    let (cmd, mut rx) = engine();
+    let _ = engineering(&mut rx).await;
+    wait_for(&mut rx, |ev| match ev {
+        Event::Users(us) if !us.is_empty() => Some(()),
+        _ => None,
+    })
+    .await
+    .expect("the demo has people");
+    cmd.send(Command::CreateGroup {
+        who: "<@U0ALICE> <@U0BOB|bob>".into(),
+    })
+    .await
+    .unwrap();
+    let got = wait_for(&mut rx, |ev| match ev {
+        Event::OpenChannel(c) => Some(Ok(c.clone())),
+        Event::Notice(n) if n.contains("nobody here") => Some(Err(n.clone())),
+        _ => None,
+    })
+    .await
+    .expect("an answer");
+    assert!(got.is_ok(), "both people found: {got:?}");
+}

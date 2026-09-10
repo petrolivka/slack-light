@@ -456,6 +456,33 @@ pub fn section_title(key: &str, custom: &[slk_core::SidebarSection]) -> String {
     }
 }
 
+/// What a group direct message is called on screen, from the name Slack
+/// gives it.
+///
+/// Slack names one `mpdm-alice--bob--petr-1` — the members' handles, each
+/// pair joined by `--`, with a number on the end — and its own client shows
+/// "alice, bob" instead, leaving out the person looking. A sidebar that
+/// showed the name as sent would carry that string for every group anybody
+/// starts. `None` when the name is not that shape, so the caller keeps what
+/// it had.
+pub fn group_label(name: &str, me: Option<&str>) -> Option<String> {
+    let rest = name.strip_prefix("mpdm-")?;
+    // The number at the end is Slack's own, for groups with the same people.
+    let rest = match rest.rsplit_once('-') {
+        Some((head, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => rest,
+    };
+    let handles: Vec<&str> = rest.split("--").filter(|h| !h.is_empty()).collect();
+    let others: Vec<&str> = handles
+        .iter()
+        .copied()
+        .filter(|h| me.is_none_or(|m| !h.eq_ignore_ascii_case(m)))
+        .collect();
+    // Everybody left out is not a label; a group of one is still a group.
+    let shown = if others.is_empty() { handles } else { others };
+    (!shown.is_empty()).then(|| shown.join(", "))
+}
+
 /// How the sidebar's options rearrange one section's conversations.
 ///
 /// Takes what each row is — its index, whether it has unread, whether it is
@@ -1311,6 +1338,27 @@ mod tests {
             channels: Vec::new(),
         }];
         assert_eq!(section_title("L3", &custom), "iOS", "and keeps its case");
+    }
+
+    #[test]
+    fn a_group_is_called_by_the_people_in_it() {
+        assert_eq!(
+            group_label("mpdm-alice--bob--petr-1", Some("petr")).as_deref(),
+            Some("alice, bob"),
+            "the person looking is left out, as in Slack's own client"
+        );
+        assert_eq!(
+            group_label("mpdm-alice--bob--petr-1", None).as_deref(),
+            Some("alice, bob, petr"),
+            "and kept when who is looking is not known yet"
+        );
+        // A handle with a dash in it survives: only `--` separates people.
+        assert_eq!(
+            group_label("mpdm-mary-jane--bob-2", Some("bob")).as_deref(),
+            Some("mary-jane")
+        );
+        assert_eq!(group_label("general", None), None, "not a group's name");
+        assert_eq!(group_label("mpdm-", None), None);
     }
 
     #[test]
