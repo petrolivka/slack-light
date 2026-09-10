@@ -1044,6 +1044,107 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// One draft, with what is known about its copy at Slack.
+    pub fn draft_row(
+        &self,
+        team: &TeamId,
+        ch: &ChannelId,
+        thread: Option<&Ts>,
+    ) -> Result<Option<DraftRow>> {
+        let t = thread.map(Ts::as_str).unwrap_or("");
+        Ok(self
+            .db
+            .query_row(
+                "SELECT channel, thread_ts, text, updated_at, remote_id, remote_ts FROM draft
+                 WHERE team = ?1 AND channel = ?2 AND thread_ts = ?3",
+                params![team.as_str(), ch.as_str(), t],
+                draft_row,
+            )
+            .optional()?)
+    }
+
+    /// Every draft this workspace has, for meeting them with Slack's.
+    pub fn drafts(&self, team: &TeamId) -> Result<Vec<DraftRow>> {
+        let mut q = self.db.prepare(
+            "SELECT channel, thread_ts, text, updated_at, remote_id, remote_ts FROM draft
+             WHERE team = ?1",
+        )?;
+        let rows = q.query_map(params![team.as_str()], draft_row)?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Record which of Slack's drafts this one now is.
+    ///
+    /// `updated_at` is set to Slack's own time for it. Right after a save the
+    /// row *is* an exact copy of Slack's, and that equality is how a later
+    /// sync tells "untouched since" from "edited here since" — which decides
+    /// whether a draft that vanished at Slack may be let go here.
+    pub fn set_draft_remote(
+        &self,
+        team: &TeamId,
+        ch: &ChannelId,
+        thread: Option<&Ts>,
+        remote_id: &str,
+        remote_ts: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        let t = thread.map(Ts::as_str).unwrap_or("");
+        self.db.execute(
+            "UPDATE draft SET remote_id = ?4, remote_ts = ?5, updated_at = ?6
+             WHERE team = ?1 AND channel = ?2 AND thread_ts = ?3",
+            params![
+                team.as_str(),
+                ch.as_str(),
+                t,
+                remote_id,
+                remote_ts,
+                updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Keep a draft that came from Slack, as an exact copy of it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_draft_synced(
+        &self,
+        team: &TeamId,
+        ch: &ChannelId,
+        thread: Option<&Ts>,
+        text: &str,
+        updated_at: i64,
+        remote_id: &str,
+        remote_ts: &str,
+    ) -> Result<()> {
+        let t = thread.map(Ts::as_str).unwrap_or("");
+        self.db.execute(
+            "INSERT INTO draft (team, channel, thread_ts, text, updated_at, remote_id, remote_ts)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(team, channel, thread_ts) DO UPDATE SET
+               text = excluded.text, updated_at = excluded.updated_at,
+               remote_id = excluded.remote_id, remote_ts = excluded.remote_ts",
+            params![
+                team.as_str(),
+                ch.as_str(),
+                t,
+                text,
+                updated_at,
+                remote_id,
+                remote_ts
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_draft(&self, team: &TeamId, ch: &ChannelId, thread: Option<&Ts>) -> Result<()> {
+        let t = thread.map(Ts::as_str).unwrap_or("");
+        self.db.execute(
+            "DELETE FROM draft WHERE team = ?1 AND channel = ?2 AND thread_ts = ?3",
+            params![team.as_str(), ch.as_str(), t],
+        )?;
+        Ok(())
+    }
+
     pub fn set_kv(&self, key: &str, value: &str) -> Result<()> {
         self.db.execute(
             "INSERT INTO kv (key, value) VALUES (?1, ?2)
@@ -1260,4 +1361,29 @@ fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// A draft as the store holds it, with its link to Slack's copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftRow {
+    pub channel: ChannelId,
+    pub thread: Option<Ts>,
+    pub text: String,
+    /// Unix seconds: local time for an edit made here, Slack's time for a
+    /// copy of Slack's.
+    pub updated_at: i64,
+    pub remote_id: Option<String>,
+    pub remote_ts: Option<String>,
+}
+
+fn draft_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DraftRow> {
+    let thread: String = r.get(1)?;
+    Ok(DraftRow {
+        channel: ChannelId::new(r.get::<_, String>(0)?),
+        thread: (!thread.is_empty()).then(|| Ts::new(thread)),
+        text: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        updated_at: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+        remote_id: r.get(4)?,
+        remote_ts: r.get(5)?,
+    })
 }

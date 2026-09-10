@@ -332,6 +332,31 @@ pub fn keyword_matches(keywords: &[String], text: &str) -> bool {
     })
 }
 
+/// The directory, as `slk_core::Names`, for turning a draft Slack holds back
+/// into what a composer holds: `@alice`, not `<@U0ALICE>`.
+struct DirNames {
+    users: std::collections::HashMap<String, String>,
+    channels: std::collections::HashMap<String, String>,
+}
+
+impl slk_core::Names for DirNames {
+    fn user(&self, id: &str) -> Option<&str> {
+        self.users.get(id).map(String::as_str)
+    }
+    fn channel(&self, id: &str) -> Option<&str> {
+        self.channels.get(id).map(String::as_str)
+    }
+}
+
+/// The whole seconds of a Slack timestamp, for comparing with the store's
+/// Unix-seconds `updated_at`.
+fn ts_secs(ts: &str) -> i64 {
+    ts.split('.')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 pub struct Engine {
     backend: Arc<dyn SlackBackend>,
     store: Store,
@@ -418,6 +443,9 @@ impl Engine {
         .await;
 
         self.boot().await;
+        // After boot rather than inside it, so the directory is loaded by the
+        // time a draft typed on the phone is turned back into words.
+        self.sync_drafts().await;
 
         // Ask for presence on the people whose dots are actually drawn: the
         // other side of every direct message.
@@ -523,6 +551,7 @@ impl Engine {
                             // not arrive as an event, so it has to be fetched.
                             self.fill_gaps().await;
                             self.refresh_sections().await;
+                            self.sync_drafts().await;
                         }
                         Err(e) => {
                             debug!("reconnect failed: {e}");
@@ -1502,12 +1531,22 @@ impl Engine {
                 thread,
                 text,
             } => {
+                // What was there before, read first: an emptied composer
+                // deletes the row, and the row is where Slack's id for the
+                // draft is kept.
+                let before = self
+                    .store
+                    .draft_row(&self.team, &channel, thread.as_ref())
+                    .ok()
+                    .flatten();
                 if let Err(e) = self
                     .store
                     .set_draft(&self.team, &channel, thread.as_ref(), &text)
                 {
                     warn!("keeping a draft: {e:#}");
                 }
+                self.push_draft(&channel, thread.as_ref(), &text, before)
+                    .await;
             }
 
             Command::SendTo { target, text } => {
@@ -1966,6 +2005,7 @@ impl Engine {
 
             Command::Refresh => {
                 self.boot().await;
+                self.sync_drafts().await;
             }
             Command::Shutdown => {}
         }
@@ -2034,6 +2074,234 @@ impl Engine {
         // that is nearly always the one already cached — the traffic shape
         // FR-Z1 exists to avoid. Once per conversation per ten minutes.
         self.refresh_bookmarks(&ch).await;
+    }
+
+    fn dir_names(&self) -> DirNames {
+        DirNames {
+            users: self
+                .store
+                .user_labels(&self.team)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|u| (u.id.as_str().to_string(), u.label))
+                .collect(),
+            channels: self
+                .store
+                .conversations(&self.team)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| (c.id.as_str().to_string(), c.name))
+                .collect(),
+        }
+    }
+
+    /// FR-M7's synced half: meet Slack's drafts with the ones kept here.
+    ///
+    /// Session route only, after boot and after every reconnect. For each
+    /// conversation the newer copy wins — Slack's `last_updated_ts` against
+    /// the local `updated_at`. A local draft Slack has never seen is sent up.
+    ///
+    /// A draft that has vanished at Slack was sent or thrown away on another
+    /// device, and goes here too — but only if the copy here is still exactly
+    /// what Slack last held. One edited here since is kept and sent up as a
+    /// new draft. The difference matters because an empty list is also what
+    /// a `drafts.list` whose shape changed parses to, and a rule that deleted
+    /// on absence alone would turn one undocumented change into every synced
+    /// draft lost. As it is, the worst a changed shape can do is drop copies
+    /// of drafts that are still at Slack, and the next good sync restores them.
+    ///
+    /// The composer is never touched from here. What changes is the store,
+    /// and the window's own rule does the rest: a draft goes into a composer
+    /// only when that composer is empty.
+    async fn sync_drafts(&mut self) {
+        if !self.backend.capabilities().drafts {
+            return;
+        }
+        let remote = match self.backend.drafts().await {
+            Ok(all) => all,
+            Err(e) => {
+                debug!("drafts: {e}");
+                return;
+            }
+        };
+        let known: std::collections::HashSet<String> = self
+            .store
+            .conversations(&self.team)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.id.as_str().to_string())
+            .collect();
+        let names = self.dir_names();
+
+        for r in &remote {
+            // For a conversation this client does not hold — left, archived —
+            // there is no composer for it to go into.
+            if !known.contains(r.channel.as_str()) {
+                continue;
+            }
+            let local = self
+                .store
+                .draft_row(&self.team, &r.channel, r.thread.as_ref())
+                .ok()
+                .flatten();
+            let theirs = ts_secs(r.updated.as_str());
+            match local {
+                // Ours is newer — typed here, perhaps offline. Up it goes, over
+                // their copy rather than beside it.
+                Some(l) if l.updated_at > theirs => {
+                    self.push_saved(
+                        &r.channel,
+                        r.thread.as_ref(),
+                        &l.text,
+                        Some(&r.id),
+                        Some(&r.updated),
+                    )
+                    .await;
+                }
+                // The same draft, unchanged since the last time.
+                Some(l)
+                    if l.remote_id.as_deref() == Some(r.id.as_str())
+                        && l.remote_ts.as_deref() == Some(r.updated.as_str()) => {}
+                _ => {
+                    let text = r.doc.plain_with(&names);
+                    if let Err(e) = self.store.set_draft_synced(
+                        &self.team,
+                        &r.channel,
+                        r.thread.as_ref(),
+                        &text,
+                        theirs,
+                        &r.id,
+                        r.updated.as_str(),
+                    ) {
+                        warn!("keeping a synced draft: {e:#}");
+                        continue;
+                    }
+                    if self.focused.as_ref() == Some(&r.channel) && r.thread.is_none() {
+                        self.emit(Event::Draft {
+                            channel: r.channel.clone(),
+                            thread: None,
+                            text,
+                        })
+                        .await;
+                    }
+                }
+            }
+        }
+
+        for l in self.store.drafts(&self.team).unwrap_or_default() {
+            let at_slack =
+                |r: &slk_api::backend::RemoteDraft| r.channel == l.channel && r.thread == l.thread;
+            match &l.remote_id {
+                Some(id) if !remote.iter().any(|r| &r.id == id) => {
+                    let untouched = l
+                        .remote_ts
+                        .as_deref()
+                        .is_some_and(|ts| ts_secs(ts) == l.updated_at);
+                    if untouched {
+                        let _ = self
+                            .store
+                            .delete_draft(&self.team, &l.channel, l.thread.as_ref());
+                    } else {
+                        self.push_saved(&l.channel, l.thread.as_ref(), &l.text, None, None)
+                            .await;
+                    }
+                }
+                None if !remote.iter().any(at_slack) => {
+                    self.push_saved(&l.channel, l.thread.as_ref(), &l.text, None, None)
+                        .await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Tell Slack what is in a composer that was just left.
+    ///
+    /// Only when it changed. The window sends `SetDraft` on every
+    /// conversation switch, and a request per switch for a draft nobody
+    /// touched would be a request per click — the traffic shape FR-Z1 exists
+    /// to avoid.
+    async fn push_draft(
+        &mut self,
+        ch: &ChannelId,
+        thread: Option<&Ts>,
+        text: &str,
+        before: Option<slk_store::DraftRow>,
+    ) {
+        if !self.backend.capabilities().drafts {
+            return;
+        }
+        let empty = text.trim().is_empty();
+        match before {
+            None if empty => {}
+            Some(b) if empty => {
+                if let Some(id) = &b.remote_id {
+                    let last = b.remote_ts.as_deref().map(Ts::new);
+                    if let Err(e) = self.backend.delete_draft(id, last.as_ref()).await {
+                        debug!("draft not deleted at Slack: {e}");
+                    }
+                }
+            }
+            Some(b) if b.text == text && b.remote_id.is_some() => {}
+            b => {
+                let id = b.as_ref().and_then(|b| b.remote_id.clone());
+                let last = b.as_ref().and_then(|b| b.remote_ts.as_deref()).map(Ts::new);
+                self.push_saved(ch, thread, text, id.as_deref(), last.as_ref())
+                    .await;
+            }
+        }
+    }
+
+    /// Save a draft at Slack, and remember which one it is.
+    ///
+    /// An update to a draft that has gone in the meantime — finished on the
+    /// phone a moment ago — becomes a new draft rather than losing the words.
+    /// A refusal (read-only) or a network failure is logged and nothing more:
+    /// the draft is kept here either way, which is the half that matters.
+    async fn push_saved(
+        &mut self,
+        ch: &ChannelId,
+        thread: Option<&Ts>,
+        text: &str,
+        id: Option<&str>,
+        last: Option<&Ts>,
+    ) {
+        let mut res = self.backend.save_draft(id, ch, thread, text, last).await;
+        if id.is_some() && matches!(&res, Err(e) if e.kind == slk_api::ErrorKind::NotFound) {
+            res = self.backend.save_draft(None, ch, thread, text, None).await;
+        }
+        match res {
+            Ok((id, ts)) => {
+                if let Err(e) = self.store.set_draft_remote(
+                    &self.team,
+                    ch,
+                    thread,
+                    &id,
+                    ts.as_str(),
+                    ts_secs(ts.as_str()),
+                ) {
+                    warn!("recording a synced draft: {e:#}");
+                }
+            }
+            Err(e) => debug!("draft not synced: {e}"),
+        }
+    }
+
+    /// A message went, so the draft it was is finished — here and at Slack.
+    async fn clear_draft(&mut self, ch: &ChannelId, thread: Option<&Ts>) {
+        let Some(row) = self.store.draft_row(&self.team, ch, thread).ok().flatten() else {
+            return;
+        };
+        let _ = self.store.delete_draft(&self.team, ch, thread);
+        if !self.backend.capabilities().drafts {
+            return;
+        }
+        if let Some(id) = row.remote_id {
+            let last = row.remote_ts.as_deref().map(Ts::new);
+            if let Err(e) = self.backend.delete_draft(&id, last.as_ref()).await {
+                debug!("draft not deleted at Slack: {e}");
+            }
+        }
     }
 
     /// Ask Slack how the person has arranged their sidebar.
@@ -2198,6 +2466,10 @@ impl Engine {
             .await
         {
             Ok(ts) => {
+                // The draft became this message, here and on every other
+                // device. A draft that outlives what it turned into shows up
+                // on the phone as words already sent.
+                self.clear_draft(&channel, thread.as_ref()).await;
                 let raw = serde_json::json!({
                     "type": "message",
                     "user": self.self_id.as_str(),

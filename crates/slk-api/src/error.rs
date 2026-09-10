@@ -43,7 +43,8 @@ impl SlackError {
             "invalid_auth" | "not_authed" | "token_revoked" | "account_inactive"
             | "token_expired" => ErrorKind::Auth,
             "ratelimited" | "rate_limited" => ErrorKind::RateLimited { retry_after: 30 },
-            "channel_not_found" | "user_not_found" | "message_not_found" | "thread_not_found" => {
+            "channel_not_found" | "user_not_found" | "message_not_found" | "thread_not_found"
+            | "draft_not_found" => {
                 ErrorKind::NotFound
             }
             "not_in_channel"

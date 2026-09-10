@@ -107,6 +107,10 @@ impl SlackBackend for ReadOnly {
     async fn sections(&self) -> Result<Vec<SidebarSection>> {
         self.inner.sections().await
     }
+    /// Reading what somebody typed on their phone is reading.
+    async fn drafts(&self) -> Result<Vec<RemoteDraft>> {
+        self.inner.drafts().await
+    }
     /// To local disk, not to the account: this is how an image gets drawn.
     async fn download(&self, url: &str, to: &std::path::Path) -> Result<u64> {
         self.inner.download(url, to).await
@@ -176,6 +180,21 @@ impl SlackBackend for ReadOnly {
     }
     async fn pin(&self, _ch: &ChannelId, _ts: &Ts, _on: bool) -> Result<()> {
         Self::refuse("pins")
+    }
+    /// A draft is somebody's words on every device they own. Saving one at
+    /// Slack changes what their phone shows.
+    async fn save_draft(
+        &self,
+        _id: Option<&str>,
+        _ch: &ChannelId,
+        _thread: Option<&Ts>,
+        _text: &str,
+        _last: Option<&Ts>,
+    ) -> Result<(String, Ts)> {
+        Self::refuse("drafts.create")
+    }
+    async fn delete_draft(&self, _id: &str, _last: Option<&Ts>) -> Result<()> {
+        Self::refuse("drafts.delete")
     }
     /// Telling a room you are typing is telling the room something.
     async fn typing(&self, _ch: &ChannelId) -> Result<()> {

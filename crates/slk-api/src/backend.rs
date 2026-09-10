@@ -5,7 +5,7 @@
 //! the UI finds that out, so it can disable an action visibly instead of
 //! offering something that will fail.
 
-use crate::error::Result;
+use crate::error::{ErrorKind, Result, SlackError};
 use async_trait::async_trait;
 use slk_core::{
     Bookmark, ChannelId, Conversation, FileId, Message, SidebarSection, TeamId, Ts, User, UserId,
@@ -151,6 +151,23 @@ pub struct FileHit {
     pub channel: Option<ChannelId>,
     pub channel_name: String,
     pub user: Option<UserId>,
+}
+
+/// A draft as Slack holds it, for the one conversation it is meant for.
+///
+/// `doc` rather than text: Slack keeps a draft as rich_text blocks, the same
+/// shape a message's body arrives in, and turning that into what a composer
+/// holds needs the directory — `@alice`, not `<@U0ALICE>` — which the engine
+/// has and a backend does not.
+#[derive(Debug, Clone)]
+pub struct RemoteDraft {
+    pub id: String,
+    pub channel: ChannelId,
+    pub thread: Option<Ts>,
+    pub doc: slk_core::Doc,
+    /// Slack's `last_updated_ts`. Newer-wins is decided on it, and an update
+    /// quotes it back.
+    pub updated: Ts,
 }
 
 /// One page of history, with the cursor to continue from.
@@ -395,6 +412,39 @@ pub trait SlackBackend: Send + Sync {
     /// a beat after the first frame is a sidebar people misclick in.
     async fn sections(&self) -> Result<Vec<SidebarSection>> {
         Ok(Vec::new())
+    }
+
+    /// The drafts Slack holds for this person, from every device.
+    ///
+    /// Session route only — `drafts.*` refuses an app token — so the default
+    /// is none, and the sync that reads it never runs on the official route.
+    async fn drafts(&self) -> Result<Vec<RemoteDraft>> {
+        Ok(Vec::new())
+    }
+
+    /// Create a draft, or update the one with this id. Returns its id and
+    /// Slack's new `last_updated_ts`, which the next update quotes back.
+    async fn save_draft(
+        &self,
+        _id: Option<&str>,
+        _ch: &ChannelId,
+        _thread: Option<&Ts>,
+        _text: &str,
+        _last: Option<&Ts>,
+    ) -> Result<(String, Ts)> {
+        Err(SlackError::new(
+            "drafts.create",
+            ErrorKind::Permission,
+            "drafts are not synced on this route",
+        ))
+    }
+
+    async fn delete_draft(&self, _id: &str, _last: Option<&Ts>) -> Result<()> {
+        Err(SlackError::new(
+            "drafts.delete",
+            ErrorKind::Permission,
+            "drafts are not synced on this route",
+        ))
     }
 
     /// What is bookmarked on this conversation's bar.

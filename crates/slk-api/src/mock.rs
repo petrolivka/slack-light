@@ -62,6 +62,11 @@ pub struct MockBackend {
     /// it and re-asks rarely, and "rarely" is only a claim until something
     /// counts.
     bookmark_calls: std::sync::atomic::AtomicUsize,
+    /// What Slack holds as drafts for this person, from every device.
+    drafts: Mutex<Vec<RemoteDraft>>,
+    /// How many times a draft has been saved here. The engine only sends one
+    /// when the words changed, and "only" is a claim until something counts.
+    draft_saves: std::sync::atomic::AtomicUsize,
 }
 
 impl MockBackend {
@@ -85,6 +90,8 @@ impl MockBackend {
             }
         }
         me.messages.lock().unwrap().clear();
+        // The phone typed into the first workspace, not both.
+        me.drafts.lock().unwrap().clear();
         me
     }
 
@@ -103,6 +110,8 @@ impl MockBackend {
             unreachable: std::sync::atomic::AtomicBool::new(false),
             marked: Mutex::new(Vec::new()),
             bookmark_calls: std::sync::atomic::AtomicUsize::new(0),
+            drafts: Mutex::new(Self::phone_drafts(team_id)),
+            draft_saves: std::sync::atomic::AtomicUsize::new(0),
             users: Vec::new(),
             messages: Mutex::new(HashMap::new()),
             uploaded: Mutex::new(HashMap::new()),
@@ -111,6 +120,46 @@ impl MockBackend {
         };
         me.seed();
         me
+    }
+
+    /// Drafts "typed on the phone": one for #general, and one for a
+    /// conversation this workspace does not hold. Real drafts lists carry
+    /// the second kind — a channel since left or archived — and a mock whose
+    /// drafts were all for conversations it holds would never run the code
+    /// that has to skip them.
+    fn phone_drafts(team_id: &str) -> Vec<RemoteDraft> {
+        let tail = &team_id[1..2];
+        let words = |t: &str| {
+            slk_core::richtext::parse_block(&json!({"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [{"type": "text", "text": t}]}
+            ]}))
+        };
+        vec![
+            RemoteDraft {
+                id: "Dr0PHONE".into(),
+                channel: ChannelId::new(format!("C0GEN{tail}")),
+                thread: None,
+                doc: words("half a thought from the phone"),
+                updated: Ts::new("1725701000.000100"),
+            },
+            RemoteDraft {
+                id: "Dr0GONE".into(),
+                channel: ChannelId::new("C0GONE"),
+                thread: None,
+                doc: words("to a channel long since left"),
+                updated: Ts::new("1725701000.000200"),
+            },
+        ]
+    }
+
+    /// What Slack holds as drafts, for tests to look at.
+    pub fn remote_drafts(&self) -> Vec<RemoteDraft> {
+        self.drafts.lock().unwrap().clone()
+    }
+
+    /// How many times a draft has been saved on this backend.
+    pub fn draft_saves(&self) -> usize {
+        self.draft_saves.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// How many times `bookmarks` has been called on this backend.
@@ -903,6 +952,65 @@ impl SlackBackend for MockBackend {
         self.typed.lock().unwrap().push(ch.clone());
         Ok(())
     }
+    async fn drafts(&self) -> Result<Vec<RemoteDraft>> {
+        Ok(self.drafts.lock().unwrap().clone())
+    }
+
+    async fn save_draft(
+        &self,
+        id: Option<&str>,
+        ch: &ChannelId,
+        thread: Option<&Ts>,
+        text: &str,
+        _last: Option<&Ts>,
+    ) -> Result<(String, Ts)> {
+        let n = self
+            .draft_saves
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let updated = Ts::new(format!("{secs}.{n:06}"));
+        let doc = slk_core::richtext::parse_block(&json!({"type": "rich_text", "elements": [
+            {"type": "rich_text_section", "elements": [{"type": "text", "text": text}]}
+        ]}));
+        let mut all = self.drafts.lock().unwrap();
+        match id {
+            Some(id) => match all.iter_mut().find(|d| d.id == id) {
+                Some(d) => {
+                    d.doc = doc;
+                    d.updated = updated.clone();
+                    Ok((id.to_string(), updated))
+                }
+                // Finished or thrown away on another device in the
+                // meantime, which is what Slack answers too.
+                None => Err(SlackError::new(
+                    "drafts.update",
+                    ErrorKind::NotFound,
+                    "draft_not_found",
+                )),
+            },
+            None => {
+                let id = format!("Dr0NEW{n}");
+                all.push(RemoteDraft {
+                    id: id.clone(),
+                    channel: ch.clone(),
+                    thread: thread.cloned(),
+                    doc,
+                    updated: updated.clone(),
+                });
+                Ok((id, updated))
+            }
+        }
+    }
+
+    async fn delete_draft(&self, id: &str, _last: Option<&Ts>) -> Result<()> {
+        self.drafts.lock().unwrap().retain(|d| d.id != id);
+        Ok(())
+    }
+
     /// One custom section, "Projects", holding `#design` — and a channel
     /// this workspace does not have.
     ///

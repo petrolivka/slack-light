@@ -1108,6 +1108,101 @@ impl SlackBackend for WebBackend {
             .unwrap_or_default())
     }
 
+    async fn drafts(&self) -> Result<Vec<RemoteDraft>> {
+        if self.creds.route() == Route::OAuth {
+            return Ok(Vec::new());
+        }
+        let v = self.call("drafts.list", &[]).await?;
+        Ok(parse_drafts(&v))
+    }
+
+    async fn save_draft(
+        &self,
+        id: Option<&str>,
+        ch: &ChannelId,
+        thread: Option<&Ts>,
+        text: &str,
+        last: Option<&Ts>,
+    ) -> Result<(String, Ts)> {
+        if self.creds.route() == Route::OAuth {
+            return Err(Self::unsupported("drafts.create"));
+        }
+        let blocks = draft_blocks(text).to_string();
+        let mut dest = serde_json::json!({ "channel_id": ch.as_str() });
+        if let Some(t) = thread {
+            dest["thread_ts"] = serde_json::json!(t.as_str());
+        }
+        let destinations = serde_json::json!([dest]).to_string();
+        let v = match id {
+            Some(id) => {
+                let last = last.map(Ts::as_str).unwrap_or("");
+                self.call(
+                    "drafts.update",
+                    &[
+                        ("draft_id", id),
+                        ("client_last_updated_ts", last),
+                        ("blocks", &blocks),
+                        ("destinations", &destinations),
+                        ("file_ids", "[]"),
+                    ],
+                )
+                .await?
+            }
+            None => {
+                let msg_id = client_msg_id();
+                self.call(
+                    "drafts.create",
+                    &[
+                        ("client_msg_id", &msg_id),
+                        ("blocks", &blocks),
+                        ("destinations", &destinations),
+                        ("file_ids", "[]"),
+                        ("is_from_composer", "false"),
+                    ],
+                )
+                .await?
+            }
+        };
+        let d = v.get("draft");
+        let new_id = d
+            .and_then(|d| d.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| id.map(str::to_string));
+        let ts = d
+            .and_then(|d| d.get("last_updated_ts"))
+            .and_then(Value::as_str)
+            .map(Ts::new);
+        match (new_id, ts) {
+            (Some(i), Some(t)) => Ok((i, t)),
+            _ => Err(SlackError::new(
+                "drafts",
+                ErrorKind::Shape,
+                "no draft object",
+            )),
+        }
+    }
+
+    async fn delete_draft(&self, id: &str, last: Option<&Ts>) -> Result<()> {
+        if self.creds.route() == Route::OAuth {
+            return Err(Self::unsupported("drafts.delete"));
+        }
+        let last = last.map(Ts::as_str).unwrap_or("");
+        match self
+            .call(
+                "drafts.delete",
+                &[("draft_id", id), ("client_last_updated_ts", last)],
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Gone already — finished on another device, which is the state
+            // that was asked for.
+            Err(e) if e.kind == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn sections(&self) -> Result<Vec<SidebarSection>> {
         // Not a public method, and asking would cost a request to be told
         // so. The official route's sidebar is the built-in one.
@@ -1557,6 +1652,96 @@ fn parse_sections(v: &Value) -> Vec<SidebarSection> {
     out
 }
 
+/// What a composer holds, as the one rich_text block Slack keeps a draft in.
+///
+/// One text element, verbatim. `@alice` stays the words `@alice` rather than
+/// becoming a mention: resolving it is what *sending* does, through the same
+/// encoder every message goes through, and a draft is somewhere to keep words,
+/// not to send them. Slack's own client shows it as the words typed.
+fn draft_blocks(text: &str) -> Value {
+    serde_json::json!([{
+        "type": "rich_text",
+        "elements": [{
+            "type": "rich_text_section",
+            "elements": [{ "type": "text", "text": text }]
+        }]
+    }])
+}
+
+/// A fresh `client_msg_id`, in the UUID shape Slack's own client sends.
+/// Unique rather than random — nanoseconds and a counter — which is all an
+/// id for a draft has to be.
+fn client_msg_id() -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = u128::from(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let h = format!("{:032x}", nanos ^ (n << 64));
+    format!(
+        "{}-{}-4{}-a{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[13..16],
+        &h[17..20],
+        &h[20..32]
+    )
+}
+
+/// The drafts in a `drafts.list` answer that belong in a composer.
+///
+/// Not the deleted, not the sent, not the scheduled — Slack keeps a
+/// scheduled message in the same list, and it is not a composer's contents.
+/// Only a draft with exactly one destination: one addressed to several
+/// conversations has no single composer to go back into. And only one with
+/// words in it — a draft that is only an attached file has nothing a
+/// composer can hold.
+///
+/// Undocumented and never captured from `slk-dev`: every accessor is an
+/// `Option`, and a draft this cannot read is skipped, never fatal.
+fn parse_drafts(v: &Value) -> Vec<RemoteDraft> {
+    let Some(all) = v.get("drafts").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    all.iter()
+        .filter_map(|d| {
+            let flag = |k: &str| d.get(k).and_then(Value::as_bool).unwrap_or(false);
+            if flag("is_deleted") || flag("is_sent") {
+                return None;
+            }
+            if d.get("date_scheduled").and_then(Value::as_i64).unwrap_or(0) > 0 {
+                return None;
+            }
+            let [dest] = d.get("destinations")?.as_array()?.as_slice() else {
+                return None;
+            };
+            let channel = ChannelId::new(dest.get("channel_id")?.as_str()?);
+            let thread = dest
+                .get("thread_ts")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(Ts::new);
+            let block = d
+                .get("blocks")?
+                .as_array()?
+                .iter()
+                .find(|b| b.get("type").and_then(Value::as_str) == Some("rich_text"))?;
+            let doc = slk_core::richtext::parse_block(block);
+            if doc.is_empty() {
+                return None;
+            }
+            Some(RemoteDraft {
+                id: d.get("id")?.as_str()?.to_string(),
+                channel,
+                thread,
+                doc,
+                updated: Ts::new(d.get("last_updated_ts")?.as_str()?),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1654,5 +1839,63 @@ mod tests {
             let v: Value = serde_json::from_str(text).unwrap();
             assert!(parse_sections(&v).is_empty());
         }
+    }
+
+    #[test]
+    fn only_drafts_with_one_home_and_words_in_them() {
+        use serde_json::json;
+        let words = |t: &str| {
+            json!([{"type":"rich_text","elements":[
+                {"type":"rich_text_section","elements":[{"type":"text","text":t}]}]}])
+        };
+        let draft = |id: &str, extra: Value| {
+            let mut o = json!({
+                "id": id,
+                "last_updated_ts": "1725700000.000100",
+                "destinations": [{"channel_id": "C1"}],
+                "blocks": words("words"),
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                o[k.as_str()] = v.clone();
+            }
+            o
+        };
+        let v = json!({"ok": true, "drafts": [
+            draft("Dr1", json!({"blocks": words("half a thought")})),
+            draft("Dr2", json!({"destinations": [{"channel_id": "C1", "thread_ts": "1725600000.000100"}]})),
+            draft("Dr3", json!({"is_sent": true})),
+            draft("Dr4", json!({"is_deleted": true})),
+            draft("Dr5", json!({"date_scheduled": 1999999999})),
+            draft("Dr6", json!({"destinations": [{"channel_id": "C1"}, {"channel_id": "C2"}]})),
+            draft("Dr7", json!({"destinations": []})),
+            draft("Dr8", json!({"blocks": [], "file_ids": ["F1"]})),
+        ]});
+        let got = parse_drafts(&v);
+        let ids: Vec<&str> = got.iter().map(|d| d.id.as_str()).collect();
+        // The ids, not "Dr1 is in there": a filter letting a sent draft
+        // through still passes a test that only looks for the one it wanted.
+        assert_eq!(ids, ["Dr1", "Dr2"]);
+        assert_eq!(got[0].doc.plain(), "half a thought");
+        assert_eq!(got[0].thread, None);
+        assert_eq!(
+            got[1].thread.as_ref().map(|t| t.as_str()),
+            Some("1725600000.000100")
+        );
+    }
+
+    #[test]
+    fn a_draft_is_kept_as_the_words_typed() {
+        let text = "for @alice: <soon> & *now*";
+        let b = draft_blocks(text);
+        assert_eq!(slk_core::richtext::parse_block(&b[0]).plain(), text);
+    }
+
+    #[test]
+    fn client_msg_ids_are_uuid_shaped_and_distinct() {
+        let (a, b) = (client_msg_id(), client_msg_id());
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36);
+        assert_eq!(a.matches('-').count(), 4);
+        assert_eq!(&a[14..15], "4", "the version nibble");
     }
 }

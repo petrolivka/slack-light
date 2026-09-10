@@ -6,7 +6,7 @@
 //! undocumented shape, the fix is a migration over data we already hold rather
 //! than a re-fetch of everyone's history.
 
-pub const VERSION: i64 = 5;
+pub const VERSION: i64 = 6;
 
 /// Steps from an older store to the current one, applied in order.
 ///
@@ -35,6 +35,11 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         "CREATE TABLE IF NOT EXISTS section (team TEXT, id TEXT, name TEXT, emoji TEXT,
                                              kind TEXT, pos INTEGER, channels TEXT,
                                              PRIMARY KEY (team, id));",
+    ),
+    (
+        6,
+        "ALTER TABLE draft ADD COLUMN remote_id TEXT;
+         ALTER TABLE draft ADD COLUMN remote_ts TEXT;",
     ),
 ];
 
@@ -73,6 +78,10 @@ CREATE TABLE history_span (team TEXT, channel TEXT, oldest TEXT, newest TEXT,
 
 CREATE TABLE draft (team TEXT, channel TEXT, thread_ts TEXT NOT NULL DEFAULT '',
                     text TEXT, updated_at INTEGER,
+                    -- Which of Slack's drafts this is, and Slack's timestamp for
+                    -- it when this row last matched it. Empty for a draft Slack
+                    -- has never seen.
+                    remote_id TEXT, remote_ts TEXT,
                     PRIMARY KEY (team, channel, thread_ts));
 
 -- A conversation's bookmark bar, cached so it is on screen with the first
