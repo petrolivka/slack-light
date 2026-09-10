@@ -14,7 +14,10 @@ mod schema;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use slk_core::{Bookmark, ChannelId, Conversation, Delivery, Message, TeamId, Ts, User, UserId};
+use slk_core::{
+    Bookmark, ChannelId, Conversation, Delivery, Message, SectionKind, SidebarSection, TeamId, Ts,
+    User, UserId,
+};
 use std::path::Path;
 
 pub struct Store {
@@ -179,6 +182,7 @@ impl Store {
                 "draft",
                 "outbox",
                 "bookmark",
+                "section",
             ] {
                 gone += self.db.execute(
                     &format!("DELETE FROM {table} WHERE team = ?1"),
@@ -964,6 +968,77 @@ impl Store {
                 title: r.get(1)?,
                 link: r.get(2)?,
                 emoji: r.get(3)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Replace this workspace's sidebar sections with what Slack just said.
+    ///
+    /// Replace, for the same reason as the bookmark bar: a section somebody
+    /// deleted on their phone has to leave this sidebar too.
+    pub fn set_sections(&self, team: &TeamId, all: &[SidebarSection]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM section WHERE team = ?1",
+            params![team.as_str()],
+        )?;
+        for (i, s) in all.iter().enumerate() {
+            let kind = match s.kind {
+                SectionKind::Custom => "custom",
+                SectionKind::Starred => "starred",
+                SectionKind::Channels => "channels",
+                SectionKind::Dms => "dms",
+                SectionKind::Other => "other",
+            };
+            let channels = s
+                .channels
+                .iter()
+                .map(ChannelId::as_str)
+                .collect::<Vec<_>>()
+                .join(",");
+            tx.execute(
+                "INSERT OR REPLACE INTO section (team, id, name, emoji, kind, pos, channels)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    team.as_str(),
+                    s.id,
+                    s.name,
+                    s.emoji,
+                    kind,
+                    i as i64,
+                    channels
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn sections(&self, team: &TeamId) -> Result<Vec<SidebarSection>> {
+        let mut q = self.db.prepare(
+            "SELECT id, name, emoji, kind, channels FROM section
+             WHERE team = ?1 ORDER BY pos",
+        )?;
+        let rows = q.query_map(params![team.as_str()], |r| {
+            let kind: String = r.get(3)?;
+            let channels: String = r.get(4)?;
+            Ok(SidebarSection {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                emoji: r.get(2)?,
+                kind: match kind.as_str() {
+                    "custom" => SectionKind::Custom,
+                    "starred" => SectionKind::Starred,
+                    "channels" => SectionKind::Channels,
+                    "dms" => SectionKind::Dms,
+                    _ => SectionKind::Other,
+                },
+                channels: channels
+                    .split(',')
+                    .filter(|c| !c.is_empty())
+                    .map(ChannelId::new)
+                    .collect(),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())

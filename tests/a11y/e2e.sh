@@ -403,13 +403,13 @@ dead=$(grep '^binding=' "$LOG" | grep -cE '=<[^>]*Shift>[A-Za-z]( |$)' || true)
 check "no binding is shift plus a letter" "$( [ "$dead" = 0 ] && echo 1 || echo 0 )" "$dead such bindings"
 # Two are GTK's own (pane focus cycling). The rest are keyless on purpose:
 # topic, purpose, invite and leave are rare and not undone by pressing the
-# same key again; status, dnd, forward and view-source want a word or a
+# same key again, and so are create, rename, archive and starting a group; status, dnd, forward and view-source want a word or a
 # target; unread-first and hide-read are settings. All of them are reached
 # by name from the palette. Anything *else* without a key is an action
 # nobody can run, which is what this counts.
 unbound=$(grep '^binding=' "$LOG" | grep 'no free key' \
-          | grep -cvE '^binding=(focus_next|focus_prev|set_topic|set_purpose|invite|leave_channel|status|dnd|unread_first|hide_read|forward_message|view_source)=' || true)
-check "every action without a key is one that was meant to have none" "$( [ "$unbound" = 0 ] && echo 1 || echo 0 )" "$unbound unexpected: $(grep '^binding=' "$LOG" | grep 'no free key' | grep -vE '^binding=(focus_next|focus_prev|set_topic|set_purpose|invite|leave_channel|status|dnd|unread_first|hide_read|forward_message|view_source)=' | tr '\n' ' ')"
+          | grep -cvE '^binding=(focus_next|focus_prev|set_topic|set_purpose|invite|leave_channel|create_channel|rename_channel|archive_channel|create_group|status|dnd|unread_first|hide_read|forward_message|view_source)=' || true)
+check "every action without a key is one that was meant to have none" "$( [ "$unbound" = 0 ] && echo 1 || echo 0 )" "$unbound unexpected: $(grep '^binding=' "$LOG" | grep 'no free key' | grep -vE '^binding=(focus_next|focus_prev|set_topic|set_purpose|invite|leave_channel|create_channel|rename_channel|archive_channel|create_group|status|dnd|unread_first|hide_read|forward_message|view_source)=' | tr '\n' ' ')"
 
 echo "--- bindings installed ---"; grep '^binding=' "$LOG" | sed 's/^binding=/  /'
 echo; echo "$pass passed, $fail failed"

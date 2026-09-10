@@ -25,7 +25,8 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use slk_core::{
-    Bookmark, ChannelId, Conversation, FileId, Message, TeamId, Ts, User, UserId, Workspace,
+    Bookmark, ChannelId, Conversation, FileId, Message, SectionKind, SidebarSection, TeamId, Ts,
+    User, UserId, Workspace,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -1107,6 +1108,16 @@ impl SlackBackend for WebBackend {
             .unwrap_or_default())
     }
 
+    async fn sections(&self) -> Result<Vec<SidebarSection>> {
+        // Not a public method, and asking would cost a request to be told
+        // so. The official route's sidebar is the built-in one.
+        if self.creds.route() == Route::OAuth {
+            return Ok(Vec::new());
+        }
+        let v = self.call("users.channelSections.list", &[]).await?;
+        Ok(parse_sections(&v))
+    }
+
     async fn bookmarks(&self, ch: &ChannelId) -> Result<Vec<Bookmark>> {
         let v = self
             .call("bookmarks.list", &[("channel_id", ch.as_str())])
@@ -1458,6 +1469,94 @@ fn parse_bookmarks(v: &Value) -> Vec<Bookmark> {
         .unwrap_or_default()
 }
 
+/// The sections in a `users.channelSections.list` answer, in the order the
+/// person sees them.
+///
+/// Slack does not send them in order. Each section names the one after it in
+/// `next_channel_section_id`, and the first is the one nobody names. The
+/// chain is followed from there; if it is broken — no head, a loop, a name
+/// that points nowhere — what the chain did not reach is appended in array
+/// order, so a malformed answer costs the order and never a section.
+///
+/// Undocumented, and never captured from `slk-dev`: every accessor is an
+/// `Option`, a section with no id is dropped, and a type this client has not
+/// seen is `Other` rather than a failure.
+fn parse_sections(v: &Value) -> Vec<SidebarSection> {
+    let Some(raw) = v.get("channel_sections").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut all: Vec<(SidebarSection, Option<String>)> = raw
+        .iter()
+        .filter_map(|x| {
+            let id = x.get("channel_section_id")?.as_str()?.to_string();
+            let kind = match x.get("type").and_then(Value::as_str) {
+                Some("standard") => SectionKind::Custom,
+                Some("stars") => SectionKind::Starred,
+                Some("channels") => SectionKind::Channels,
+                Some("direct_messages") => SectionKind::Dms,
+                _ => SectionKind::Other,
+            };
+            let channels = x
+                .get("channel_ids_page")
+                .and_then(|p| p.get("channel_ids"))
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|c| c.as_str().map(ChannelId::new))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let next = x
+                .get("next_channel_section_id")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())
+                .map(str::to_string);
+            Some((
+                SidebarSection {
+                    id,
+                    name: x
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    emoji: x
+                        .get("emoji")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim_matches(':')
+                        .to_string(),
+                    kind,
+                    channels,
+                },
+                next,
+            ))
+        })
+        .collect();
+
+    let named: std::collections::HashSet<String> =
+        all.iter().filter_map(|(_, n)| n.clone()).collect();
+    let mut out: Vec<SidebarSection> = Vec::with_capacity(all.len());
+    let mut at = all.iter().position(|(s, _)| !named.contains(&s.id));
+    // Bounded by the count: a loop in the chain ends the walk rather than
+    // the client.
+    while let Some(i) = at {
+        if out.len() >= all.len() || out.iter().any(|s| s.id == all[i].0.id) {
+            break;
+        }
+        out.push(all[i].0.clone());
+        at = all[i]
+            .1
+            .as_ref()
+            .and_then(|n| all.iter().position(|(s, _)| &s.id == n));
+    }
+    for (s, _) in all.drain(..) {
+        if !out.iter().any(|o| o.id == s.id) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1501,6 +1600,59 @@ mod tests {
         for text in [r#"{"ok":true}"#, r#"{"ok":true,"bookmarks":"soon"}"#] {
             let v: Value = serde_json::from_str(text).unwrap();
             assert!(parse_bookmarks(&v).is_empty());
+        }
+    }
+
+    #[test]
+    fn sections_are_in_the_order_the_chain_says_not_the_array() {
+        // Slack sends them in whatever order; the chain is the truth.
+        let v: Value = serde_json::from_str(
+            r#"{"ok":true,"channel_sections":[
+              {"channel_section_id":"L3","type":"direct_messages","name":"","next_channel_section_id":null},
+              {"channel_section_id":"L1","type":"stars","name":"","next_channel_section_id":"L2"},
+              {"channel_section_id":"L2","type":"standard","name":"Projects","emoji":":rocket:",
+               "next_channel_section_id":"L4",
+               "channel_ids_page":{"channel_ids":["C1","C2"],"count":2,"cursor":null}},
+              {"channel_section_id":"L4","type":"channels","name":"","next_channel_section_id":"L3"}
+            ]}"#,
+        )
+        .unwrap();
+        let got = parse_sections(&v);
+        let ids: Vec<&str> = got.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["L1", "L2", "L4", "L3"]);
+        assert_eq!(got[1].kind, SectionKind::Custom);
+        assert_eq!(got[1].name, "Projects");
+        assert_eq!(got[1].emoji, "rocket", "colons trimmed once, here");
+        assert_eq!(got[1].channels.len(), 2);
+    }
+
+    #[test]
+    fn a_broken_chain_costs_the_order_and_never_a_section() {
+        // A loop, and a section nothing reaches.
+        let v: Value = serde_json::from_str(
+            r#"{"ok":true,"channel_sections":[
+              {"channel_section_id":"A","type":"standard","name":"a","next_channel_section_id":"B"},
+              {"channel_section_id":"B","type":"standard","name":"b","next_channel_section_id":"A"},
+              {"channel_section_id":"C","type":"salesforce_records","name":"c"},
+              {"type":"standard","name":"no id at all"}
+            ]}"#,
+        )
+        .unwrap();
+        let got = parse_sections(&v);
+        assert_eq!(got.len(), 3, "every section with an id, once each");
+        assert_eq!(got.iter().filter(|s| s.id == "A").count(), 1);
+        assert_eq!(
+            got.iter().find(|s| s.id == "C").map(|s| s.kind),
+            Some(SectionKind::Other),
+            "a type never seen is carried, not a failure"
+        );
+    }
+
+    #[test]
+    fn no_sections_is_the_built_in_sidebar() {
+        for text in [r#"{"ok":true}"#, r#"{"ok":true,"channel_sections":{}}"#] {
+            let v: Value = serde_json::from_str(text).unwrap();
+            assert!(parse_sections(&v).is_empty());
         }
     }
 }

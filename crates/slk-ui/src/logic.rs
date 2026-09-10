@@ -358,6 +358,104 @@ pub fn name_of(name: &str, peer: Option<&str>, from_directory: Option<&str>) -> 
         .to_string()
 }
 
+/// The sections, by their `[sidebar] order` names, with their headings.
+///
+/// `custom` stands for every section the person made in Slack, in Slack's
+/// order, and has no heading of its own — each of them has one. `recent` is a
+/// view of the conversations most recently opened rather than a place one
+/// belongs, so `section_key` never answers it.
+pub const BUILT_IN_SECTIONS: [(&str, &str); 5] = [
+    ("recent", "RECENT"),
+    ("starred", "STARRED"),
+    ("custom", ""),
+    ("channels", "CHANNELS"),
+    ("dms", "DIRECT MESSAGES"),
+];
+
+/// Which section a conversation is drawn in: `starred`, the id of one of the
+/// person's own sections, `dms` or `channels`.
+///
+/// Starred first. A star given here moves the row at once, while Slack's
+/// section list only catches up at the next boot; when both are fresh they
+/// agree anyway, because Slack takes a starred conversation out of the
+/// section it was in. Then a section the person made, then the built-in rule.
+pub fn section_key(
+    id: &slk_core::ChannelId,
+    starred: bool,
+    dm: bool,
+    custom: &[slk_core::SidebarSection],
+) -> String {
+    if starred {
+        return "starred".into();
+    }
+    if let Some(s) = custom.iter().find(|s| s.channels.contains(id)) {
+        return s.id.clone();
+    }
+    if dm {
+        "dms".into()
+    } else {
+        "channels".into()
+    }
+}
+
+/// The sections to draw, in order, by key.
+///
+/// The built-ins where `[sidebar] order` puts them, and every section the
+/// person made, in Slack's order, where `custom` stands. An unknown name is
+/// ignored and a missing one appended, as before — so a config written
+/// before M4, with no `custom` in it, gets the person's sections at the
+/// bottom rather than not at all.
+pub fn section_keys(order: &[String], custom: &[slk_core::SidebarSection]) -> Vec<String> {
+    let mut names: Vec<&str> = Vec::new();
+    for want in order {
+        if let Some((n, _)) = BUILT_IN_SECTIONS.iter().find(|(n, _)| *n == want.as_str()) {
+            if !names.contains(n) {
+                names.push(n);
+            }
+        }
+    }
+    for (n, _) in BUILT_IN_SECTIONS {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    let mut out = Vec::new();
+    for n in names {
+        if n == "custom" {
+            out.extend(custom.iter().map(|s| s.id.clone()));
+        } else {
+            out.push(n.to_string());
+        }
+    }
+    out
+}
+
+/// A section's heading: the built-in title, or the name the person gave
+/// theirs — as they typed it, not upper-cased, because "iOS" is a name — with
+/// its emoji in front when it is one this client can draw. A custom emoji is
+/// an image a heading has no room for, and its name spelled out reads as
+/// part of the heading.
+pub fn section_title(key: &str, custom: &[slk_core::SidebarSection]) -> String {
+    if let Some((_, t)) = BUILT_IN_SECTIONS.iter().find(|(n, _)| *n == key) {
+        return t.to_string();
+    }
+    let Some(s) = custom.iter().find(|s| s.id == key) else {
+        return String::new();
+    };
+    let name = if s.name.is_empty() {
+        "untitled"
+    } else {
+        s.name.as_str()
+    };
+    match Some(s.emoji.as_str())
+        .filter(|e| !e.is_empty())
+        .and_then(|e| slk_core::emoji::shortcode(e, None))
+    {
+        Some(glyph) => format!("{glyph} {name}"),
+        None => name.to_string(),
+    }
+}
+
 /// How the sidebar's options rearrange one section's conversations.
 ///
 /// Takes what each row is — its index, whether it has unread, whether it is
@@ -1136,6 +1234,83 @@ mod tests {
                 "{c} is offered by completion"
             );
         }
+    }
+
+    #[test]
+    fn custom_sections_stand_where_custom_does_in_slacks_order() {
+        use slk_core::{ChannelId, SectionKind, SidebarSection};
+        let sec = |id: &str, name: &str, chans: &[&str]| SidebarSection {
+            id: id.into(),
+            name: name.into(),
+            emoji: String::new(),
+            kind: SectionKind::Custom,
+            channels: chans.iter().map(|c| ChannelId::new(*c)).collect(),
+        };
+        let custom = [
+            sec("L2", "Projects", &["C1"]),
+            sec("L1", "Clients", &["C2"]),
+        ];
+        let order: Vec<String> = ["recent", "starred", "custom", "channels", "dms"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            section_keys(&order, &custom),
+            ["recent", "starred", "L2", "L1", "channels", "dms"],
+            "Slack's order among the custom ones, not sorted by id"
+        );
+        // A config written before M4 names no `custom`: appended, not lost.
+        let old: Vec<String> = ["dms", "channels", "bogus"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            section_keys(&old, &custom),
+            ["dms", "channels", "recent", "starred", "L2", "L1"]
+        );
+    }
+
+    #[test]
+    fn a_star_given_here_beats_a_section_slack_has_not_updated_yet() {
+        use slk_core::{ChannelId, SectionKind, SidebarSection};
+        let custom = [SidebarSection {
+            id: "L2".into(),
+            name: "Projects".into(),
+            emoji: "rocket".into(),
+            kind: SectionKind::Custom,
+            channels: vec![ChannelId::new("C1"), ChannelId::new("D1")],
+        }];
+        let c1 = ChannelId::new("C1");
+        assert_eq!(section_key(&c1, true, false, &custom), "starred");
+        assert_eq!(section_key(&c1, false, false, &custom), "L2");
+        // A direct message can be in a section the person made, too.
+        assert_eq!(
+            section_key(&ChannelId::new("D1"), false, true, &custom),
+            "L2"
+        );
+        assert_eq!(
+            section_key(&ChannelId::new("D9"), false, true, &custom),
+            "dms"
+        );
+        assert_eq!(
+            section_key(&ChannelId::new("C9"), false, false, &custom),
+            "channels"
+        );
+        assert_eq!(section_title("L2", &custom), "🚀 Projects");
+        assert_eq!(section_title("channels", &custom), "CHANNELS");
+    }
+
+    #[test]
+    fn a_heading_never_spells_out_an_emoji_it_cannot_draw() {
+        use slk_core::{SectionKind, SidebarSection};
+        let custom = [SidebarSection {
+            id: "L3".into(),
+            name: "iOS".into(),
+            emoji: "our-own-logo".into(),
+            kind: SectionKind::Custom,
+            channels: Vec::new(),
+        }];
+        assert_eq!(section_title("L3", &custom), "iOS", "and keeps its case");
     }
 
     #[test]

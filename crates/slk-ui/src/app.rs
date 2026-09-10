@@ -240,12 +240,11 @@ pub enum Msg {
     Focused(Pane),
     Mapped,
     StatusExpired(u32),
-    ToggleSection(u8),
+    ToggleSection(String),
     BenchScrollDone,
     IdleDone,
 }
 
-/// The sidebar's groups, in the order the official client shows them.
 /// Apply `[ui] high_contrast` to a palette.
 ///
 /// `auto` asks the desktop through the portal, which is the answer somebody
@@ -264,54 +263,14 @@ fn contrast(palette: slk_theme::Palette, setting: &str) -> slk_theme::Palette {
     }
 }
 
-/// The sections a conversation can be in, by their config names.
-///
-/// `recent` is not a section a conversation *belongs* to — it is a view of
-/// the ones most recently opened, and those rows also appear below in their
-/// own section, the way the official client does it.
-const SECTIONS: [(u8, &str, &str); 4] = [
-    (3, "recent", "RECENT"),
-    (0, "starred", "STARRED"),
-    (1, "channels", "CHANNELS"),
-    (2, "dms", "DIRECT MESSAGES"),
-];
-
-fn section_of(c: &SidebarEntry) -> u8 {
-    if c.is_starred {
-        0
-    } else if c.is_dm() {
-        2
-    } else {
-        1
-    }
-}
-
-/// The sections to draw, in the order the config asks for.
-///
-/// An unknown name is ignored and a missing one is appended: a typo in
-/// `order` should cost one section's position, not the sidebar.
-fn sections_in_order(order: &[String]) -> Vec<(u8, &'static str)> {
-    let mut out: Vec<(u8, &'static str)> = Vec::new();
-    for want in order {
-        if let Some((id, _, title)) = SECTIONS.iter().find(|(_, name, _)| name == want) {
-            if !out.iter().any(|(i, _)| i == id) {
-                out.push((*id, title));
-            }
-        }
-    }
-    for (id, _, title) in SECTIONS {
-        if !out.iter().any(|(i, _)| *i == id) {
-            out.push((id, title));
-        }
-    }
-    out
-}
-
 struct WorkspaceState {
     team: TeamId,
     name: String,
     commands: mpsc::Sender<Command>,
     convs: Vec<SidebarEntry>,
+    /// The person's own Slack sidebar sections, as the engine last
+    /// reported them. Empty on the official route, and until boot.
+    sections: Vec<slk_core::SidebarSection>,
     connected: bool,
     /// Whether this workspace has ever been connected. "Connecting" and
     /// "offline" are different states and mean different things to the
@@ -455,7 +414,10 @@ pub struct App {
     /// Row index in the sidebar to conversation index, because the section
     /// headings are rows too and the two stopped being the same thing.
     row_map: Vec<Option<usize>>,
-    collapsed: HashSet<u8>,
+    /// Which section each sidebar row is in, heading rows included, so
+    /// folding can be a key as well as a click.
+    row_section: Vec<String>,
+    collapsed: HashSet<String>,
     rail: gtk::Box,
     scroller: gtk::ScrolledWindow,
     composer: gtk::TextView,
@@ -1194,6 +1156,7 @@ impl SimpleComponent for App {
                     name: w.name,
                     commands: w.commands,
                     convs: Vec::new(),
+                    sections: Vec::new(),
                     connected: false,
                     was_connected: false,
                 })
@@ -1269,6 +1232,7 @@ impl SimpleComponent for App {
             sidebar_box: gtk::Box::new(gtk::Orientation::Vertical, 0),
             bookmark_bar: gtk::Box::new(gtk::Orientation::Horizontal, 4),
             row_map: Vec::new(),
+            row_section: Vec::new(),
             collapsed: HashSet::new(),
             rail: gtk::Box::new(gtk::Orientation::Vertical, 0),
             scroller: gtk::ScrolledWindow::new(),
@@ -2078,6 +2042,12 @@ impl App {
                     d.groups.insert(handle.to_lowercase(), id);
                 }
             }
+            Event::Sections(sections) => {
+                self.workspaces[idx].sections = sections;
+                if is_current {
+                    self.rebuild_sidebar();
+                }
+            }
             Event::Conversations(convs) => {
                 {
                     let mut d = self.shared.names.borrow_mut();
@@ -2626,6 +2596,26 @@ impl App {
             .unwrap_or_default();
     }
 
+    /// The sidebar section the open conversation is drawn in.
+    fn section_of_open(&self) -> Option<String> {
+        let open = self.open.as_ref()?;
+        let c = self.convs().iter().find(|c| &c.id == open)?;
+        let custom: Vec<slk_core::SidebarSection> = self
+            .workspaces
+            .get(self.current)?
+            .sections
+            .iter()
+            .filter(|s| s.kind == slk_core::SectionKind::Custom)
+            .cloned()
+            .collect();
+        Some(crate::logic::section_key(
+            &c.id,
+            c.is_starred,
+            c.is_dm(),
+            &custom,
+        ))
+    }
+
     /// Draw the conversation's bookmark bar.
     ///
     /// Buttons rather than links in a label: a bookmark is a control, and a
@@ -2948,6 +2938,30 @@ impl App {
                 self.composer.grab_focus();
             }
             "leave_channel" => self.confirm_leave(sender),
+            // Fold the section the keyboard is in: the focused sidebar row,
+            // else the selected one, else the open conversation's. The last
+            // is what lets the same key unfold it again — folding takes the
+            // selected row with it, and a key that can close a section and
+            // not reopen it is a trap. Until M4 this action was advertised
+            // in the palette and answered "unbound action".
+            "toggle_section" => {
+                let from_row = self
+                    .sidebar
+                    .focus_child()
+                    .and_then(|w| w.downcast::<gtk::ListBoxRow>().ok())
+                    .or_else(|| self.sidebar.selected_row())
+                    .and_then(|r| usize::try_from(r.index()).ok())
+                    .and_then(|i| self.row_section.get(i).cloned());
+                match from_row.or_else(|| self.section_of_open()) {
+                    Some(key) => {
+                        if !self.collapsed.remove(&key) {
+                            self.collapsed.insert(key);
+                        }
+                        self.rebuild_sidebar();
+                    }
+                    None => self.say("no sidebar section here".into()),
+                }
+            }
             "archive_channel" => self.confirm_archive(sender),
             // A name from the user, so the composer again — the same reasons
             // as topic and invite above. Rename is prefilled with the current
@@ -4572,13 +4586,30 @@ impl App {
             self.sidebar.remove(&child);
         }
         self.row_map.clear();
+        self.row_section.clear();
         let convs: Vec<SidebarEntry> = self.convs().to_vec();
+        // Only the sections the person made; the built-in ones in Slack's
+        // list are drawn here by this client's own rules already.
+        let custom: Vec<slk_core::SidebarSection> = self
+            .workspaces
+            .get(self.current)
+            .map(|w| {
+                w.sections
+                    .iter()
+                    .filter(|s| s.kind == slk_core::SectionKind::Custom)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let place =
+            |c: &SidebarEntry| crate::logic::section_key(&c.id, c.is_starred, c.is_dm(), &custom);
 
-        for (sec, title) in sections_in_order(&self.sidebar_order) {
+        for sec in crate::logic::section_keys(&self.sidebar_order, &custom) {
+            let title = crate::logic::section_title(&sec, &custom);
             // RECENT is the conversations most recently opened, in that
             // order, rather than a section rows belong to. It is off unless
             // `[sidebar] recents` asks for it.
-            let picked: Vec<usize> = if sec == 3 {
+            let picked: Vec<usize> = if sec == "recent" {
                 if self.recents == 0 {
                     continue;
                 }
@@ -4597,7 +4628,7 @@ impl App {
                     convs
                         .iter()
                         .enumerate()
-                        .filter(|(_, c)| section_of(c) == sec)
+                        .filter(|(_, c)| place(c) == sec)
                         .map(|(i, c)| {
                             (
                                 i,
@@ -4623,7 +4654,7 @@ impl App {
             let head = gtk::Box::new(gtk::Orientation::Horizontal, 4);
             head.add_css_class("section");
             head.append(&gtk::Label::new(Some(if folded { "▸" } else { "▾" })));
-            head.append(&gtk::Label::new(Some(title)));
+            head.append(&gtk::Label::new(Some(&title)));
             if folded {
                 let n = gtk::Label::new(Some(&members.len().to_string()));
                 n.add_css_class("count");
@@ -4636,12 +4667,14 @@ impl App {
             hrow.set_activatable(true);
             let click = gtk::GestureClick::new();
             let s = self.shared.sender.clone();
+            let key = sec.clone();
             click.connect_released(move |_, _, _, _| {
-                let _ = s.send(Msg::ToggleSection(sec));
+                let _ = s.send(Msg::ToggleSection(key.clone()));
             });
             hrow.add_controller(click);
             self.sidebar.append(&hrow);
             self.row_map.push(None);
+            self.row_section.push(sec.clone());
             if folded {
                 continue;
             }
@@ -4700,6 +4733,7 @@ impl App {
                 }
                 self.sidebar.append(&row);
                 self.row_map.push(Some(i));
+                self.row_section.push(sec.clone());
             }
         }
 

@@ -15,8 +15,8 @@ use crate::events::{EventStream, RtEvent};
 use async_trait::async_trait;
 use serde_json::json;
 use slk_core::{
-    Bookmark, ChannelId, Conversation, ConversationKind, Message, TeamId, Ts, User, UserId,
-    Workspace,
+    Bookmark, ChannelId, Conversation, ConversationKind, Message, SectionKind, SidebarSection,
+    TeamId, Ts, User, UserId, Workspace,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -903,6 +903,52 @@ impl SlackBackend for MockBackend {
         self.typed.lock().unwrap().push(ch.clone());
         Ok(())
     }
+    /// One custom section, "Projects", holding `#design` — and a channel
+    /// this workspace does not have.
+    ///
+    /// The second is deliberate. Slack's sections name conversations the
+    /// person has since left or that were archived, and a sidebar that drew a
+    /// row for every id it was given would draw rows that open nothing. A
+    /// mock that only ever named conversations it holds would never show it.
+    /// The built-in sections are in the list too, as at Slack, so the code
+    /// that ignores them is run.
+    async fn sections(&self) -> Result<Vec<SidebarSection>> {
+        let tail = &self.team.as_str()[1..2];
+        Ok(vec![
+            SidebarSection {
+                id: "L0STARS".into(),
+                name: String::new(),
+                emoji: String::new(),
+                kind: SectionKind::Starred,
+                channels: Vec::new(),
+            },
+            SidebarSection {
+                id: "L0PROJ".into(),
+                name: "Projects".into(),
+                emoji: "rocket".into(),
+                kind: SectionKind::Custom,
+                channels: vec![
+                    ChannelId::new(format!("C0DES{tail}")),
+                    ChannelId::new("C0GONE"),
+                ],
+            },
+            SidebarSection {
+                id: "L0CHAN".into(),
+                name: String::new(),
+                emoji: String::new(),
+                kind: SectionKind::Channels,
+                channels: Vec::new(),
+            },
+            SidebarSection {
+                id: "L0DMS".into(),
+                name: String::new(),
+                emoji: String::new(),
+                kind: SectionKind::Dms,
+                channels: Vec::new(),
+            },
+        ])
+    }
+
     /// Bookmarks on the demo's busiest channel, and nowhere else.
     ///
     /// Nowhere else on purpose: most conversations in a real workspace have

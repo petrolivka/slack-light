@@ -98,6 +98,8 @@ const DEFAULTS: &[(Action, &str)] = &[
     // Topic, purpose, invite and leave are deliberately keyless: they are
     // rare, they are not reversible by pressing the same key again, and a
     // mis-typed chord that leaves a channel is not a mistake anyone forgives.
+    // Create, rename, archive and starting a group are keyless for the same
+    // reasons, archive most of all — it ends the channel for everybody in it.
     // The palette and the conversation menu reach them by name.
 ];
 

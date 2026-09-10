@@ -19,5 +19,5 @@ pub use ast::{Doc, Inline, Names, Style};
 pub use ids::{BotId, ChannelId, FileId, MsgRef, SubteamId, TeamId, Ts, UserId};
 pub use model::{
     Author, Bookmark, Conversation, ConversationKind, Delivery, FileMeta, Message, NotifyPref,
-    Presence, Reaction, User, Workspace,
+    Presence, Reaction, SectionKind, SidebarSection, User, Workspace,
 };

@@ -8,7 +8,8 @@
 use crate::error::Result;
 use async_trait::async_trait;
 use slk_core::{
-    Bookmark, ChannelId, Conversation, FileId, Message, TeamId, Ts, User, UserId, Workspace,
+    Bookmark, ChannelId, Conversation, FileId, Message, SidebarSection, TeamId, Ts, User, UserId,
+    Workspace,
 };
 
 /// What this backend can actually do. A missing capability disables the action
@@ -383,6 +384,16 @@ pub trait SlackBackend: Send + Sync {
     /// worth showing. A default of "nothing" is the honest answer for a
     /// backend that cannot ask.
     async fn pins(&self, _ch: &ChannelId) -> Result<Vec<Ts>> {
+        Ok(Vec::new())
+    }
+
+    /// The person's own sidebar sections, in their order.
+    ///
+    /// Undocumented, session route only: the official route has no such
+    /// method, and a default of "none" leaves its sidebar exactly as it was.
+    /// Fetched at boot and cached, because a sidebar that rearranges itself
+    /// a beat after the first frame is a sidebar people misclick in.
+    async fn sections(&self) -> Result<Vec<SidebarSection>> {
         Ok(Vec::new())
     }
 

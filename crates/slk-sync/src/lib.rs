@@ -266,6 +266,11 @@ pub enum Event {
         thread: Option<Ts>,
         text: String,
     },
+    /// The person's own sidebar sections, in their order. Sent from the
+    /// cache with the sidebar, and again after boot only if Slack's answer
+    /// differs — a sidebar rebuilt for no change loses the pointer hovering
+    /// over it.
+    Sections(Vec<slk_core::SidebarSection>),
     /// A conversation's bookmark bar. Sent twice on an open — once from the
     /// cache so the bar is there with the first frame, once from Slack — and
     /// the interface redraws only if the second differs from the first.
@@ -350,6 +355,10 @@ pub struct Engine {
     /// re-opening a conversation twenty times in an afternoon is not twenty
     /// requests for a list that has not changed.
     bookmarks_checked: std::collections::HashMap<String, Instant>,
+    /// Whether the cached sections have gone out yet. Once is enough: after
+    /// that the window holds them, and every sidebar push re-sending them
+    /// would rebuild the sidebar twice per star, mute and rename.
+    sections_sent: bool,
 }
 
 impl Engine {
@@ -382,6 +391,7 @@ impl Engine {
                 notified: std::collections::VecDeque::new(),
                 page: page.clamp(10, 1000),
                 bookmarks_checked: std::collections::HashMap::new(),
+                sections_sent: false,
             };
             if let Err(e) = engine.run(cmd_rx).await {
                 warn!("engine stopped: {e:#}");
@@ -512,6 +522,7 @@ impl Engine {
                             // Whatever arrived while the socket was down did
                             // not arrive as an event, so it has to be fetched.
                             self.fill_gaps().await;
+                            self.refresh_sections().await;
                         }
                         Err(e) => {
                             debug!("reconnect failed: {e}");
@@ -794,6 +805,7 @@ impl Engine {
                 if !boot.users.is_empty() {
                     let _ = self.store.upsert_users(&boot.users);
                 }
+                self.refresh_sections().await;
             }
             Err(e) if e.kind == slk_api::ErrorKind::Auth => {
                 self.emit(Event::AuthLost).await;
@@ -1019,7 +1031,20 @@ impl Engine {
 
     async fn push_sidebar(&mut self) {
         match self.store.conversations(&self.team) {
-            Ok(convs) => self.emit(Event::Conversations(convs)).await,
+            Ok(convs) => {
+                // Sections first, so the rebuild that the conversations
+                // trigger already knows where each one goes. The other way
+                // round is one frame of the wrong sidebar on every start.
+                if !self.sections_sent {
+                    self.sections_sent = true;
+                    if let Ok(cached) = self.store.sections(&self.team) {
+                        if !cached.is_empty() {
+                            self.emit(Event::Sections(cached)).await;
+                        }
+                    }
+                }
+                self.emit(Event::Conversations(convs)).await
+            }
             Err(e) => {
                 // An empty sidebar with the reason only in a log file is the
                 // hardest kind of bug to report. Say it on screen.
@@ -2009,6 +2034,31 @@ impl Engine {
         // that is nearly always the one already cached — the traffic shape
         // FR-Z1 exists to avoid. Once per conversation per ten minutes.
         self.refresh_bookmarks(&ch).await;
+    }
+
+    /// Ask Slack how the person has arranged their sidebar.
+    ///
+    /// At boot and after every reconnect. Sections change when somebody drags
+    /// a channel on another device, there is no event for it that this client
+    /// has seen, and a reconnect is usually a laptop that slept through
+    /// exactly that. A failure keeps the cached arrangement, silently — the
+    /// sidebar still works, only in the order it had.
+    async fn refresh_sections(&mut self) {
+        let fresh = match self.backend.sections().await {
+            Ok(all) => all,
+            Err(e) => {
+                debug!("sections: {e}");
+                return;
+            }
+        };
+        let had = self.store.sections(&self.team).unwrap_or_default();
+        if had == fresh {
+            return;
+        }
+        if let Err(e) = self.store.set_sections(&self.team, &fresh) {
+            warn!("caching sections: {e:#}");
+        }
+        self.emit(Event::Sections(fresh)).await;
     }
 
     /// Ask Slack what is on this conversation's bar, at most every ten

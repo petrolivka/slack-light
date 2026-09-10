@@ -69,8 +69,10 @@ pub struct Sidebar {
     /// A "RECENT" section at the top, holding this many of the conversations
     /// most recently opened. Zero turns it off.
     pub recents: u8,
-    /// Which sections, in which order. Unknown names are ignored and missing
-    /// ones are appended, so a typo costs one section rather than the sidebar.
+    /// Which sections, in which order: `recent`, `starred`, `custom`,
+    /// `channels`, `dms`. `custom` is every section made in Slack itself, in
+    /// Slack's order. Unknown names are ignored and missing ones are
+    /// appended, so a typo costs one section rather than the sidebar.
     pub order: Vec<String>,
 }
 impl Default for Sidebar {
@@ -83,6 +85,9 @@ impl Default for Sidebar {
             order: vec![
                 "recent".into(),
                 "starred".into(),
+                // The sections the person made in Slack, in Slack's order.
+                // Above channels, which is where Slack puts them.
+                "custom".into(),
                 "channels".into(),
                 "dms".into(),
             ],

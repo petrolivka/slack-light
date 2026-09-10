@@ -535,3 +535,69 @@ async fn a_group_is_everybody_named_or_nobody() {
     }
     assert_eq!(opened[0], opened[1], "the same people, the same group");
 }
+
+// ---- FR-N6: the person's own sidebar sections ------------------------------
+
+/// The sections arrive once — and are not sent again with every star, mute
+/// and rename that pushes the sidebar, which would rebuild it twice each time.
+#[tokio::test(flavor = "multi_thread")]
+async fn sections_arrive_once_and_not_with_every_sidebar_change() {
+    let (cmd, mut rx) = engine();
+    let mut sections: Option<Vec<slk_core::SidebarSection>> = None;
+    let mut eng: Option<slk_core::ChannelId> = None;
+    wait_for(&mut rx, |ev| {
+        match ev {
+            Event::Sections(s) => sections = Some(s.clone()),
+            Event::Conversations(cs) => {
+                if let Some(c) = cs.iter().find(|c| c.name == "engineering") {
+                    eng = Some(c.id.clone());
+                }
+            }
+            _ => {}
+        }
+        (sections.is_some() && eng.is_some()).then_some(())
+    })
+    .await
+    .expect("both the sidebar and its sections arrive");
+
+    let got = sections.unwrap();
+    let custom: Vec<_> = got
+        .iter()
+        .filter(|s| s.kind == slk_core::SectionKind::Custom)
+        .collect();
+    assert_eq!(custom.len(), 1);
+    assert_eq!(custom[0].name, "Projects");
+    assert_eq!(
+        got.len(),
+        4,
+        "the built-in sections are carried too, so Slack's order stays whole"
+    );
+
+    // The demo starts with #engineering starred; unstarring pushes the sidebar.
+    let ch = eng.unwrap();
+    cmd.send(Command::Star {
+        channel: ch.clone(),
+        on: false,
+    })
+    .await
+    .unwrap();
+    let mut resent = 0;
+    wait_for(&mut rx, |ev| match ev {
+        Event::Sections(_) => {
+            resent += 1;
+            None
+        }
+        Event::Conversations(cs) => cs
+            .iter()
+            .find(|c| c.id == ch)
+            .filter(|c| !c.is_starred)
+            .map(|_| ()),
+        _ => None,
+    })
+    .await
+    .expect("the star lands in the sidebar");
+    assert_eq!(
+        resent, 0,
+        "a sidebar push is not a reason to resend sections"
+    );
+}

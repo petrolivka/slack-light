@@ -521,3 +521,37 @@ pub struct Bookmark {
     /// rather than to its name, because a bar is one line tall.
     pub emoji: String,
 }
+
+/// Which of Slack's sidebar sections this is.
+///
+/// Slack keeps its built-in groups in the same list as the ones people make,
+/// so the list has to say which is which. Only `Custom` adds anything to this
+/// client's sidebar: the built-ins are drawn here already, by rules this
+/// client owns and `[sidebar] order` arranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionKind {
+    /// A section somebody made and named — `standard`, in Slack's words.
+    Custom,
+    Starred,
+    Channels,
+    Dms,
+    /// Slack Connect, apps, Salesforce records, and whatever is added next.
+    /// Carried rather than dropped so the order stays whole, never drawn.
+    Other,
+}
+
+/// One of the sections in the person's Slack sidebar, in their order.
+///
+/// `channels` is what Slack said is in it, which can name conversations this
+/// client does not have — a channel since left, archived, or past the first
+/// page of a large section. The sidebar draws what it knows and skips the
+/// rest; a row for a conversation that is not there would open nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarSection {
+    pub id: String,
+    pub name: String,
+    /// A shortcode without colons, or empty.
+    pub emoji: String,
+    pub kind: SectionKind,
+    pub channels: Vec<ChannelId>,
+}
