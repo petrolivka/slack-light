@@ -6,7 +6,7 @@
 //! undocumented shape, the fix is a migration over data we already hold rather
 //! than a re-fetch of everyone's history.
 
-pub const VERSION: i64 = 3;
+pub const VERSION: i64 = 4;
 
 /// Steps from an older store to the current one, applied in order.
 ///
@@ -23,6 +23,12 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
                                             thread_ts TEXT NOT NULL DEFAULT '',
                                             text TEXT, broadcast INTEGER, queued_at INTEGER,
                                             PRIMARY KEY (team, local_id));",
+    ),
+    (
+        4,
+        "CREATE TABLE IF NOT EXISTS bookmark (team TEXT, channel TEXT, id TEXT,
+                                              title TEXT, link TEXT, emoji TEXT, pos INTEGER,
+                                              PRIMARY KEY (team, channel, id));",
     ),
 ];
 
@@ -62,6 +68,13 @@ CREATE TABLE history_span (team TEXT, channel TEXT, oldest TEXT, newest TEXT,
 CREATE TABLE draft (team TEXT, channel TEXT, thread_ts TEXT NOT NULL DEFAULT '',
                     text TEXT, updated_at INTEGER,
                     PRIMARY KEY (team, channel, thread_ts));
+
+-- A conversation's bookmark bar, cached so it is on screen with the first
+-- frame rather than a round trip later. `pos` is Slack's own order: a bar
+-- whose rows move between openings is a bar people stop aiming at.
+CREATE TABLE bookmark (team TEXT, channel TEXT, id TEXT,
+                       title TEXT, link TEXT, emoji TEXT, pos INTEGER,
+                       PRIMARY KEY (team, channel, id));
 
 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
 

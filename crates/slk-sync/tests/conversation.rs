@@ -251,3 +251,96 @@ async fn typing_reaches_the_backend_and_says_nothing_on_screen() {
         "typing said something: {noise:?}"
     );
 }
+
+/// The bar arrives on an open, and only for a conversation that has one.
+///
+/// Both halves matter. The demo gives `#engineering` two bookmarks and
+/// `#general` none, and a client that showed the previous conversation's bar
+/// on the next conversation would pass a test that only ever opened one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bookmark_bar_belongs_to_its_conversation() {
+    let (cmd, mut rx) = engine();
+    // Both ids from the one sidebar: `Conversations` arrives once, and a
+    // second wait for it would sit until the timeout.
+    let (ch, general) = wait_for(&mut rx, |ev| match ev {
+        Event::Conversations(cs) => {
+            let find = |n: &str| cs.iter().find(|c| c.name == n).map(|c| c.id.clone());
+            Some((find("engineering")?, find("general")?))
+        }
+        _ => None,
+    })
+    .await
+    .expect("the demo workspace has #engineering and #general");
+
+    cmd.send(Command::Open(ch.clone())).await.unwrap();
+    let items = wait_for(&mut rx, |ev| match ev {
+        Event::Bookmarks { channel, items } if *channel == ch => Some(items.clone()),
+        _ => None,
+    })
+    .await
+    .expect("a conversation with bookmarks reports them");
+    assert_eq!(items.len(), 2, "both of them, not just the first");
+    assert_eq!(items[0].title, "Runbook");
+    assert_eq!(items[0].emoji, ":books:");
+
+    // A conversation with no bookmarks says nothing at all rather than
+    // repeating the last answer. The refresh runs after the history lands, so
+    // waiting for the history is not enough — wait for the *next* open's
+    // history, by which time a bar for `#general` would long since have been
+    // sent.
+    cmd.send(Command::Open(general.clone())).await.unwrap();
+    let mut bar_for_general = false;
+    let opened = wait_for(&mut rx, |ev| match ev {
+        Event::Bookmarks { channel, .. } if *channel == general => {
+            bar_for_general = true;
+            None
+        }
+        Event::Messages { channel, .. } if *channel == general => Some(()),
+        _ => None,
+    })
+    .await;
+    assert!(opened.is_some(), "the second conversation did open");
+    cmd.send(Command::Open(ch.clone())).await.unwrap();
+    wait_for(&mut rx, |ev| match ev {
+        Event::Bookmarks { channel, .. } if *channel == general => {
+            bar_for_general = true;
+            None
+        }
+        Event::Messages { channel, .. } if *channel == ch => Some(()),
+        _ => None,
+    })
+    .await
+    .expect("and the first one comes back");
+    assert!(
+        !bar_for_general,
+        "a conversation with no bookmarks must not be given somebody else's"
+    );
+}
+
+/// Re-opening the same conversation does not ask Slack again.
+///
+/// The bar changes about as often as a channel's purpose does, and the client
+/// that asks on every open is the traffic shape FR-Z1 exists to avoid. The
+/// cache answers instead; Slack is asked at most once every ten minutes.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bar_is_cached_rather_than_re_fetched() {
+    let store = Store::open(None).expect("an in-memory store");
+    let backend = Arc::new(MockBackend::new());
+    let (cmd, mut rx) = Engine::spawn(backend.clone(), store, Vec::new(), 50);
+    let ch = engineering(&mut rx).await;
+
+    for _ in 0..2 {
+        cmd.send(Command::Open(ch.clone())).await.unwrap();
+        wait_for(&mut rx, |ev| match ev {
+            Event::Messages { channel, .. } if *channel == ch => Some(()),
+            _ => None,
+        })
+        .await
+        .expect("the conversation opens");
+    }
+    assert_eq!(
+        backend.bookmark_calls(),
+        1,
+        "the second open answers from the cache"
+    );
+}

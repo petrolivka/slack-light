@@ -24,7 +24,9 @@ use crate::events::{self, EventStream, RtEvent};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use slk_core::{ChannelId, Conversation, FileId, Message, TeamId, Ts, User, UserId, Workspace};
+use slk_core::{
+    Bookmark, ChannelId, Conversation, FileId, Message, TeamId, Ts, User, UserId, Workspace,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -1018,6 +1020,13 @@ impl SlackBackend for WebBackend {
             .unwrap_or_default())
     }
 
+    async fn bookmarks(&self, ch: &ChannelId) -> Result<Vec<Bookmark>> {
+        let v = self
+            .call("bookmarks.list", &[("channel_id", ch.as_str())])
+            .await?;
+        Ok(parse_bookmarks(&v))
+    }
+
     async fn download(&self, url: &str, to: &std::path::Path) -> Result<u64> {
         let _permit = self.gate.acquire().await.ok();
         let res = self
@@ -1316,5 +1325,95 @@ impl SlackBackend for WebBackend {
         });
 
         Ok(Some(rx))
+    }
+}
+
+/// The link bookmarks in a `bookmarks.list` answer, in the order Slack sent
+/// them.
+///
+/// Slack bookmarks four kinds and this client can open one. A folder has no
+/// link at all; a canvas and a file link into the web client, which is not
+/// what a bar on a native window should quietly do. So the bar shows what it
+/// can open and nothing else, rather than a row that does nothing when
+/// clicked.
+///
+/// A free function rather than a method so the filter can be tested without a
+/// socket — the parse is the part that goes wrong when Slack changes, and the
+/// request is the part that cannot be tested here at all.
+fn parse_bookmarks(v: &Value) -> Vec<Bookmark> {
+    v.get("bookmarks")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("link"))
+                .filter_map(|b| {
+                    let link = b.get("link")?.as_str()?;
+                    if link.is_empty() {
+                        return None;
+                    }
+                    Some(Bookmark {
+                        id: b.get("id")?.as_str()?.to_string(),
+                        title: b
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        link: link.to_string(),
+                        emoji: b
+                            .get("emoji")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_kinds_that_can_be_opened() {
+        let v: Value = serde_json::from_str(
+            r#"{"ok":true,"bookmarks":[
+              {"id":"Bk1","type":"link","title":"Runbook","link":"https://x.invalid/r","emoji":":books:"},
+              {"id":"Bk2","type":"folder","title":"Docs"},
+              {"id":"Bk3","type":"canvas","title":"Plan","link":"https://x.invalid/c"},
+              {"id":"Bk4","type":"link","title":"Rota","link":"https://x.invalid/o"}
+            ]}"#,
+        )
+        .unwrap();
+        let got = parse_bookmarks(&v);
+        // The count, not "the runbook is in there": a filter that lets the
+        // canvas through still passes a test that only looks for what it
+        // wanted. M3 lost a milestone to exactly that shape of assertion.
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, "Bk1");
+        assert_eq!(got[0].emoji, ":books:");
+        assert_eq!(got[1].id, "Bk4");
+        assert_eq!(got[1].emoji, "");
+    }
+
+    #[test]
+    fn a_link_kind_with_no_link_is_not_a_row() {
+        let v: Value = serde_json::from_str(
+            r#"{"ok":true,"bookmarks":[
+              {"id":"Bk1","type":"link","title":"Broken","link":""},
+              {"id":"Bk2","type":"link","title":"No link at all"}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(parse_bookmarks(&v).is_empty());
+    }
+
+    #[test]
+    fn a_shape_we_have_never_seen_costs_the_bar_and_nothing_else() {
+        for text in [r#"{"ok":true}"#, r#"{"ok":true,"bookmarks":"soon"}"#] {
+            let v: Value = serde_json::from_str(text).unwrap();
+            assert!(parse_bookmarks(&v).is_empty());
+        }
     }
 }

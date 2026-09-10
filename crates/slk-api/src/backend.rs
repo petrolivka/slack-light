@@ -7,7 +7,9 @@
 
 use crate::error::Result;
 use async_trait::async_trait;
-use slk_core::{ChannelId, Conversation, FileId, Message, TeamId, Ts, User, UserId, Workspace};
+use slk_core::{
+    Bookmark, ChannelId, Conversation, FileId, Message, TeamId, Ts, User, UserId, Workspace,
+};
 
 /// What this backend can actually do. A missing capability disables the action
 /// in the interface rather than hiding it, so both backends look the same and
@@ -326,6 +328,15 @@ pub trait SlackBackend: Send + Sync {
     /// worth showing. A default of "nothing" is the honest answer for a
     /// backend that cannot ask.
     async fn pins(&self, _ch: &ChannelId) -> Result<Vec<Ts>> {
+        Ok(Vec::new())
+    }
+
+    /// What is bookmarked on this conversation's bar.
+    ///
+    /// A default of "none" rather than an error: the bar is decoration on a
+    /// conversation that works without it, and a backend whose token lacks
+    /// `bookmarks:read` should cost the bar, not the conversation.
+    async fn bookmarks(&self, _ch: &ChannelId) -> Result<Vec<Bookmark>> {
         Ok(Vec::new())
     }
 

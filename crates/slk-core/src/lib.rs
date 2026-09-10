@@ -18,6 +18,6 @@ pub mod richtext;
 pub use ast::{Doc, Inline, Names, Style};
 pub use ids::{BotId, ChannelId, FileId, MsgRef, SubteamId, TeamId, Ts, UserId};
 pub use model::{
-    Author, Conversation, ConversationKind, Delivery, FileMeta, Message, NotifyPref, Presence,
-    Reaction, User, Workspace,
+    Author, Bookmark, Conversation, ConversationKind, Delivery, FileMeta, Message, NotifyPref,
+    Presence, Reaction, User, Workspace,
 };

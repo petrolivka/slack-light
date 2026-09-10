@@ -15,7 +15,8 @@ use crate::events::{EventStream, RtEvent};
 use async_trait::async_trait;
 use serde_json::json;
 use slk_core::{
-    ChannelId, Conversation, ConversationKind, Message, TeamId, Ts, User, UserId, Workspace,
+    Bookmark, ChannelId, Conversation, ConversationKind, Message, TeamId, Ts, User, UserId,
+    Workspace,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -57,6 +58,10 @@ pub struct MockBackend {
     unreachable: std::sync::atomic::AtomicBool,
     /// Conversations this client has told Slack it has read.
     marked: Mutex<Vec<ChannelId>>,
+    /// How many times the bookmark bar has been asked for. The engine caches
+    /// it and re-asks rarely, and "rarely" is only a claim until something
+    /// counts.
+    bookmark_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl MockBackend {
@@ -97,6 +102,7 @@ impl MockBackend {
             typed: Mutex::new(Vec::new()),
             unreachable: std::sync::atomic::AtomicBool::new(false),
             marked: Mutex::new(Vec::new()),
+            bookmark_calls: std::sync::atomic::AtomicUsize::new(0),
             users: Vec::new(),
             messages: Mutex::new(HashMap::new()),
             uploaded: Mutex::new(HashMap::new()),
@@ -105,6 +111,12 @@ impl MockBackend {
         };
         me.seed();
         me
+    }
+
+    /// How many times `bookmarks` has been called on this backend.
+    pub fn bookmark_calls(&self) -> usize {
+        self.bookmark_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Emit a scripted message every `secs` seconds, for `--demo`.
@@ -891,6 +903,36 @@ impl SlackBackend for MockBackend {
         self.typed.lock().unwrap().push(ch.clone());
         Ok(())
     }
+    /// Bookmarks on the demo's busiest channel, and nowhere else.
+    ///
+    /// Nowhere else on purpose: most conversations in a real workspace have
+    /// no bar at all, and a demo where every channel has one never shows what
+    /// the header looks like without it. The kinds this client drops are not
+    /// modelled here — the mock answers with the parsed shape, not with
+    /// Slack's JSON, so the filter is tested where it lives, in
+    /// `web::parse_bookmarks`.
+    async fn bookmarks(&self, ch: &ChannelId) -> Result<Vec<Bookmark>> {
+        self.bookmark_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !ch.as_str().starts_with("C0ENG") {
+            return Ok(Vec::new());
+        }
+        Ok(vec![
+            Bookmark {
+                id: "Bk01".into(),
+                title: "Runbook".into(),
+                link: "https://example.invalid/runbook".into(),
+                emoji: ":books:".into(),
+            },
+            Bookmark {
+                id: "Bk02".into(),
+                title: "On-call rota".into(),
+                link: "https://example.invalid/rota".into(),
+                emoji: String::new(),
+            },
+        ])
+    }
+
     async fn pins(&self, ch: &ChannelId) -> Result<Vec<Ts>> {
         Ok(self
             .messages

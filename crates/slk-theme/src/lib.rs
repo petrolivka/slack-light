@@ -369,6 +369,18 @@ window {{ background-color: @sl_bg; color: @sl_fg; font-size: 13px; }}
 .header .topic {{ color: @sl_fg_dim; font-size: 12px; }}
 .hairline {{ background-color: alpha(@sl_muted, 0.5); min-height: 1px; }}
 
+/* The bookmark bar. Dim by default and lit on hover: it sits above every
+   message in the conversation, so a bar as loud as the header competes with
+   the thing people came to read. */
+.bookmarks {{ background-color: @sl_bg; padding: 0 10px 5px 10px; }}
+.bookmarks button.bookmark {{
+    color: @sl_fg_dim; font-size: 12px; padding: 1px 7px; min-height: 0;
+    border-radius: 5px; background-image: none;
+    border: 1px solid alpha(@sl_muted, 0.5);
+}}
+.bookmarks button.bookmark:hover {{ color: @sl_fg_bright; background-color: alpha(@sl_fg, 0.06); }}
+.bookmarks button.bookmark:focus {{ color: @sl_fg_bright; border-color: @sl_accent; }}
+
 .conversation {{ background-color: @sl_bg; }}
 .conversation > row {{ padding: 0; }}
 .conversation > row:hover {{ background-color: alpha(@sl_fg, 0.03); }}

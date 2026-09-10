@@ -248,6 +248,13 @@ pub enum Event {
         thread: Option<Ts>,
         text: String,
     },
+    /// A conversation's bookmark bar. Sent twice on an open — once from the
+    /// cache so the bar is there with the first frame, once from Slack — and
+    /// the interface redraws only if the second differs from the first.
+    Bookmarks {
+        channel: ChannelId,
+        items: Vec<slk_core::Bookmark>,
+    },
     /// A link, ready to put on the clipboard.
     Permalink {
         channel: ChannelId,
@@ -321,6 +328,10 @@ pub struct Engine {
     /// is the one number that trades first paint against how far back a
     /// conversation reads before it has to ask again.
     page: u16,
+    /// When each conversation's bookmark bar was last asked about, so
+    /// re-opening a conversation twenty times in an afternoon is not twenty
+    /// requests for a list that has not changed.
+    bookmarks_checked: std::collections::HashMap<String, Instant>,
 }
 
 impl Engine {
@@ -352,6 +363,7 @@ impl Engine {
                     .collect(),
                 notified: std::collections::VecDeque::new(),
                 page: page.clamp(10, 1000),
+                bookmarks_checked: std::collections::HashMap::new(),
             };
             if let Err(e) = engine.run(cmd_rx).await {
                 warn!("engine stopped: {e:#}");
@@ -1778,6 +1790,18 @@ impl Engine {
             })
             .await;
         }
+        // The bar, from the cache, in the same breath as the draft: a bar
+        // that arrives a round trip after the conversation pushes every
+        // message down once the answer lands.
+        if let Ok(cached) = self.store.bookmarks(&self.team, &ch) {
+            if !cached.is_empty() {
+                self.emit(Event::Bookmarks {
+                    channel: ch.clone(),
+                    items: cached,
+                })
+                .await;
+            }
+        }
         // Cached first: the pane fills before any request is made.
         if let Ok(cached) =
             self.store
@@ -1801,7 +1825,7 @@ impl Engine {
             Ok(page) => {
                 self.store_page(&page.messages);
                 self.emit(Event::Messages {
-                    channel: ch,
+                    channel: ch.clone(),
                     messages: page.messages,
                     append_older: false,
                 })
@@ -1810,6 +1834,52 @@ impl Engine {
             Err(e) if e.kind == slk_api::ErrorKind::Auth => self.emit(Event::AuthLost).await,
             Err(e) => self.emit(Event::Notice(e.user_message())).await,
         }
+
+        // The bar last, and rarely. It is the least important thing on the
+        // screen and it changes about as often as the channel's purpose does,
+        // so asking on every open would be a request per open for an answer
+        // that is nearly always the one already cached — the traffic shape
+        // FR-Z1 exists to avoid. Once per conversation per ten minutes.
+        self.refresh_bookmarks(&ch).await;
+    }
+
+    /// Ask Slack what is on this conversation's bar, at most every ten
+    /// minutes per conversation.
+    ///
+    /// Emits only when the answer differs from what is already on screen: a
+    /// bar that is rebuilt on every open flickers, and a widget rebuilt for
+    /// no change is a widget that loses the pointer hovering over it.
+    async fn refresh_bookmarks(&mut self, ch: &ChannelId) {
+        const EVERY: Duration = Duration::from_secs(600);
+        if let Some(last) = self.bookmarks_checked.get(ch.as_str()) {
+            if last.elapsed() < EVERY {
+                return;
+            }
+        }
+        let fresh = match self.backend.bookmarks(ch).await {
+            Ok(all) => all,
+            // A bar we could not ask about keeps the one we have. There is no
+            // notice: nobody opened a conversation to be told about its
+            // bookmarks.
+            Err(e) => {
+                debug!("bookmarks: {e}");
+                return;
+            }
+        };
+        self.bookmarks_checked
+            .insert(ch.as_str().to_string(), Instant::now());
+        let had = self.store.bookmarks(&self.team, ch).unwrap_or_default();
+        if had == fresh {
+            return;
+        }
+        if let Err(e) = self.store.set_bookmarks(&self.team, ch, &fresh) {
+            warn!("caching bookmarks: {e:#}");
+        }
+        self.emit(Event::Bookmarks {
+            channel: ch.clone(),
+            items: fresh,
+        })
+        .await;
     }
 
     async fn load_older(&mut self, ch: ChannelId, before: Ts) {

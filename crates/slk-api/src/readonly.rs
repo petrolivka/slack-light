@@ -17,7 +17,7 @@
 use crate::backend::*;
 use crate::error::{ErrorKind, Result, SlackError};
 use async_trait::async_trait;
-use slk_core::{ChannelId, Conversation, TeamId, Ts, User, UserId, Workspace};
+use slk_core::{Bookmark, ChannelId, Conversation, TeamId, Ts, User, UserId, Workspace};
 use std::sync::Arc;
 
 pub struct ReadOnly {
@@ -98,6 +98,9 @@ impl SlackBackend for ReadOnly {
     }
     async fn pins(&self, ch: &ChannelId) -> Result<Vec<Ts>> {
         self.inner.pins(ch).await
+    }
+    async fn bookmarks(&self, ch: &ChannelId) -> Result<Vec<Bookmark>> {
+        self.inner.bookmarks(ch).await
     }
     /// To local disk, not to the account: this is how an image gets drawn.
     async fn download(&self, url: &str, to: &std::path::Path) -> Result<u64> {

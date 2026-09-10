@@ -189,6 +189,7 @@ pub fn count_update(msg: &crate::app::Msg) {
         Settled => "Settled",
         Scrolled { .. } => "Scrolled",
         Link(_) => "Link",
+        Bookmark(_) => "Bookmark",
         ListPick(_) => "ListPick",
         Dropped(_) => "Dropped",
         Leave(_) => "Leave",

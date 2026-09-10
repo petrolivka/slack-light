@@ -14,7 +14,7 @@ mod schema;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use slk_core::{ChannelId, Conversation, Delivery, Message, TeamId, Ts, User, UserId};
+use slk_core::{Bookmark, ChannelId, Conversation, Delivery, Message, TeamId, Ts, User, UserId};
 use std::path::Path;
 
 pub struct Store {
@@ -178,6 +178,7 @@ impl Store {
                 "history_span",
                 "draft",
                 "outbox",
+                "bookmark",
             ] {
                 gone += self.db.execute(
                     &format!("DELETE FROM {table} WHERE team = ?1"),
@@ -902,6 +903,52 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// Replace a conversation's bookmark bar with what Slack just said.
+    ///
+    /// Replace, not merge: a bookmark somebody deleted has to leave the bar,
+    /// and a merge would keep it for ever. Slack's order is kept as `pos` —
+    /// a bar whose rows move between openings is a bar people stop aiming at.
+    pub fn set_bookmarks(&self, team: &TeamId, ch: &ChannelId, all: &[Bookmark]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM bookmark WHERE team = ?1 AND channel = ?2",
+            params![team.as_str(), ch.as_str()],
+        )?;
+        for (i, b) in all.iter().enumerate() {
+            tx.execute(
+                "INSERT OR REPLACE INTO bookmark (team, channel, id, title, link, emoji, pos)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    team.as_str(),
+                    ch.as_str(),
+                    b.id,
+                    b.title,
+                    b.link,
+                    b.emoji,
+                    i as i64
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn bookmarks(&self, team: &TeamId, ch: &ChannelId) -> Result<Vec<Bookmark>> {
+        let mut q = self.db.prepare(
+            "SELECT id, title, link, emoji FROM bookmark
+             WHERE team = ?1 AND channel = ?2 ORDER BY pos",
+        )?;
+        let rows = q.query_map(params![team.as_str(), ch.as_str()], |r| {
+            Ok(Bookmark {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                link: r.get(2)?,
+                emoji: r.get(3)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn set_kv(&self, key: &str, value: &str) -> Result<()> {

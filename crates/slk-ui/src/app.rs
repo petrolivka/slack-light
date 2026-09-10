@@ -202,6 +202,8 @@ pub enum Msg {
     },
     /// A link inside a message was clicked.
     Link(String),
+    /// A bookmark on the conversation's bar was clicked.
+    Bookmark(String),
     /// A row in the side pane's list was chosen.
     ListPick(usize),
     /// Files were dropped on the window.
@@ -377,6 +379,10 @@ pub struct App {
     /// What was typed and not sent, per conversation. A draft lost by
     /// glancing at another channel is the thing people never forgive.
     drafts: HashMap<ChannelId, String>,
+    /// The open conversation's bookmarks, as the engine last reported them.
+    /// Held so the bar can be rebuilt without asking again — on a theme
+    /// change, for instance.
+    bookmarks: Vec<slk_core::Bookmark>,
     /// A message on its way to another conversation: which one it is, and its
     /// link once Slack has minted one. Cleared when the target is chosen or
     /// the picker is dismissed.
@@ -441,6 +447,9 @@ pub struct App {
     // handle to each and relm4 hands widgets to the view, not the model.
     sidebar: gtk::ListBox,
     sidebar_box: gtk::Box,
+    /// The conversation's bookmark bar: a row of flat buttons, hidden when
+    /// the conversation has none, which is most of them.
+    bookmark_bar: gtk::Box,
     /// Row index in the sidebar to conversation index, because the section
     /// headings are rows too and the two stopped being the same thing.
     row_map: Vec<Option<usize>>,
@@ -532,6 +541,11 @@ impl App {
         self.marked = None;
         self.close_completions();
         self.open = Some(id.clone());
+        // The previous conversation's bar goes with the previous
+        // conversation. It comes back from the cache within the same
+        // `Open`, so this is a blink and not a gap.
+        self.bookmarks.clear();
+        self.rebuild_bookmarks();
         self.refresh_header();
         // Where to come back to next time. Best effort by design — failing to
         // remember is not worth a message, and the next start simply opens
@@ -846,6 +860,16 @@ impl SimpleComponent for App {
                                     set_hexpand: true,
                                     add_css_class: "topic",
                                 },
+                            },
+
+                            // The bookmark bar, between the header and the
+                            // hairline that closes it — it belongs to the
+                            // header, and a bar below the rule reads as the
+                            // first thing in the conversation.
+                            #[local_ref]
+                            bookmark_bar -> gtk::Box {
+                                set_visible: false,
+                                add_css_class: "bookmarks",
                             },
                             gtk::Box { add_css_class: "hairline" },
 
@@ -1207,6 +1231,7 @@ impl SimpleComponent for App {
             candidates: Vec::new(),
             inserting: Rc::new(std::cell::Cell::new(false)),
             drafts: HashMap::new(),
+            bookmarks: Vec::new(),
             forwarding: None,
             forward_link: None,
             typing: Vec::new(),
@@ -1240,6 +1265,7 @@ impl SimpleComponent for App {
             marked: None,
             sidebar: gtk::ListBox::new(),
             sidebar_box: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            bookmark_bar: gtk::Box::new(gtk::Orientation::Horizontal, 4),
             row_map: Vec::new(),
             collapsed: HashSet::new(),
             rail: gtk::Box::new(gtk::Orientation::Vertical, 0),
@@ -1286,6 +1312,7 @@ impl SimpleComponent for App {
         let main_paned = &model.main_paned;
         let sidebar = &model.sidebar;
         let sidebar_box = &model.sidebar_box;
+        let bookmark_bar = &model.bookmark_bar;
         let rail = &model.rail;
         let scroller = &model.scroller;
         let loading = &model.loading;
@@ -1709,6 +1736,10 @@ impl SimpleComponent for App {
                 }
             }
             Msg::Link(url) => self.follow_link(&url, &sender),
+            // The same path a link in a message takes, so a bookmark that
+            // happens to be a permalink into this workspace jumps inside the
+            // client rather than opening a browser onto it.
+            Msg::Bookmark(url) => self.follow_link(&url, &sender),
             Msg::ListPick(i) => self.pick(i, &sender),
             Msg::Dropped(paths) => self.upload(paths, &sender),
             Msg::Leave(ch) => self.send(Command::Leave(ch)),
@@ -1947,6 +1978,17 @@ impl App {
                     "{}: session expired — run `slack-light auth add`",
                     self.workspaces[idx].name
                 ));
+            }
+            Event::Bookmarks { channel, items } => {
+                // Only for the conversation on screen. The engine answers
+                // about the conversation it was asked about, and by the time
+                // a slow answer lands the person may have moved on — a bar
+                // belonging to the previous conversation is worse than none.
+                if !is_current || self.open.as_ref() != Some(&channel) {
+                    return;
+                }
+                self.bookmarks = items;
+                self.rebuild_bookmarks();
             }
             Event::Draft {
                 channel,
@@ -2579,6 +2621,57 @@ impl App {
                 bits.join("  ·  ")
             })
             .unwrap_or_default();
+    }
+
+    /// Draw the conversation's bookmark bar.
+    ///
+    /// Buttons rather than links in a label: a bookmark is a control, and a
+    /// control a screen reader can land on and describe is the difference
+    /// between a bar that exists and a bar that can be used. Hidden entirely
+    /// when there are none — an empty strip above the conversation costs a
+    /// row of height on every conversation that has no bookmarks, which is
+    /// most of them.
+    fn rebuild_bookmarks(&mut self) {
+        while let Some(child) = self.bookmark_bar.first_child() {
+            self.bookmark_bar.remove(&child);
+        }
+        self.bookmark_bar.set_visible(!self.bookmarks.is_empty());
+        for b in &self.bookmarks {
+            // The glyph if we know the shortcode, nothing if we do not. A
+            // custom emoji is an image this bar has no room for, and its name
+            // spelled out beside the title reads as part of the title.
+            let glyph = b
+                .emoji
+                .trim_matches(':')
+                .split("::")
+                .next()
+                .filter(|n| !n.is_empty())
+                .and_then(|n| slk_core::emoji::shortcode(n, None))
+                .unwrap_or_default();
+            let label = if glyph.is_empty() {
+                b.title.clone()
+            } else {
+                format!("{glyph} {}", b.title)
+            };
+            let button = gtk::Button::with_label(&label);
+            button.add_css_class("flat");
+            button.add_css_class("bookmark");
+            button.set_can_focus(true);
+            button.set_tooltip_text(Some(&b.link));
+            // The link in the accessible name as well as in the tooltip:
+            // "Runbook" alone does not say where it goes, and a tooltip is
+            // not something a screen reader announces on focus.
+            button.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{}, opens {}",
+                b.title, b.link
+            ))]);
+            let sender = self.shared.sender.clone();
+            let link = b.link.clone();
+            button.connect_clicked(move |_| {
+                let _ = sender.send(Msg::Bookmark(link.clone()));
+            });
+            self.bookmark_bar.append(&button);
+        }
     }
 
     /// Publish what a status bar wants, for the control socket to hand out.

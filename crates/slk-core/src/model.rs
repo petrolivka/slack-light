@@ -504,3 +504,20 @@ impl Message {
         })
     }
 }
+
+/// One bookmark on a conversation's own bar.
+///
+/// Slack has several kinds — a link, a canvas, a file, a folder that holds
+/// other bookmarks — and only the link kind is one this client can act on, so
+/// `link` is not an `Option` and the backend drops the rest. A row that cannot
+/// be opened is a row that does nothing when clicked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bookmark {
+    pub id: String,
+    pub title: String,
+    pub link: String,
+    /// Slack's own emoji shortcode, with colons, or empty. Rendered as the
+    /// glyph when it is a standard one; a custom one falls back to nothing
+    /// rather than to its name, because a bar is one line tall.
+    pub emoji: String,
+}
