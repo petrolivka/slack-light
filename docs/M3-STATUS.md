@@ -5,9 +5,10 @@ listed with a reason.** This is that list. The rule M2 was accepted under
 applies unchanged — *the requirements table in §6 is the checklist, not the
 roadmap* — so the audit below walks §6, not the milestone description.
 
-Nine commits, `a0630ab` … `6fe476a`. 91 unit and scenario tests (from 71),
-67 accessibility checks in `tests/a11y/e2e.sh` (from 45), clippy clean,
-`cargo fmt` applied, every automated run against `--anonymous`.
+Eleven commits, `a0630ab` … the run that closes this document. 91 unit and
+scenario tests (from 71), **70 accessibility checks passing** in
+`tests/a11y/e2e.sh` (from 45), clippy clean, `cargo fmt` applied, every
+automated run against `--anonymous`.
 
 ---
 
@@ -126,12 +127,54 @@ first-claimant rule makes that survivable rather than silent, but which one
 wins then depends on the preset, so within one table it is a mistake. A unit
 test now refuses two defaults asking for one chord.
 
+**The conversation header was computed once and never rebuilt.** Star, mute
+and topic all updated the sidebar and left the header saying the old thing
+until you navigated away and came back. The header is not a property of
+*opening* a conversation — it is a property of the conversation, and the
+conversation changes while it is open. Found by the accessibility suite,
+which asserts on the header and not on the sidebar; three of its checks
+failed on one cause.
+
 **The event match had a catch-all.** It is now exhaustive, and the compiler
 proved it: in M2 `Event::Notify` fell through that catch-all and
 notifications never happened at all. Adding an event should break the match.
 It did, twice, during this milestone — which is the point.
 
 ---
+
+## 3a. What the first real run of the suite cost
+
+The suite had never been run end to end against M3 (§5 of the first draft of
+this document said so). Running it produced nine failures. Three were the
+header defect above. The other six were the *suite* being wrong, and each was
+worth fixing rather than working around:
+
+- **It could not see inside a text field.** `tree.py` printed the accessible
+  *name*, and an entry's name is its label, not its contents — so "up-arrow
+  recalls the last search" was unassertable. It now reads the AT-SPI `Text`
+  interface for text-bearing roles, which is what a screen reader does; a
+  proxy that stops where a text field begins is not much of a proxy.
+- **The file chooser is a different application.** `xdg-desktop-portal-gtk`
+  has its own tree, so asserting on ours could never have found it. It also
+  had to be closed by the compositor rather than by Escape: the chooser is
+  modal and transient for our window, so while it is open our window takes no
+  input at all — one un-closed dialog turned a single failure into nine
+  further down the file.
+- **`Return` on a complete slash command accepts the completion**, it does not
+  send. That is what Return should do, and the test wanted one keystroke where
+  a person uses two.
+- **A prefix match matched the sidebar.** The sidebar names the same
+  conversation the header does, so `label '# engineering` matched a row and
+  passed while the header said the old thing — which is exactly how the header
+  defect stayed invisible.
+- **A virtualised list only puts realised rows in the tree.** In a tiled
+  window that is three or four of them, so asserting about a message four back
+  from the end asserted about nothing. The check walks the cursor up until it
+  finds it, which is what a person does.
+- **The keyless-action exemption list was out of date** — six actions added
+  this milestone are keyless on purpose and the check did not know.
+
+Two runs back to back, 70 for 70 both times.
 
 ## 4. Decided against, with the reason
 
@@ -194,18 +237,12 @@ from then on every call carries `team_id` — written to the shape Slack
 documents. There is no Grid org here to test against.
 
 **A screen reader has still not driven the client.** The accessibility tree
-is asserted on, every control this milestone added is in it with a usable
-name — the custom-emoji chip is `":shipit: 2"`, not `"2"` — and high
-contrast is tested as a WCAG AAA contrast ratio rather than as a screenshot.
-None of that is the same as Orca reading a conversation aloud.
-
-**The accessibility suite has not run against M3's changes.** The session on
-this machine was locked (`hyprlock`) for the whole of the second half of the
-milestone, so the keyboard could not be taken — and with the new guard the
-suite correctly refuses to run rather than typing at a lock screen. The 22
-checks added this milestone are written and syntax-checked; they have not
-been executed. `tests/a11y/e2e.sh` on an unlocked desktop is the next thing
-to run.
+is asserted on — 70 checks, and it can now read what is *inside* a text
+field as well as what is around it — every control this milestone added is
+in it with a usable name (the custom-emoji chip is `":shipit: 2"`, not
+`"2"`), and high contrast is tested as a WCAG AAA contrast ratio rather than
+as a screenshot. None of that is the same as Orca reading a conversation
+aloud.
 
 **Drag-and-drop is still verified by eye alone**, and Hyprland still has no
 click dispatcher, so no pointer path is asserted by the suite. Mitigated as

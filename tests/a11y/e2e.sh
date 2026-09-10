@@ -35,16 +35,23 @@ focus() { hyprctl dispatch "hl.dsp.focus({ window = \"class:$CLASS\" })" >/dev/n
 # also why a run with focus quietly elsewhere reports thirty failures that
 # say nothing about the client. So: check, try once to take focus back, and
 # if that fails abort the run rather than type into somebody's #general.
+# Ours under either spelling. On Wayland the toplevel carries the GTK
+# application id; under XWayland — and for a moment before GTK applies the
+# app id — it carries the program name instead. Both are this client and
+# neither is somebody else's window, which is the only question being asked.
+ours() { [ "$1" = "$CLASS" ] || [ "$1" = "slack-light" ]; }
+
 w() {
-  local c
+  local c t
   c=$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // ""')
-  if [ "$c" != "$CLASS" ]; then
+  if ! ours "$c"; then
     focus
     c=$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // ""')
   fi
-  if [ "$c" != "$CLASS" ]; then
+  if ! ours "$c"; then
+    t=$(hyprctl activewindow -j 2>/dev/null | jq -r '.title // ""')
     echo
-    echo "  ABORTED: the keyboard belongs to '${c:-nothing}', not to $CLASS."
+    echo "  ABORTED: the keyboard belongs to '${c:-nothing}' — ${t:-no title}."
     echo "  Nothing was typed. This suite drives the real keyboard; it needs"
     echo "  the desktop to itself. Close what took focus and run it again."
     pkill -x slack-light 2>/dev/null
@@ -174,12 +181,16 @@ check "alt-c offers the channels one could join" "$( tree | grep -q '#random' &&
 # the mute are toggles read back out of the header, which is the only place
 # either one is visible for a conversation that is already open.
 w -k Escape; sleep 0.4
-star_before=$(tree | grep -c "label '★" || true)
+# Whole labels, not fragments. The sidebar names the same conversation —
+# `'#  engineering, 1 mention'` — so anything that matches a prefix matches
+# the sidebar too, and then the check passes while the header still says the
+# old thing. `#engineering` starts starred in the demo, so the first press
+# takes it off.
+check "the header starts starred, as the demo says" "$( tree | grep -q "label '★ # engineering'" && echo 1 || echo 0 )" "$(tree | grep -oE "label '[^']*engineering[^']*'" | tr '\n' ' ')"
 w -M ctrl -M alt s -m alt -m ctrl; sleep 1.5
-star_after=$(tree | grep -c "label '★" || true)
-check "ctrl-alt-s stars the conversation, and the header says so" "$( [ "$star_after" != "$star_before" ] && echo 1 || echo 0 )" "before=$star_before after=$star_after"
+check "ctrl-alt-s unstars it, and the header says so" "$( tree | grep -q "label '# engineering'" && echo 1 || echo 0 )" "$(tree | grep -oE "label '[^']*engineering[^']*'" | tr '\n' ' ')"
 w -M ctrl -M alt m -m alt -m ctrl; sleep 1.5
-check "ctrl-alt-m mutes it, and that shows too" "$( tree | grep -q '🔕' && echo 1 || echo 0 )" "$(tree | grep -oE "label '[^']*(★|🔕)[^']*'" | head -1)"
+check "ctrl-alt-m mutes it, and that shows too" "$( tree | grep -q "label '# engineering 🔕'" && echo 1 || echo 0 )" "$(tree | grep -oE "label '[^']*🔕[^']*'" | head -1)"
 w -M ctrl -M alt m -m alt -m ctrl; sleep 1.5
 check "and unmuting takes the mark away again" "$( tree | grep -q '🔕' && echo 0 || echo 1 )"
 
@@ -194,10 +205,22 @@ w "/topic on-call rotation"; sleep 0.3; w -k Return; sleep 2.0
 check "/topic sets the topic and the header shows it" "$( tree | grep -q 'on-call rotation' && echo 1 || echo 0 )" "$(tree | grep -oE "label '[0-9]+ members[^']*'" | head -1)"
 
 # A slash command the interface owns rather than the workspace: nothing is
-# sent, a box opens.
-w "/upload"; sleep 0.3; w -k Return; sleep 1.5
-check "/upload opens the file chooser rather than posting" "$( tree | grep -qiE "window '[^']*(file|open)" && echo 1 || echo 0 )" "$(tree | grep -oE "window '[^']*'" | tr '\n' ' ')"
-w -k Escape; sleep 0.8
+# sent, a chooser opens. Escape first, because a complete command name has
+# the completion popup open and the first Return accepts it — which is what
+# Return should do, and is why this needs two keystrokes rather than one.
+w "/upload"; sleep 0.6; w -k Escape; sleep 0.3; w -k Return; sleep 2.5
+# The chooser is `xdg-desktop-portal-gtk`, a different application on the
+# a11y bus. Asserting on our own tree could never have seen it.
+check "/upload opens the file chooser rather than posting" "$( tree --app xdg-desktop-portal-gtk | grep -q 'file chooser' && echo 1 || echo 0 )" "$(tree --app xdg-desktop-portal-gtk | head -2 | tr '\n' ' ')"
+check "and the command itself was not posted" "$( tree | grep -q "list item.*'/upload'" && echo 0 || echo 1 )"
+# Closed by the compositor, not by a keystroke. The chooser is modal and
+# transient for our window, so while it is open the window takes no input —
+# and Escape typed at *our* window closes nothing. One un-closed dialog
+# turned this into nine failures further down the file before the cause was
+# obvious, which is the argument for closing it explicitly.
+hyprctl dispatch 'hl.dsp.window.close({ window = "class:xdg-desktop-portal-gtk" })' >/dev/null 2>&1
+sleep 1.2
+check "and the chooser closes again" "$( hyprctl clients -j | jq -r '.[].class' | grep -q portal && echo 0 || echo 1 )"
 
 # Search: the query goes in the pane, so the results stay readable next to
 # the conversation they came from.
@@ -209,8 +232,20 @@ check "each hit says which conversation it is in" "$( tree | grep -q '#engineeri
 # A snippet: Slack sends the first lines, the row shows twelve of them and
 # puts the rest behind a disclosure rather than fetching the file.
 w -k Escape; sleep 0.4
-w -M alt -k Home -m alt; sleep 1.0
-check "a text file is shown inline, not as a paperclip" "$( tree | grep -q 'retry.toml' && echo 1 || echo 0 )" "$(tree | grep -oE "label '📄[^']*'" | head -1)"
+# At the newest end: the demo's own story is the newest thing in the
+# conversation, and `--demo-rows` prepends older filler in front of it. A
+# virtualised list only puts realised rows in the tree, so asserting from
+# the oldest end asserts about the filler.
+w -M alt g -m alt; sleep 1.2
+# Walking up from the newest, because a virtualised list only puts the rows
+# it has realised into the tree, and in a tiled window that is three or four
+# of them. The snippet is a few messages back from the end.
+snip=0
+for _ in 1 2 3 4 5 6 7 8; do
+  if tree | grep -q 'retry.toml'; then snip=1; break; fi
+  w -M alt k -m alt; sleep 0.5
+done
+check "a text file is shown inline, not as a paperclip" "$snip" "$(tree | grep -oE "label '📄[^']*'" | head -1)"
 check "with its first lines and a count of the rest" "$( tree | grep -q 'more lines' && echo 1 || echo 0 )"
 
 # A custom emoji is a picture in the chip, and the chip is still named — a
@@ -351,13 +386,15 @@ rm -rf "$CFG"
 # so none may be installed — and every action must have a key or say why not.
 dead=$(grep '^binding=' "$LOG" | grep -cE '=<[^>]*Shift>[A-Za-z]( |$)' || true)
 check "no binding is shift plus a letter" "$( [ "$dead" = 0 ] && echo 1 || echo 0 )" "$dead such bindings"
-# Two are GTK's own (pane focus cycling), four are keyless on purpose:
-# topic, purpose, invite and leave are rare, irreversible by the same key,
-# and reached by name from the palette. Anything else without a key is an
-# action nobody can run.
+# Two are GTK's own (pane focus cycling). The rest are keyless on purpose:
+# topic, purpose, invite and leave are rare and not undone by pressing the
+# same key again; status, dnd, forward and view-source want a word or a
+# target; unread-first and hide-read are settings. All of them are reached
+# by name from the palette. Anything *else* without a key is an action
+# nobody can run, which is what this counts.
 unbound=$(grep '^binding=' "$LOG" | grep 'no free key' \
-          | grep -cvE '^binding=(focus_next|focus_prev|set_topic|set_purpose|invite|leave_channel)=' || true)
-check "every action without a key is one that was meant to have none" "$( [ "$unbound" = 0 ] && echo 1 || echo 0 )" "$unbound unexpected: $(grep '^binding=' "$LOG" | grep 'no free key' | grep -vE '^binding=(focus_next|focus_prev|set_topic|set_purpose|invite|leave_channel)=' | tr '\n' ' ')"
+          | grep -cvE '^binding=(focus_next|focus_prev|set_topic|set_purpose|invite|leave_channel|status|dnd|unread_first|hide_read|forward_message|view_source)=' || true)
+check "every action without a key is one that was meant to have none" "$( [ "$unbound" = 0 ] && echo 1 || echo 0 )" "$unbound unexpected: $(grep '^binding=' "$LOG" | grep 'no free key' | grep -vE '^binding=(focus_next|focus_prev|set_topic|set_purpose|invite|leave_channel|status|dnd|unread_first|hide_read|forward_message|view_source)=' | tr '\n' ' ')"
 
 echo "--- bindings installed ---"; grep '^binding=' "$LOG" | sed 's/^binding=/  /'
 echo; echo "$pass passed, $fail failed"

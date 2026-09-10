@@ -21,6 +21,13 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
 ACC = "org.a11y.atspi.Accessible"
+TEXT = "org.a11y.atspi.Text"
+
+# Roles whose *contents* are the interesting part. A screen reader reads what
+# is in an entry; a tree that can only see the entry's label is a proxy that
+# stops short exactly where a text field begins — which is how "up-arrow
+# recalls the last search" went unassertable.
+TEXTY = ("entry", "text", "text box", "password text")
 
 # The states worth printing. AT-SPI sends a 64-bit bitfield in two words;
 # these are the ones a test asks about — "is the message cursor on this row"
@@ -79,6 +86,17 @@ def states(bus, name, path):
     return [STATES[b] for b in ASKED if bits >> b & 1]
 
 
+def text_of(bus, name, path):
+    """What a text-bearing widget currently holds, or None."""
+    try:
+        return call(
+            bus, name, path, TEXT, "GetText",
+            GLib.Variant("(ii)", (0, -1)), GLib.VariantType("(s)"),
+        )[0]
+    except GLib.Error:
+        return None
+
+
 def role(bus, name, path):
     try:
         return call(bus, name, path, ACC, "GetRoleName", None, GLib.VariantType("(s)"))[0]
@@ -94,11 +112,18 @@ def walk(bus, name, path, depth=0, out=None, limit=1500, with_states=False):
         out = []
     if len(out) >= limit:
         return out
+    r = role(bus, name, path)
     node = {
         "depth": depth,
-        "role": role(bus, name, path),
+        "role": r,
         "name": prop(bus, name, path, "Name") or "",
     }
+    # Only for the roles that have contents: GetText on everything would be a
+    # D-Bus round trip per node, and the tree is walked on every assertion.
+    if r in TEXTY:
+        held = text_of(bus, name, path)
+        if held:
+            node["text"] = held
     if with_states:
         node["states"] = states(bus, name, path)
     out.append(node)
@@ -131,8 +156,11 @@ def main():
     else:
         for n in nodes:
             label = f" {n['name']!r}" if n["name"] else ""
+            # Contents in angle brackets, so an assertion can tell "a field
+            # called Search" from "a field holding the word search".
+            held = f" <{n['text']!r}>" if n.get("text") else ""
             st = f" [{','.join(n['states'])}]" if n.get("states") else ""
-            print(f"{'  ' * n['depth']}{n['role']}{label}{st}")
+            print(f"{'  ' * n['depth']}{n['role']}{label}{held}{st}")
 
 
 if __name__ == "__main__":

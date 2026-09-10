@@ -531,51 +531,8 @@ impl App {
         self.editing = None;
         self.marked = None;
         self.close_completions();
-        let found = self.convs().iter().find(|c| c.id == id).cloned();
-        self.title = found
-            .as_ref()
-            .map(|c| {
-                let name = if c.is_dm() {
-                    c.name.clone()
-                } else if c.is_private() {
-                    format!("🔒 {}", c.name)
-                } else {
-                    format!("# {}", c.name)
-                };
-                // Star and mute in the header, as glyphs rather than as a
-                // colour: the sidebar shows the star and nothing showed the
-                // mute at all, so "why is this one quiet" had no answer on
-                // screen.
-                let mut out = String::new();
-                if c.is_starred {
-                    out.push_str("★ ");
-                }
-                out.push_str(&name);
-                if c.is_muted {
-                    out.push_str(" 🔕");
-                }
-                out
-            })
-            .unwrap_or_default();
-        self.topic = found
-            .as_ref()
-            .map(|c| {
-                let mut bits = Vec::new();
-                if let Some(n) = c.member_count.filter(|_| !c.is_dm()) {
-                    bits.push(format!("{n} members"));
-                }
-                let note = if c.topic.is_empty() {
-                    &c.purpose
-                } else {
-                    &c.topic
-                };
-                if !note.is_empty() {
-                    bits.push(note.replace('\n', " "));
-                }
-                bits.join("  ·  ")
-            })
-            .unwrap_or_default();
         self.open = Some(id.clone());
+        self.refresh_header();
         // Where to come back to next time. Best effort by design — failing to
         // remember is not worth a message, and the next start simply opens
         // the first conversation as it always did.
@@ -2075,6 +2032,9 @@ impl App {
                 self.workspaces[idx].convs = convs;
                 if is_current {
                     self.rebuild_sidebar();
+                    // The conversation on screen may be one of the ones that
+                    // just changed — starred, muted, renamed, a new topic.
+                    self.refresh_header();
                     self.land();
                 }
             }
@@ -2496,6 +2456,64 @@ impl App {
 
     /// The right-hand end of the status bar: what is waiting, and the two
     /// keys worth knowing.
+    /// The conversation header: name, star, mute, member count, topic.
+    ///
+    /// A method rather than three lines in `open_conversation`, because the
+    /// header is not a property of *opening* a conversation — it is a
+    /// property of the conversation, and the conversation changes while it is
+    /// open. Computing it once at open meant starring, muting or setting the
+    /// topic updated the sidebar and left the header saying the old thing
+    /// until you navigated away and back. Found by the accessibility suite,
+    /// which asserts on the header and not on the sidebar.
+    fn refresh_header(&mut self) {
+        let found = self
+            .open
+            .clone()
+            .and_then(|id| self.convs().iter().find(|c| c.id == id).cloned());
+        self.title = found
+            .as_ref()
+            .map(|c| {
+                let name = if c.is_dm() {
+                    c.name.clone()
+                } else if c.is_private() {
+                    format!("🔒 {}", c.name)
+                } else {
+                    format!("# {}", c.name)
+                };
+                // Star and mute as glyphs rather than as a colour: the sidebar
+                // shows the star and nothing showed the mute at all, so "why
+                // is this one quiet" had no answer on screen.
+                let mut out = String::new();
+                if c.is_starred {
+                    out.push_str("★ ");
+                }
+                out.push_str(&name);
+                if c.is_muted {
+                    out.push_str(" 🔕");
+                }
+                out
+            })
+            .unwrap_or_default();
+        self.topic = found
+            .as_ref()
+            .map(|c| {
+                let mut bits = Vec::new();
+                if let Some(n) = c.member_count.filter(|_| !c.is_dm()) {
+                    bits.push(format!("{n} members"));
+                }
+                let note = if c.topic.is_empty() {
+                    &c.purpose
+                } else {
+                    &c.topic
+                };
+                if !note.is_empty() {
+                    bits.push(note.replace('\n', " "));
+                }
+                bits.join("  ·  ")
+            })
+            .unwrap_or_default();
+    }
+
     /// Publish what a status bar wants, for the control socket to hand out.
     ///
     /// Called from the same places that redraw the counters, so it cannot
