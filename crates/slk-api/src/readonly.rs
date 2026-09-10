@@ -155,6 +155,14 @@ impl SlackBackend for ReadOnly {
     async fn channel_op(&self, _op: ChannelOp) -> Result<()> {
         Self::refuse("conversations")
     }
+    async fn create_channel(&self, _name: &str, _private: bool) -> Result<Conversation> {
+        Self::refuse("conversations.create")
+    }
+    /// Opening a conversation with somebody creates it, and everybody in it
+    /// is told. It is not a read however much it looks like one from here.
+    async fn open_group(&self, _users: &[UserId]) -> Result<Conversation> {
+        Self::refuse("conversations.open")
+    }
     async fn slash(&self, _ch: &ChannelId, _command: &str, _text: &str) -> Result<()> {
         Self::refuse("chat.command")
     }

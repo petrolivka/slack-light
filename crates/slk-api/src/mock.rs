@@ -983,6 +983,77 @@ impl SlackBackend for MockBackend {
                     c.is_member = false;
                 }
             }
+            ChannelOp::Archive(ch) => {
+                let mut convs = self.convs.lock().unwrap();
+                match convs.iter_mut().find(|c| c.id == *ch) {
+                    // Slack refuses to archive a direct message or the
+                    // workspace's #general, and a mock that let either
+                    // through would be kinder than Slack in exactly the way
+                    // M3 found four times.
+                    Some(c)
+                        if matches!(
+                            c.kind,
+                            ConversationKind::Dm { .. } | ConversationKind::Mpim { .. }
+                        ) =>
+                    {
+                        return Err(SlackError::new(
+                            "conversations.archive",
+                            ErrorKind::Permission,
+                            "method_not_supported_for_channel_type",
+                        ));
+                    }
+                    Some(c) if c.name == "general" => {
+                        return Err(SlackError::new(
+                            "conversations.archive",
+                            ErrorKind::Permission,
+                            "cant_archive_general",
+                        ));
+                    }
+                    Some(c) => c.is_archived = true,
+                    None => {
+                        return Err(SlackError::new(
+                            "conversations.archive",
+                            ErrorKind::NotFound,
+                            "channel_not_found",
+                        ))
+                    }
+                }
+            }
+            ChannelOp::Rename(ch, name) => {
+                let want = crate::backend::channel_name(name).map_err(|why| {
+                    SlackError::new("conversations.rename", ErrorKind::Other, why)
+                })?;
+                let mut convs = self.convs.lock().unwrap();
+                if convs.iter().any(|c| c.name == want && c.id != *ch) {
+                    return Err(SlackError::new(
+                        "conversations.rename",
+                        ErrorKind::Other,
+                        "name_taken",
+                    ));
+                }
+                match convs.iter_mut().find(|c| c.id == *ch) {
+                    Some(c)
+                        if matches!(
+                            c.kind,
+                            ConversationKind::Dm { .. } | ConversationKind::Mpim { .. }
+                        ) =>
+                    {
+                        return Err(SlackError::new(
+                            "conversations.rename",
+                            ErrorKind::Permission,
+                            "method_not_supported_for_channel_type",
+                        ));
+                    }
+                    Some(c) => c.name = want,
+                    None => {
+                        return Err(SlackError::new(
+                            "conversations.rename",
+                            ErrorKind::NotFound,
+                            "channel_not_found",
+                        ))
+                    }
+                }
+            }
             _ => {}
         }
         if let ChannelOp::Join(ch) = &op {
@@ -1016,6 +1087,139 @@ impl SlackBackend for MockBackend {
         }
         Ok(())
     }
+    async fn create_channel(&self, name: &str, private: bool) -> Result<Conversation> {
+        let want = crate::backend::channel_name(name)
+            .map_err(|why| SlackError::new("conversations.create", ErrorKind::Other, why))?;
+        let mut convs = self.convs.lock().unwrap();
+        if convs.iter().any(|c| c.name == want) {
+            return Err(SlackError::new(
+                "conversations.create",
+                ErrorKind::Other,
+                "name_taken",
+            ));
+        }
+        let n = convs.len();
+        let c = Conversation {
+            team: self.team.clone(),
+            // `C` or `G` by kind, the way Slack issues them, because
+            // `Conversation::parse` and the sidebar both read the prefix.
+            id: ChannelId::new(format!(
+                "{}0NEW{n}{}",
+                if private { 'G' } else { 'C' },
+                &self.team.as_str()[1..2]
+            )),
+            kind: if private {
+                ConversationKind::Private
+            } else {
+                ConversationKind::Public
+            },
+            name: want,
+            topic: String::new(),
+            purpose: String::new(),
+            is_member: true,
+            is_archived: false,
+            is_starred: false,
+            is_muted: false,
+            is_shared: false,
+            member_count: Some(1),
+            last_read: None,
+            latest: None,
+            unread: 0,
+            mentions: 0,
+            notify: Default::default(),
+        };
+        convs.push(c.clone());
+        Ok(c)
+    }
+
+    async fn open_group(&self, users: &[UserId]) -> Result<Conversation> {
+        if users.is_empty() {
+            return Err(SlackError::new(
+                "conversations.open",
+                ErrorKind::Other,
+                "no users given",
+            ));
+        }
+        if let Some(u) = users
+            .iter()
+            .find(|u| !self.users.iter().any(|x| x.id == **u))
+        {
+            return Err(SlackError::new(
+                "conversations.open",
+                ErrorKind::NotFound,
+                format!("user_not_found: {}", u.as_str()),
+            ));
+        }
+        let mut convs = self.convs.lock().unwrap();
+        // The same people open the same conversation, as at Slack: a second
+        // `/group alice bob` must not make a second group.
+        let mut want: Vec<UserId> = users.to_vec();
+        want.push(self.self_id.clone());
+        want.sort();
+        want.dedup();
+        let found = convs.iter().find(|c| match &c.kind {
+            ConversationKind::Mpim { members } => {
+                let mut m = members.clone();
+                m.sort();
+                m == want
+            }
+            ConversationKind::Dm { peer } => users.len() == 1 && *peer == users[0],
+            _ => false,
+        });
+        if let Some(c) = found {
+            return Ok(c.clone());
+        }
+        let n = convs.len();
+        let (id, kind, name) = if users.len() == 1 {
+            (
+                format!("D0NEW{n}"),
+                ConversationKind::Dm {
+                    peer: users[0].clone(),
+                },
+                // Slack's `ims` have no name, and the sidebar resolves one
+                // from the directory. The mock does not hand it one.
+                String::new(),
+            )
+        } else {
+            // Slack names a group `mpdm-alice--bob--me-1`. The sidebar
+            // prefers the members' own names, so this only has to be
+            // non-empty and recognisable.
+            let handles: Vec<String> = want
+                .iter()
+                .filter_map(|u| self.users.iter().find(|x| x.id == *u))
+                .map(|u| u.name.clone())
+                .collect();
+            (
+                format!("G0NEW{n}"),
+                ConversationKind::Mpim {
+                    members: want.clone(),
+                },
+                format!("mpdm-{}-1", handles.join("--")),
+            )
+        };
+        let c = Conversation {
+            team: self.team.clone(),
+            id: ChannelId::new(id),
+            kind,
+            name,
+            topic: String::new(),
+            purpose: String::new(),
+            is_member: true,
+            is_archived: false,
+            is_starred: false,
+            is_muted: false,
+            is_shared: false,
+            member_count: Some(want.len() as u32),
+            last_read: None,
+            latest: None,
+            unread: 0,
+            mentions: 0,
+            notify: Default::default(),
+        };
+        convs.push(c.clone());
+        Ok(c)
+    }
+
     async fn slash(&self, _ch: &ChannelId, command: &str, _text: &str) -> Result<()> {
         // The demo has no apps, so an unknown command is refused the way a
         // workspace without that app would refuse it.

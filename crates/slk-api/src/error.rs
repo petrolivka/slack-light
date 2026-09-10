@@ -51,7 +51,14 @@ impl SlackError {
             | "missing_scope"
             | "no_permission"
             | "cant_update_message"
-            | "cant_delete_message" => ErrorKind::Permission,
+            | "cant_delete_message"
+            // Archiving and renaming: #general cannot be archived, a direct
+            // message cannot be archived or renamed, and on many workspaces
+            // only admins may do either.
+            | "cant_archive_general"
+            | "method_not_supported_for_channel_type"
+            | "not_authorized"
+            | "restricted_action_non_threadable_channel" => ErrorKind::Permission,
             _ => ErrorKind::Other,
         };
         SlackError::new(method, kind, code)
@@ -77,9 +84,23 @@ impl SlackError {
             ErrorKind::Permission if self.detail == "not_pinnable" => {
                 "that kind of message cannot be pinned".into()
             }
+            ErrorKind::Permission if self.detail == "cant_archive_general" => {
+                "the workspace's #general cannot be archived".into()
+            }
+            ErrorKind::Permission if self.detail == "method_not_supported_for_channel_type" => {
+                "not for this kind of conversation".into()
+            }
             ErrorKind::Permission => "you cannot do that here".into(),
             ErrorKind::Transport => "cannot reach Slack".into(),
             ErrorKind::Shape => "Slack sent something unexpected (logged)".into(),
+            // The two a person can fix by choosing again, said as such rather
+            // than as Slack's code for them.
+            ErrorKind::Other if self.detail == "name_taken" => {
+                "that name is taken — archived channels keep theirs".into()
+            }
+            ErrorKind::Other if self.detail.starts_with("invalid_name") => {
+                "Slack will not take that name".into()
+            }
             ErrorKind::Other => format!("Slack said: {}", self.detail),
         }
     }

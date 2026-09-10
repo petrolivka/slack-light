@@ -193,6 +193,7 @@ pub fn count_update(msg: &crate::app::Msg) {
         ListPick(_) => "ListPick",
         Dropped(_) => "Dropped",
         Leave(_) => "Leave",
+        Archive(_) => "Archive",
         TypingExpired => "TypingExpired",
         Idle(_) => "Idle",
         ViewImage(_) => "ViewImage",

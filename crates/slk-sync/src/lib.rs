@@ -160,6 +160,24 @@ pub enum Command {
     BrowseChannels,
     /// Join a public channel and open it.
     Join(ChannelId),
+    /// Make a channel, and open it.
+    CreateChannel {
+        name: String,
+        private: bool,
+    },
+    /// Open a conversation with these people. `who` is what the user typed —
+    /// `@alice @bob`, or names separated by commas — and the engine resolves
+    /// it, because the engine holds the directory.
+    CreateGroup {
+        who: String,
+    },
+    Rename {
+        channel: ChannelId,
+        name: String,
+    },
+    /// Archive a channel. The window asks first; by the time this is sent
+    /// the question has been answered.
+    Archive(ChannelId),
     /// Remember where the user was, for the next start.
     Remember(String),
     ListMembers(ChannelId),
@@ -600,6 +618,26 @@ impl Engine {
                     on: command == "/star",
                 }))
                 .await;
+                return;
+            }
+            "/create" | "/create-private" => {
+                Box::pin(self.handle(Command::CreateChannel {
+                    name: text.clone(),
+                    private: command == "/create-private",
+                }))
+                .await;
+                return;
+            }
+            "/rename" => {
+                Box::pin(self.handle(Command::Rename {
+                    channel: channel.clone(),
+                    name: text.clone(),
+                }))
+                .await;
+                return;
+            }
+            "/group" => {
+                Box::pin(self.handle(Command::CreateGroup { who: text.clone() })).await;
                 return;
             }
             "/join" | "/open" => {
@@ -1598,6 +1636,136 @@ impl Engine {
                             .await
                     }
                 }
+            }
+
+            Command::CreateChannel { name, private } => {
+                // Normalised and checked here, before any request: Slack's
+                // own refusals name the rule rather than the character, and
+                // arrive a round trip later.
+                let want = match slk_api::backend::channel_name(&name) {
+                    Ok(n) => n,
+                    Err(why) => {
+                        self.emit(Event::Notice(why)).await;
+                        return;
+                    }
+                };
+                match self.backend.create_channel(&want, private).await {
+                    Ok(c) => {
+                        let id = c.id.clone();
+                        if let Err(e) = self.store.upsert_conversations(&[c]) {
+                            warn!("storing a new channel: {e:#}");
+                        }
+                        self.push_sidebar().await;
+                        self.emit(Event::Notice(format!(
+                            "created {}{want}",
+                            if private { "🔒 " } else { "#" }
+                        )))
+                        .await;
+                        self.emit(Event::OpenChannel(id.clone())).await;
+                        self.open(id).await;
+                    }
+                    Err(e) => {
+                        self.emit(Event::Notice(format!(
+                            "cannot create {want}: {}",
+                            e.user_message()
+                        )))
+                        .await
+                    }
+                }
+            }
+
+            Command::CreateGroup { who } => {
+                // Everybody named, or nobody: a group opened with two of the
+                // three people meant is a conversation with the wrong people
+                // in it, and they are told it exists.
+                let names: Vec<&str> = who
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                if names.is_empty() {
+                    self.emit(Event::Notice("name the people: /group @alice @bob".into()))
+                        .await;
+                    return;
+                }
+                let mut ids: Vec<UserId> = Vec::new();
+                let mut unknown: Vec<&str> = Vec::new();
+                for n in &names {
+                    match self.resolve_user(n) {
+                        Some(id) if id == self.self_id => {}
+                        Some(id) => {
+                            if !ids.contains(&id) {
+                                ids.push(id)
+                            }
+                        }
+                        None => unknown.push(n),
+                    }
+                }
+                if !unknown.is_empty() {
+                    self.emit(Event::Notice(format!(
+                        "nobody here is called {}",
+                        unknown.join(", ")
+                    )))
+                    .await;
+                    return;
+                }
+                if ids.is_empty() {
+                    self.emit(Event::Notice("that is only you".into())).await;
+                    return;
+                }
+                // Slack caps a group direct message at nine people besides
+                // you. Past that it wants a channel, and says so after the
+                // request; saying it before is kinder.
+                if ids.len() > 8 {
+                    self.emit(Event::Notice(
+                        "a group holds at most nine people — make a channel instead".into(),
+                    ))
+                    .await;
+                    return;
+                }
+                match self.backend.open_group(&ids).await {
+                    Ok(c) => {
+                        let id = c.id.clone();
+                        if let Err(e) = self.store.upsert_conversations(&[c]) {
+                            warn!("storing a new conversation: {e:#}");
+                        }
+                        self.push_sidebar().await;
+                        self.emit(Event::OpenChannel(id.clone())).await;
+                        self.open(id).await;
+                    }
+                    Err(e) => {
+                        self.emit(Event::Notice(format!(
+                            "cannot open it: {}",
+                            e.user_message()
+                        )))
+                        .await
+                    }
+                }
+            }
+
+            Command::Rename { channel, name } => {
+                let want = match slk_api::backend::channel_name(&name) {
+                    Ok(n) => n,
+                    Err(why) => {
+                        self.emit(Event::Notice(why)).await;
+                        return;
+                    }
+                };
+                self.conversation_op(
+                    slk_api::backend::ChannelOp::Rename(channel.clone(), want.clone()),
+                    |st, team| st.rename(team, &channel, &want),
+                    "renamed",
+                )
+                .await;
+            }
+
+            Command::Archive(channel) => {
+                self.conversation_op(
+                    slk_api::backend::ChannelOp::Archive(channel.clone()),
+                    |st, team| st.set_archived(team, &channel, true),
+                    "archived",
+                )
+                .await;
             }
 
             Command::BrowseChannels => {

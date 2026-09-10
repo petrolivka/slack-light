@@ -86,6 +86,10 @@ actions! {
     SetPurpose     => "set_purpose",     "Set the conversation's purpose",       "conversation";
     InviteUser     => "invite",          "Invite somebody here",                 "conversation";
     LeaveChannel   => "leave_channel",   "Leave this conversation",              "conversation";
+    CreateChannel  => "create_channel",  "Create a channel",                     "conversation";
+    RenameChannel  => "rename_channel",  "Rename this channel",                  "conversation";
+    ArchiveChannel => "archive_channel", "Archive this channel, for everybody",  "conversation";
+    CreateGroup    => "create_group",    "Start a conversation with several people", "conversation";
 
     NextConv       => "next_conversation",   "Next conversation",                "navigate";
     PrevConv       => "prev_conversation",   "Previous conversation",            "navigate";

@@ -743,6 +743,24 @@ impl Store {
         Ok(())
     }
 
+    /// Archived conversations drop out of `conversations()`, which is the
+    /// whole of what archiving means to a sidebar.
+    pub fn set_archived(&self, team: &TeamId, ch: &ChannelId, on: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE conversation SET is_archived = ?3 WHERE team = ?1 AND id = ?2",
+            params![team.as_str(), ch.as_str(), on],
+        )?;
+        Ok(())
+    }
+
+    pub fn rename(&self, team: &TeamId, ch: &ChannelId, name: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE conversation SET name = ?3 WHERE team = ?1 AND id = ?2",
+            params![team.as_str(), ch.as_str(), name],
+        )?;
+        Ok(())
+    }
+
     pub fn set_topic(&self, team: &TeamId, ch: &ChannelId, topic: &str) -> Result<()> {
         self.db.execute(
             "UPDATE conversation SET topic = ?3 WHERE team = ?1 AND id = ?2",

@@ -214,6 +214,8 @@ pub enum Msg {
     Idle(bool),
     /// Leaving was confirmed in the dialog.
     Leave(ChannelId),
+    /// Archiving was confirmed in the dialog.
+    Archive(ChannelId),
     /// An image in a message was clicked.
     ViewImage(String),
     /// The side pane's search box changed or was submitted.
@@ -1743,6 +1745,7 @@ impl SimpleComponent for App {
             Msg::ListPick(i) => self.pick(i, &sender),
             Msg::Dropped(paths) => self.upload(paths, &sender),
             Msg::Leave(ch) => self.send(Command::Leave(ch)),
+            Msg::Archive(ch) => self.send(Command::Archive(ch)),
             Msg::TypingExpired => self.refresh_hint(),
             Msg::Idle(away) => {
                 bench::report("idle", if away { "away" } else { "back" });
@@ -2945,6 +2948,41 @@ impl App {
                 self.composer.grab_focus();
             }
             "leave_channel" => self.confirm_leave(sender),
+            "archive_channel" => self.confirm_archive(sender),
+            // A name from the user, so the composer again — the same reasons
+            // as topic and invite above. Rename is prefilled with the current
+            // name, because the usual rename is a small change to it.
+            "create_channel" | "rename_channel" | "create_group" => {
+                if self.read_only {
+                    self.say("read-only: nothing is changed".into());
+                    return;
+                }
+                let prefill = match name {
+                    "create_channel" => "/create ".to_string(),
+                    "create_group" => "/group @".to_string(),
+                    _ => {
+                        let Some(c) = self
+                            .open
+                            .clone()
+                            .and_then(|ch| self.convs().iter().find(|c| c.id == ch).cloned())
+                        else {
+                            self.say("no conversation open".into());
+                            return;
+                        };
+                        if c.is_dm() {
+                            self.say("a direct message has no name to change".into());
+                            return;
+                        }
+                        format!("/rename {}", c.name)
+                    }
+                };
+                self.inserting.set(true);
+                let buf = self.composer.buffer();
+                buf.set_text(&prefill);
+                buf.place_cursor(&buf.end_iter());
+                self.inserting.set(false);
+                self.composer.grab_focus();
+            }
             // Both are `[sidebar]` settings and both are worth changing for a
             // minute — "show me only what is unread" is a way of working
             // through a morning, not a preference.
@@ -4115,6 +4153,50 @@ impl App {
             move |r| {
                 if r == Ok(1) {
                     let _ = s.send(Msg::Leave(ch));
+                }
+            },
+        );
+    }
+
+    /// The one act in the client everybody in the workspace sees happen.
+    ///
+    /// Cancel is the default and the button says what it does, rather than
+    /// "OK": a dialog that is dismissed with Return by habit must not be the
+    /// way a channel ends.
+    fn confirm_archive(&mut self, sender: &ComponentSender<Self>) {
+        let Some(ch) = self.open.clone() else {
+            self.say("no conversation open".into());
+            return;
+        };
+        if self.read_only {
+            self.say("read-only: nothing is changed".into());
+            return;
+        }
+        if let Some(c) = self.convs().iter().find(|c| c.id == ch) {
+            if c.is_dm() {
+                self.say("a direct message cannot be archived".into());
+                return;
+            }
+        }
+        let name = self.title.clone();
+        let dialog = gtk::AlertDialog::builder()
+            .message(format!("Archive {name}?"))
+            .detail(
+                "It is archived for everybody in it, and nobody can post there \
+                 afterwards. A workspace admin can unarchive it; this client cannot.",
+            )
+            .buttons(["Cancel", "Archive for everybody"])
+            .cancel_button(0)
+            .default_button(0)
+            .modal(true)
+            .build();
+        let s = sender.input_sender().clone();
+        dialog.choose(
+            self.window().as_ref(),
+            gtk::gio::Cancellable::NONE,
+            move |r| {
+                if r == Ok(1) {
+                    let _ = s.send(Msg::Archive(ch));
                 }
             },
         );

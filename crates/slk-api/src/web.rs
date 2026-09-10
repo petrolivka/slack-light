@@ -302,6 +302,22 @@ impl WebBackend {
         }
     }
 
+    /// One conversation, in full.
+    ///
+    /// `conversations.open` answers with a thinner object than
+    /// `conversations.info` does, and a group direct message needs the
+    /// members to have a name at all.
+    async fn conversation_info(&self, ch: &ChannelId) -> Result<Conversation> {
+        let v = self
+            .call("conversations.info", &[("channel", ch.as_str())])
+            .await?;
+        v.get("channel")
+            .and_then(|c| Conversation::parse(&self.team, c))
+            .ok_or_else(|| {
+                SlackError::new("conversations.info", ErrorKind::Shape, "no channel object")
+            })
+    }
+
     fn parse_page(&self, method: &str, ch: &ChannelId, v: &Value) -> Result<Page> {
         let raw = v
             .get("messages")
@@ -905,6 +921,24 @@ impl SlackBackend for WebBackend {
                     Err(e) => return Err(e),
                 }
             }
+            ChannelOp::Archive(ch) => {
+                match self
+                    .call("conversations.archive", &[("channel", ch.as_str())])
+                    .await
+                {
+                    Ok(_) => {}
+                    // Already archived is the state that was asked for.
+                    Err(e) if e.detail == "already_archived" => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            ChannelOp::Rename(ch, name) => {
+                self.call(
+                    "conversations.rename",
+                    &[("channel", ch.as_str()), ("name", &name)],
+                )
+                .await?;
+            }
             ChannelOp::SetMuted(all) => {
                 // Muting is a user preference, and `users.prefs.set` is not a
                 // public method. The interface shows the refusal rather than
@@ -921,6 +955,59 @@ impl SlackBackend for WebBackend {
             }
         }
         Ok(())
+    }
+
+    async fn create_channel(&self, name: &str, private: bool) -> Result<Conversation> {
+        let v = self
+            .call(
+                "conversations.create",
+                &[
+                    ("name", name),
+                    ("is_private", if private { "true" } else { "false" }),
+                ],
+            )
+            .await?;
+        v.get("channel")
+            .and_then(|c| Conversation::parse(&self.team, c))
+            .ok_or_else(|| {
+                SlackError::new(
+                    "conversations.create",
+                    ErrorKind::Shape,
+                    "no channel object",
+                )
+            })
+    }
+
+    async fn open_group(&self, users: &[UserId]) -> Result<Conversation> {
+        let list = users
+            .iter()
+            .map(|u| u.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let v = self
+            .call(
+                "conversations.open",
+                // `return_im` is what makes the answer a channel object
+                // rather than the bare `{"id": ...}` Slack sends otherwise —
+                // and a bare id has no name, no members and no kind, so the
+                // sidebar would show a row with nothing in it.
+                &[("users", &list), ("return_im", "true")],
+            )
+            .await?;
+        let parsed = v
+            .get("channel")
+            .and_then(|c| Conversation::parse(&self.team, c));
+        match parsed {
+            // A group whose object came back without its members is a group
+            // the sidebar cannot name. Ask properly rather than show `@`.
+            Some(c) if !c.name.is_empty() || users.len() == 1 => Ok(c),
+            Some(c) => self.conversation_info(&c.id).await.or(Ok(c)),
+            None => Err(SlackError::new(
+                "conversations.open",
+                ErrorKind::Shape,
+                "no channel object",
+            )),
+        }
     }
 
     async fn slash(&self, ch: &ChannelId, command: &str, text: &str) -> Result<()> {

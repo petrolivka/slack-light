@@ -83,6 +83,45 @@ pub enum ChannelOp {
     /// backend that tried to keep its own copy would drift from the sidebar
     /// the first time another client muted something.
     SetMuted(Vec<ChannelId>),
+    /// Archive a channel. Slack has no delete: this is the end of it, and the
+    /// only thing here that everybody in the workspace sees happen.
+    Archive(ChannelId),
+    /// Rename a channel. Slack normalises the name it is given, so what
+    /// arrives back is not always what was asked for.
+    Rename(ChannelId, String),
+}
+
+/// A channel name the way Slack will store it, or the reason it will not.
+///
+/// Slack lowercases, and refuses spaces, capitals, most punctuation and
+/// anything over eighty characters with `invalid_name_specials`,
+/// `invalid_name_maxlength` and friends — errors that arrive after a round
+/// trip and name the rule rather than the fix. Doing the obvious
+/// normalisation here (case, spaces to dashes, a leading `#`) means
+/// `/create Release Week` does what was meant; refusing the rest here means
+/// the refusal says which character was the problem.
+pub fn channel_name(raw: &str) -> std::result::Result<String, String> {
+    let name: String = raw
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-");
+    if name.is_empty() {
+        return Err("a channel needs a name".into());
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_alphanumeric() || *c == '-' || *c == '_'))
+    {
+        return Err(format!("a channel name cannot contain {bad:?}"));
+    }
+    if name.chars().count() > 80 {
+        return Err("a channel name is at most 80 characters".into());
+    }
+    Ok(name)
 }
 
 /// One search result, from Slack or from the local index.
@@ -310,6 +349,22 @@ pub trait SlackBackend: Send + Sync {
 
     /// Join, leave, or change a conversation.
     async fn channel_op(&self, op: ChannelOp) -> Result<()>;
+
+    /// Create a channel, and return it.
+    ///
+    /// Returns the conversation rather than `()` because the only useful
+    /// thing to do with a channel you have just made is open it, and asking
+    /// the workspace for a list to find it again is a round trip for
+    /// something the answer already contained.
+    async fn create_channel(&self, name: &str, private: bool) -> Result<Conversation>;
+
+    /// Open a conversation with these people: one of them is a direct
+    /// message, several is a group.
+    ///
+    /// Idempotent at Slack's end — opening the same group twice returns the
+    /// same conversation — which is what makes it safe to offer as a command
+    /// somebody may repeat.
+    async fn open_group(&self, users: &[UserId]) -> Result<Conversation>;
 
     /// Hand an unrecognised slash command to the workspace, the way the web
     /// client does, so `/giphy` and the rest still work.

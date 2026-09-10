@@ -319,6 +319,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/invite", "Invite somebody here"),
     ("/join", "Join or open a channel"),
     ("/leave", "Leave this conversation"),
+    ("/create", "Create a channel: `/create name`"),
+    ("/create-private", "Create a private channel"),
+    ("/rename", "Rename this channel"),
+    ("/archive", "Archive this channel, for everybody"),
+    ("/group", "Start a conversation: `/group @alice @bob`"),
     ("/mute", "Mute this conversation"),
     ("/unmute", "Unmute this conversation"),
     ("/star", "Star this conversation"),
@@ -479,6 +484,11 @@ pub fn local(command: &str, text: &str) -> Option<(&'static str, String)> {
         "/thread" => ("open_thread", String::new()),
         "/edit" => ("edit_message", String::new()),
         "/pins" => ("pinned", String::new()),
+        // Archiving is the one act here everybody in the workspace sees
+        // happen, and it has no undo in this client. It goes through the same
+        // confirmation the key does, so typing it is not a shortcut past the
+        // question.
+        "/archive" => ("archive_channel", String::new()),
         // Jump-to already fuzzy-matches every conversation and person, so
         // `/msg alice` is that box with `alice` in it. Inventing a second
         // people-picker would give two answers to "who is alice".
@@ -767,8 +777,25 @@ mod tests {
         // the client does not keep — which is exactly how `/pins` was
         // advertised and then forwarded to Slack as an unknown command.
         const ENGINE: &[&str] = &[
-            "/me", "/shrug", "/topic", "/purpose", "/away", "/active", "/status", "/dnd",
-            "/invite", "/join", "/leave", "/mute", "/unmute", "/star", "/unstar",
+            "/me",
+            "/shrug",
+            "/topic",
+            "/purpose",
+            "/away",
+            "/active",
+            "/status",
+            "/dnd",
+            "/invite",
+            "/join",
+            "/leave",
+            "/mute",
+            "/unmute",
+            "/star",
+            "/unstar",
+            "/create",
+            "/create-private",
+            "/rename",
+            "/group",
         ];
         // Slackbot's, not ours, and it works because the engine forwards
         // anything it does not recognise to the workspace.
@@ -1089,6 +1116,26 @@ mod tests {
         assert_eq!(MarkRead::parse("on_focus"), MarkRead::OnFocus);
         // Anything unrecognised is the middle setting, not the riskiest one.
         assert_eq!(MarkRead::parse("nonsense"), MarkRead::OnFocus);
+    }
+
+    #[test]
+    fn archiving_is_asked_about_however_it_is_asked_for() {
+        // `/archive` is the interface's, so it reaches the same confirmation
+        // dialog the key does. Were it the engine's, typing it would archive
+        // a channel for everybody in it with no question at all.
+        assert_eq!(
+            local("/archive", ""),
+            Some(("archive_channel", String::new()))
+        );
+        // The others take a name and go to the engine, where the directory
+        // and the normalisation are.
+        for c in ["/create", "/create-private", "/rename", "/group"] {
+            assert_eq!(local(c, "x"), None, "{c} is the engine's");
+            assert!(
+                COMMANDS.iter().any(|(n, _)| *n == c),
+                "{c} is offered by completion"
+            );
+        }
     }
 
     #[test]
