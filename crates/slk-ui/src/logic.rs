@@ -21,19 +21,45 @@ pub fn landing<'a>(convs: impl IntoIterator<Item = (&'a bool, &'a u32, &'a u32)>
         .unwrap_or(0)
 }
 
-/// Where an upserted message goes in the list: over the row it replaces
-/// (the optimistic one, or an edit of itself), or at the end.
+/// Where an upserted message goes in the list.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Placement {
+    /// Over one row: the optimistic one it confirms, or itself being edited.
     Replace(usize),
+    /// Two rows are the same message. Overwrite the earlier and delete the
+    /// later, so it keeps the place it already had in the conversation.
+    Merge {
+        keep: usize,
+        drop: usize,
+    },
     Append,
 }
 
+/// FR-M4's "echo deduplication in both orders", as arithmetic.
+///
+/// A message sent from here can arrive back twice: once as the HTTP
+/// response's confirmation, carrying `replaces` with the optimistic row's
+/// local timestamp, and once as Slack's own websocket echo, carrying the real
+/// timestamp and no `replaces` at all. Which lands first is a race, and Slack
+/// frequently wins it.
+///
+/// Looking up only `replaces` handles one order. Looking up only `ts` handles
+/// the other. Handling *both* means accepting that for a moment the list can
+/// hold two rows for one message — the optimistic one and the echo — and that
+/// the second answer has to collapse them rather than replace one and leave
+/// the other. That is the case this returns `Merge` for, and the case that
+/// put every threaded reply on screen twice.
 pub fn placement(rows: &[&str], ts: &str, replaces: Option<&str>) -> Placement {
-    let target = replaces.unwrap_or(ts);
-    match rows.iter().position(|r| *r == target) {
-        Some(i) => Placement::Replace(i),
-        None => Placement::Append,
+    let by_ts = rows.iter().position(|r| *r == ts);
+    let by_replaces = replaces.and_then(|t| rows.iter().position(|r| *r == t));
+    match (by_ts, by_replaces) {
+        (Some(a), Some(b)) if a != b => Placement::Merge {
+            keep: a.min(b),
+            drop: a.max(b),
+        },
+        (Some(a), _) => Placement::Replace(a),
+        (None, Some(b)) => Placement::Replace(b),
+        (None, None) => Placement::Append,
     }
 }
 
@@ -789,6 +815,39 @@ mod tests {
         );
         assert_eq!(placement(&rows, "4.0", None), Placement::Append);
         assert_eq!(placement(&rows, "4.0", Some("gone")), Placement::Append);
+    }
+
+    #[test]
+    fn an_echo_that_beats_its_own_confirmation_does_not_double_the_message() {
+        // FR-M4 says both orders. This is the one that was never handled: a
+        // message sent from here comes back twice, and Slack's websocket echo
+        // frequently arrives before the HTTP response does.
+        //
+        // Order A — confirmation first, then the echo:
+        let rows = ["1.0", "local-3"];
+        assert_eq!(
+            placement(&rows, "3.0", Some("local-3")),
+            Placement::Replace(1)
+        );
+        let after = ["1.0", "3.0"];
+        assert_eq!(
+            placement(&after, "3.0", None),
+            Placement::Replace(1),
+            "the echo lands on the row that is already there"
+        );
+
+        // Order B — the echo first, which appends beside the optimistic row,
+        // and then the confirmation, which has to collapse the two rather
+        // than replace one and leave the other. Leaving the other is what put
+        // every threaded reply on screen twice.
+        let rows = ["1.0", "local-3"];
+        assert_eq!(placement(&rows, "3.0", None), Placement::Append);
+        let both = ["1.0", "local-3", "3.0"];
+        assert_eq!(
+            placement(&both, "3.0", Some("local-3")),
+            Placement::Merge { keep: 1, drop: 2 },
+            "the message keeps the place it already had"
+        );
     }
 
     #[test]

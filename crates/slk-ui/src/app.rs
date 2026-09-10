@@ -2120,9 +2120,34 @@ impl App {
                     let in_thread =
                         message.ts == parent || message.thread_ts.as_ref() == Some(&parent);
                     if in_thread {
-                        match self.position_in(Pane::Thread, message.ts.as_str()) {
-                            Some(pos) => self.replace_row(Pane::Thread, pos, (*message).clone()),
-                            None => {
+                        // The same rule the conversation uses, and for the
+                        // same reason: a confirmation arrives with the real
+                        // timestamp and the row it replaces still carries the
+                        // local one. Looking the *new* ts up finds nothing and
+                        // appends, so every reply sent in a thread appeared
+                        // twice — once pending, once confirmed. `placement`
+                        // looks up `replaces` first, which is what makes the
+                        // websocket's echo of the same message land on the row
+                        // that is already there rather than beside it.
+                        let held: Vec<String> = self
+                            .thread_list
+                            .iter()
+                            .map(|r| r.borrow().msg.ts.as_str().to_string())
+                            .collect();
+                        let refs: Vec<&str> = held.iter().map(String::as_str).collect();
+                        match crate::logic::placement(
+                            &refs,
+                            message.ts.as_str(),
+                            replaces.as_ref().map(|t| t.as_str()),
+                        ) {
+                            crate::logic::Placement::Merge { keep, drop } => {
+                                self.thread_list.remove(drop as u32);
+                                self.replace_row(Pane::Thread, keep as u32, (*message).clone());
+                            }
+                            crate::logic::Placement::Replace(pos) => {
+                                self.replace_row(Pane::Thread, pos as u32, (*message).clone())
+                            }
+                            crate::logic::Placement::Append => {
                                 let rows = self.thread_rows(vec![(*message).clone()]);
                                 self.thread_list.extend_from_iter(rows);
                                 let adj = self.thread_scroller.vadjustment();
@@ -2145,13 +2170,23 @@ impl App {
                     message.ts.as_str(),
                     replaces.as_ref().map(|t| t.as_str()),
                 );
+                // The duplicate goes first, so the row that survives is
+                // grouped against the message genuinely above it rather than
+                // against a copy of itself.
+                if let crate::logic::Placement::Merge { drop, .. } = place {
+                    self.list.remove(drop as u32);
+                }
                 let above = match place {
-                    crate::logic::Placement::Replace(pos) => (pos as u32).checked_sub(1),
+                    crate::logic::Placement::Replace(pos)
+                    | crate::logic::Placement::Merge { keep: pos, .. } => {
+                        (pos as u32).checked_sub(1)
+                    }
                     crate::logic::Placement::Append => self.list.len().checked_sub(1),
                 };
                 let row = self.row_at(*message, above);
                 match place {
-                    crate::logic::Placement::Replace(pos) => {
+                    crate::logic::Placement::Replace(pos)
+                    | crate::logic::Placement::Merge { keep: pos, .. } => {
                         // A replaced row loses the selection with the widget
                         // it was on. Measured: saving a message put a notice
                         // on screen, the engine echoed the message back, and

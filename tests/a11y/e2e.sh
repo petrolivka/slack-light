@@ -130,6 +130,16 @@ check "alt-1 adds a reaction chip to it" "$( [ "$after" -gt "$before" ] && echo 
 # closes it. Both go through the same code the row's ↳ link does.
 w -M alt t -m alt; sleep 1.5
 check "alt-t opens the thread pane" "$( tree | grep -q "label 'Thread" && echo 1 || echo 0 )"
+
+# A reply sent in a thread must appear once. It appeared twice: the pane
+# looked the row up by the *new* timestamp, and the optimistic row it was
+# meant to replace still carried the local one, so the confirmation was
+# appended beside it instead of over it. Counting is the whole check —
+# "the reply is there" passed the entire time it was there twice.
+w "reply once and only once"; sleep 0.3; w -k Return; sleep 2.5
+n=$(tree | grep -c 'reply once and only once')
+check "a reply in a thread appears exactly once" "$( [ "$n" = 1 ] && echo 1 || echo 0 )" "$n copies"
+
 w -M alt w -m alt; sleep 0.6
 check "alt-w closes it again" "$( tree | grep -q "label 'Thread" && echo 0 || echo 1 )"
 
